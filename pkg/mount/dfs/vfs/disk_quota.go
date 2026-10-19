@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"context"
 	"errors"
 	"sync"
 
@@ -9,16 +10,37 @@ import (
 
 var ErrCacheDiskLimit = errors.New("dfs cache: disk quota exhausted")
 
+// Internal wakeup, never a downloader failure.
+var errQuotaSpaceChanged = errors.New("dfs cache: quota space changed")
+
 // diskQuota is the authoritative process-lifetime accounting for the DFS
 // cache directory. Unlike buffer.Pool accounting, used bytes remain charged
 // when an idle buffer closes because its sparse cache file persists on disk.
 // Reservations are included in admission so concurrent writers cannot all
 // observe the same remaining capacity.
 type diskQuota struct {
-	mu       sync.Mutex
-	limit    int64
-	used     int64
-	reserved int64
+	mu           sync.Mutex
+	limit        int64
+	used         int64
+	reserved     int64
+	spaceChanged chan struct{}
+}
+
+// spaceSignal is captured BEFORE checking admission so a physical release
+// cannot be lost between the quota check and parking behind maintenance.
+func (q *diskQuota) spaceSignal() <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.spaceChanged == nil {
+		q.spaceChanged = make(chan struct{})
+	}
+	return q.spaceChanged
+}
+func (q *diskQuota) notifySpaceLocked() {
+	if q.spaceChanged != nil {
+		close(q.spaceChanged)
+	}
+	q.spaceChanged = make(chan struct{})
 }
 
 type diskQuotaSnapshot struct {
@@ -74,6 +96,9 @@ func (q *diskQuota) commit(reserved, committed int64) {
 	q.mu.Lock()
 	q.reserved -= min(reserved, q.reserved)
 	q.used += committed
+	if committed < reserved {
+		q.notifySpaceLocked()
+	}
 	q.mu.Unlock()
 }
 
@@ -82,7 +107,11 @@ func (q *diskQuota) cancel(reserved int64) {
 		return
 	}
 	q.mu.Lock()
-	q.reserved -= min(reserved, q.reserved)
+	canceled := min(reserved, q.reserved)
+	q.reserved -= canceled
+	if canceled > 0 {
+		q.notifySpaceLocked()
+	}
 	q.mu.Unlock()
 }
 
@@ -95,6 +124,9 @@ func (q *diskQuota) release(n int64) int64 {
 	q.mu.Lock()
 	released := min(n, q.used)
 	q.used -= released
+	if released > 0 {
+		q.notifySpaceLocked()
+	}
 	q.mu.Unlock()
 	return released
 }
@@ -130,19 +162,49 @@ func (q *diskQuota) snapshot() diskQuotaSnapshot {
 }
 
 func (c *Cache) reserveDisk(excludedKey string, n int64) bool {
+	return c.reserveDiskContext(context.Background(), excludedKey, n) == nil
+}
+
+func (c *Cache) reserveDiskContext(ctx context.Context, excludedKey string, n int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if n <= 0 || c == nil || c.quota == nil {
-		return true
+		return nil
 	}
-	if c.quota.tryReserve(n) {
-		return true
+	pressure := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		space := c.quota.spaceSignal()
+		if c.quota.tryReserve(n) {
+			return nil
+		}
+		if !pressure {
+			c.quotaPressure.Add(1)
+			pressure = true
+		}
+		err := c.reclaimForReservation(ctx, excludedKey, n, space)
+		// This is a predicate/notification wait, not a polling retry. Another
+		// physical release (or canceled reservation) permits fresh admission even
+		// if an unrelated cleanup is still joining a slow source. Every loop
+		// follows a distinct quota generation or a context cancellation.
+		if errors.Is(err, errQuotaSpaceChanged) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if c.quota.tryReserve(n) {
+			return nil
+		}
+		c.quotaDenials.Add(1)
+		return ErrCacheDiskLimit
 	}
-	c.quotaPressure.Add(1)
-	c.reclaimForReservation(excludedKey, n)
-	if c.quota.tryReserve(n) {
-		return true
-	}
-	c.quotaDenials.Add(1)
-	return false
 }
 
 func (c *Cache) releaseDisk(n int64) int64 {
@@ -160,17 +222,21 @@ func (c *Cache) releaseDisk(n int64) int64 {
 // then cold persistent entries. It never closes the item performing the write.
 // cleanupMu serializes this path with periodic cleanup and other pressure
 // writers, preventing a thundering herd of directory scans and removals.
-func (c *Cache) reclaimForReservation(excludedKey string, request int64) {
+func (c *Cache) reclaimForReservation(ctx context.Context, excludedKey string, request int64, space <-chan struct{}) error {
 	if c == nil || c.quota == nil || request <= 0 {
-		return
+		return nil
 	}
 
-	c.cleanupMu.Lock()
+	// Close cancels its downloader before joining it. A canceled downloader
+	// exits this admission wait, while active writers wait for real reclamation.
+	if err := c.cleanupMu.LockContextOrSpace(ctx, space); err != nil {
+		return err
+	}
 	defer c.cleanupMu.Unlock()
 
 	shortfall := c.quota.shortfall(request)
 	if shortfall <= 0 {
-		return
+		return nil
 	}
 	if c.pool != nil {
 		// Fence hole-punch callbacks out of a writer's interval between its
@@ -181,7 +247,7 @@ func (c *Cache) reclaimForReservation(excludedKey string, request int64) {
 		c.diskOpMu.Unlock()
 		shortfall = c.quota.shortfall(request)
 		if shortfall <= 0 {
-			return
+			return nil
 		}
 	}
 
@@ -200,4 +266,5 @@ func (c *Cache) reclaimForReservation(excludedKey string, request int64) {
 	scan.errors += removalErrors
 	c.releaseDisk(scan.totalSize - remaining)
 	c.storeDiskStats(scan.candidates, removed)
+	return nil
 }

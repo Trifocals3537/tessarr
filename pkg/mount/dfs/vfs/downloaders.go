@@ -244,11 +244,24 @@ func (dls *Downloaders) DownloadWithPriority(ctx context.Context, r ranges.Range
 	dls.touchActivity()
 
 	dls.mu.Lock()
-	// Wait out an in-flight StopAll: it has (or is about to have) canceled the
-	// current ctx, and anything we start on it dies instantly. StopAll always
-	// clears stopping and broadcasts, so this wait is bounded.
-	for dls.stopping && !dls.closed {
-		dls.stopCondLocked().Wait()
+	// Wait out an in-flight StopAll without making request cancellation wait
+	// for downloader teardown. The callback takes mu so its broadcast cannot
+	// be lost between checking ctx and entering Cond.Wait.
+	if dls.stopping && !dls.closed {
+		cond := dls.stopCondLocked()
+		stopWake := context.AfterFunc(ctx, func() {
+			dls.mu.Lock()
+			cond.Broadcast()
+			dls.mu.Unlock()
+		})
+		defer stopWake()
+		for dls.stopping && !dls.closed && ctx.Err() == nil {
+			cond.Wait()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		dls.mu.Unlock()
+		return err
 	}
 	if dls.closed {
 		dls.mu.Unlock()
@@ -1388,9 +1401,12 @@ func (w *cacheWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	n, skipped, err := w.item.WriteAtNoOverwrite(p, w.offset)
+	n, skipped, err := w.item.writeAtNoOverwriteContext(w.dl.ctx, p, w.offset)
 	if err != nil {
-		return n, err
+		// WriteAtNoOverwrite's legacy count is len(p), even on failure.
+		// Passing that count through lets io.CopyN hide an exact-length
+		// quota/cancellation error as success. No bytes were acknowledged.
+		return 0, err
 	}
 	w.dl.mu.Lock()
 	if skipped == n {

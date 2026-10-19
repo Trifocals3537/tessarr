@@ -62,7 +62,7 @@ type Cache struct {
 
 	createGroup singleflight.Group
 	threshold   int64
-	cleanupMu   sync.Mutex
+	cleanupMu   cleanupMutex
 	// diskOpMu lets independent cache writers proceed concurrently while
 	// fencing synchronous hole-punch reclamation out of an in-flight publish.
 	diskOpMu sync.RWMutex
@@ -413,7 +413,7 @@ func (c *Cache) evictCandidates(now time.Time, candidates []candidateEntry, tota
 	}
 
 	// Phase 2: If still over threshold, remove oldest entries (only if not in map)
-	if threshold > 0 && totalSize > threshold {
+	if (threshold > 0 || thresholdOverride == 0) && totalSize > threshold {
 		// Sort by access time, then modification time (oldest first)
 		sort.Slice(candidates, func(i, j int) bool {
 			if candidates[i].atime.Equal(candidates[j].atime) {
@@ -1335,6 +1335,10 @@ func (item *CacheItem) recordTerminalReadFailure(off, length int64, err error) {
 // after each insert. Keeping both in sync is what lets a reopened item
 // resume cached data via the buffer's InitialRanges seed.
 func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, err error) {
+	return item.writeAtNoOverwriteContext(context.Background(), p, off)
+}
+
+func (item *CacheItem) writeAtNoOverwriteContext(ctx context.Context, p []byte, off int64) (n, skipped int, err error) {
 	item.writeMu.Lock()
 	defer item.writeMu.Unlock()
 
@@ -1348,15 +1352,14 @@ func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, 
 	frs := item.info.Rs.FindAll(writeRange)
 	item.metaMu.RUnlock()
 
-	wrote := false
 	for _, fr := range frs {
 		if fr.Present {
 			skipped += int(fr.R.Size)
 			continue
 		}
 		localOff := fr.R.Pos - off
-		if !item.cache.reserveDisk(item.key, fr.R.Size) {
-			return n, skipped, fmt.Errorf("%w: need %d bytes", ErrCacheDiskLimit, fr.R.Size)
+		if err := item.cache.reserveDiskContext(ctx, item.key, fr.R.Size); err != nil {
+			return n, skipped, fmt.Errorf("cache admission for %d bytes: %w", fr.R.Size, err)
 		}
 		item.cache.diskOpMu.RLock()
 		written, werr := item.buf.WriteAt(p[localOff:localOff+fr.R.Size], fr.R.Pos)
@@ -1373,10 +1376,8 @@ func (item *CacheItem) WriteAtNoOverwrite(p []byte, off int64) (n, skipped int, 
 		item.info.Rs.Insert(fr.R)
 		item.metaMu.Unlock()
 		item.cache.diskOpMu.RUnlock()
-		wrote = true
-	}
-
-	if wrote {
+		// Publish each completed span even if a later reservation fails or is
+		// canceled. Ordinary metadata flushes must retain these cached bytes.
 		item.markMetadataDirty()
 	}
 	return n, skipped, nil
