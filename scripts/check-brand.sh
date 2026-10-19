@@ -19,7 +19,7 @@ allowed_legacy_reference() {
         docs/src/content/docs/guides/configuration.md|\
         docs/src/content/docs/help/troubleshooting.md|\
         pkg/server/templates/layout.html|pkg/server/assets/js/common.js|\
-        pkg/server/assets/build/js/common.js)
+        pkg/server/assets/build/js/common.js|scripts/version-info.test.mjs)
             # Permit only the verified repository address on these lines,
             # keeping the check active for unrelated legacy product wording.
             local without_repo_url="${content//https:\/\/github.com\/Trifocals3537\/decypharr/}"

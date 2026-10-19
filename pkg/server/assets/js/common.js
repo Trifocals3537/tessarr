@@ -421,8 +421,14 @@ class TessarrUtils {
                     versionBadge.textContent = version;
                 } else {
                     const releaseLink = document.createElement('a');
-                    releaseLink.href =
-                        `https://github.com/Trifocals3537/decypharr/releases/tag/v${encodeURIComponent(version)}`;
+                    // Continuous beta images have a build number and commit,
+                    // but no GitHub release tag. Published beta/RC releases
+                    // retain their normal release links.
+                    const betaBuild = channel === 'beta' &&
+                        version.match(/^\d+\.\d+\.\d+-beta\.\d+\.([0-9a-f]{7})$/i);
+                    releaseLink.href = betaBuild
+                        ? `https://github.com/Trifocals3537/decypharr/commit/${betaBuild[1]}`
+                        : `https://github.com/Trifocals3537/decypharr/releases/tag/v${encodeURIComponent(version)}`;
                     releaseLink.target = '_blank';
                     releaseLink.rel = 'noopener noreferrer';
                     releaseLink.className =
@@ -746,12 +752,12 @@ class TessarrUtils {
     }
 }
 
-// Initialize utilities
-window.tessarrUtils = new TessarrUtils();
-
-// Global functions for backward compatibility
-window.fetcher = (endpoint, options = {}) => window.tessarrUtils.fetcher(endpoint, options);
-window.createToast = (message, type, duration) => window.tessarrUtils.createToast(message, type, duration);
+// Initialize browser utilities and the backward-compatible global functions.
+if (typeof window !== 'undefined') {
+    window.tessarrUtils = new TessarrUtils();
+    window.fetcher = (endpoint, options = {}) => window.tessarrUtils.fetcher(endpoint, options);
+    window.createToast = (message, type, duration) => window.tessarrUtils.createToast(message, type, duration);
+}
 
 // Export for ES6 modules if needed
 if (typeof module !== 'undefined' && module.exports) {
