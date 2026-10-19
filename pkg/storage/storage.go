@@ -37,9 +37,11 @@ type Storage struct {
 	queue        *hybrid.Store
 	entryItems   *hybrid.Store
 	storageState *hybrid.Store
-	// handoffSyncForTest injects durability failures; production leaves it nil.
+	// Durability hooks inject sync failures; production leaves them nil.
 	handoffSyncForTest     func() error
 	mainCleanupSyncForTest func() error
+	queueRowSyncForTest    func() error
+	queueIntentSyncForTest func() error
 	// Per-key durability latches survive lifecycle-state eviction. Operations
 	// on each key are serialized by its lifecycle lock.
 	handoffPending   sync.Map

@@ -86,6 +86,10 @@ client intent is neither widened nor upgraded from preserving files.
   intent normally.
 - Known migration metadata is excluded from provider collision scans. Malformed
   actual entry records still block destructive cleanup.
+- Failed queue-row retirement and intent-removal syncs remain barriers on every
+  retry, even after the record disappears from the memory index. Completion
+  reopens the queue key only after the cleared intent is durably synced, so a
+  replacement cannot be admitted early or remain blocked after a successful retry.
 
 ### Regression matrix
 
@@ -96,6 +100,7 @@ client intent is neither widened nor upgraded from preserving files.
 | Administrative gate | Both admin APIs followed by true/false client retries; preserving and non-preserving intents; reopen/recovery; unrelated hashes; completion-sync failure; shared key lock through local cleanup |
 | Queue-only admin | Existing benign intent rejected without expansion or false success; reopen/retry; fresh destructive intent retries after provider failure |
 | Migration | Legitimate migration status accepted; corrupt real record rejected |
+| Queue durability | Repeated row-retirement and intent-removal sync failures; direct and client completion retries; replacement admission and reopen after a successful barrier |
 
 The crash test models process termination, not physical power loss or a storage
 device that lies about fsync. The durability argument depends on successful

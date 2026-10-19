@@ -27,6 +27,20 @@ const queueDeletionTombstoneVersion = 1
 const QueuePlacementScopeTransferOnly = "queued_transfer_only"
 const QueuePlacementScopeAll = "all_placements"
 
+func (s *Storage) syncQueueDeletionRow() error {
+	if s.queueRowSyncForTest != nil {
+		return s.queueRowSyncForTest()
+	}
+	return s.queue.Sync()
+}
+
+func (s *Storage) syncQueueDeletionIntent() error {
+	if s.queueIntentSyncForTest != nil {
+		return s.queueIntentSyncForTest()
+	}
+	return s.queueTombstones.Sync()
+}
+
 type queueDeletionPhase string
 
 const (
@@ -377,6 +391,15 @@ func (s *Storage) prepareQueuedDeletion(
 		return queueDeletionIntentFromTombstone(key, tombstone)
 	}
 
+	if state.queueDeleting {
+		// Completion may have removed the intent from the memory index before
+		// its sync failed. A client retry must finish that barrier before an
+		// absent row can count as success or a replacement can be admitted.
+		if err := s.syncQueueDeletionIntent(); err != nil {
+			return nil, fmt.Errorf("sync cleared queue deletion intent: %w", err)
+		}
+		state.queueDeleting = false
+	}
 	entry, err := s.getQueuedRaw(key)
 	if err != nil {
 		return nil, err
@@ -589,14 +612,14 @@ func (s *Storage) RetireQueuedDeletionRow(
 		if err := s.queue.Delete(key); err != nil {
 			return fmt.Errorf("retire queued deletion row: %w", err)
 		}
-		if err := s.queue.Sync(); err != nil {
-			return fmt.Errorf("sync retired queued deletion row: %w", err)
-		}
 	case IsQueuedEntryNotFound(err):
-		// A prior attempt made the row deletion durable but crashed before
-		// advancing the tombstone. Continue the same exact intent.
+		// The row may be absent only from memory after a failed sync. Retry
+		// the durability barrier before advancing the same exact intent.
 	default:
 		return fmt.Errorf("inspect queued deletion row: %w", err)
+	}
+	if err := s.syncQueueDeletionRow(); err != nil {
+		return fmt.Errorf("sync retired queued deletion row: %w", err)
 	}
 
 	if tombstone.Phase != queueDeletionRowRetired {
@@ -637,6 +660,12 @@ func (s *Storage) CompleteQueuedDeletion(
 		return err
 	}
 	if !found {
+		if state.queueDeleting {
+			if err := s.syncQueueDeletionIntent(); err != nil {
+				return fmt.Errorf("sync cleared queue deletion intent: %w", err)
+			}
+			state.queueDeleting = false
+		}
 		return nil
 	}
 	state.queueDeleting = true
@@ -693,7 +722,7 @@ func (s *Storage) CompleteQueuedDeletion(
 		!hybrid.IsNotFound(err) {
 		return fmt.Errorf("clear queue deletion intent: %w", err)
 	}
-	if err := s.queueTombstones.Sync(); err != nil {
+	if err := s.syncQueueDeletionIntent(); err != nil {
 		return fmt.Errorf("sync cleared queue deletion intent: %w", err)
 	}
 	state.queueDeleting = false
