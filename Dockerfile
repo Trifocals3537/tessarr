@@ -50,12 +50,12 @@ ARG VERSION=0.0.0
 ARG CHANNEL=dev
 
 LABEL version="${VERSION}-${CHANNEL}"
-LABEL org.opencontainers.image.source="https://github.com/Trifocals3537/decypharr"
+LABEL org.opencontainers.image.source="https://github.com/Trifocals3537/tessarr"
 LABEL org.opencontainers.image.title="Tessarr"
 LABEL org.opencontainers.image.description="Self-hosted debrid and Usenet media bridge with qBittorrent and SABnzbd-compatible APIs"
 LABEL org.opencontainers.image.authors="Tessarr contributors"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.documentation="https://github.com/Trifocals3537/decypharr/blob/beta/README.md"
+LABEL org.opencontainers.image.documentation="https://github.com/Trifocals3537/tessarr/blob/beta/README.md"
 
 # Install dependencies including rclone (from binary)
 RUN apk add --no-cache fuse3 ca-certificates su-exec shadow curl unzip tzdata && \
