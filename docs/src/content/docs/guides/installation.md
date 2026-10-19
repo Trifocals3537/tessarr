@@ -6,7 +6,7 @@ description: Install Tessarr as a native Linux service or with Docker.
 ## Native Linux (Recommended)
 
 Download the archive for your architecture from this fork's
-[GitHub Releases](https://github.com/Trifocals3537/tessarr/releases).
+[GitHub Releases](https://github.com/Trifocals3537/decypharr/releases).
 Linux hosts need FUSE support and a compatible FUSE runtime (commonly
 `libfuse2` on Ubuntu and Debian). Install rclone only if you plan to use the
 rclone mount backend.
@@ -328,12 +328,6 @@ docker run -d \
 
 The container image explicitly listens on `0.0.0.0`; publish only the ports you
 intend to expose.
-
-## Managed (ElfHosted)
-
-Prefer not to self-host? A managed Tessarr instance is available
-via [ElfHosted](https://store.elfhosted.com/product/tessarr/?utm_source=github&utm_medium=docs&utm_campaign=tessarr-docs),
-preconfigured alongside Sonarr/Radarr and connected to your debrid provider. Includes a 7-day trial.
 
 ## Next Steps
 

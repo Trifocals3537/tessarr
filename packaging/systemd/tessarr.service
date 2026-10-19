@@ -1,6 +1,6 @@
 [Unit]
 Description=Tessarr media gateway
-Documentation=https://github.com/Trifocals3537/tessarr
+Documentation=https://github.com/Trifocals3537/decypharr
 
 [Service]
 Type=simple

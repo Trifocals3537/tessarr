@@ -542,4 +542,4 @@ REPAIR__ENABLED=true
 REPAIR__INTERVAL=30m
 ```
 
-See [defaults.go](https://github.com/Trifocals3537/tessarr/blob/beta/internal/config/defaults.go) for all defaults.
+See [defaults.go](https://github.com/Trifocals3537/decypharr/blob/beta/internal/config/defaults.go) for all defaults.
