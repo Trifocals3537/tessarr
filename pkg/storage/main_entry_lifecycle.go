@@ -28,8 +28,10 @@ var (
 )
 
 // mainEntryLifecycle serializes only the final local read/write section for one
-// main-entry key. Provider, network, and filesystem work carries a generation
-// token and never holds these locks.
+// main-entry key. Provider and network work carries a generation token and
+// never holds these locks. CompleteQueuedDeletion is the narrow filesystem
+// exception: local cleanup holds the per-key lock to serialize against admin
+// snapshot installation. Its callback must not re-enter Storage.
 //
 // Generations are intentionally process-local because no worker survives a
 // restart. Retired keys and authoritative provider absences are persisted

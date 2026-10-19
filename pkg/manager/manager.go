@@ -1118,7 +1118,11 @@ func (m *Manager) DeleteEntryForQueueCleanup(queued *storage.Entry) error {
 // DeleteQBitQueueEntry retires only the client queue and owned staging data.
 // Provider cancellation requires a durable, Arr-validated failed-transfer proof.
 func (m *Manager) DeleteQBitQueueEntry(infohash string, deleteFiles bool) error {
-	_, err := m.queue.deleteWithPreparation(infohash, func(e *storage.Entry) error { return m.RemoveTorrentPlacements(e) }, deleteFiles, func() (*storage.QueueDeletionIntent, error) {
+	var cleanup func(*storage.Entry) error
+	if deleteFiles {
+		cleanup = func(e *storage.Entry) error { return m.RemoveTorrentPlacements(e) }
+	}
+	_, err := m.queue.deleteWithPreparation(infohash, cleanup, deleteFiles, func() (*storage.QueueDeletionIntent, error) {
 		return m.queue.storage.PrepareQBitQueuedDeletion(infohash, deleteFiles)
 	})
 	return err

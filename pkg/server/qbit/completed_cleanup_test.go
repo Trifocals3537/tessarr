@@ -1,12 +1,15 @@
 package qbit
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
@@ -69,6 +72,11 @@ func TestCompletedDownloadCleanupPreservesPersistentEntry(t *testing.T) {
 	}
 	libraryLink := filepath.Join(t.TempDir(), "episode.mkv")
 	if err := os.Symlink(payload, libraryLink); err != nil {
+		// ERROR_PRIVILEGE_NOT_HELD: ordinary Windows accounts may lack
+		// symlink permission even when all application operations are allowed.
+		if runtime.GOOS == "windows" && errors.Is(err, syscall.Errno(1314)) {
+			t.Skipf("symlink fixture requires Windows symlink privilege: %v", err)
+		}
 		t.Fatal(err)
 	}
 	entry := &storage.Entry{

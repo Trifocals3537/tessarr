@@ -10,6 +10,24 @@ import (
 	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 )
 
+func (s *Storage) syncHandoffState() error {
+	if s.handoffSyncForTest != nil {
+		return s.handoffSyncForTest()
+	}
+	return s.storageState.Sync()
+}
+
+func (s *Storage) flushPendingHandoff(key string) error {
+	if _, pending := s.handoffPending.Load(key); !pending {
+		return nil
+	}
+	if err := s.syncHandoffState(); err != nil {
+		return err
+	}
+	s.handoffPending.Delete(key)
+	return nil
+}
+
 const handoffAuthorizationPrefix = "uncached_handoff/"
 
 // FailedUncachedHandoff requires positive failure evidence, never inferred import
@@ -74,16 +92,24 @@ func (s *Storage) AuthorizeUncachedHandoff(expected *Entry) error {
 	if !bytes.Equal(want, got) {
 		return ErrQueuedDeletionIdentityMismatch
 	}
-	if err := s.storageState.Put(handoffAuthorizationPrefix+normalizeMainEntryKey(expected.InfoHash), got, nil); err != nil {
+	key := handoffAuthorizationPrefix + normalizeMainEntryKey(expected.InfoHash)
+	if err := s.flushPendingHandoff(key); err != nil {
 		return err
 	}
-	return s.storageState.Sync()
+	if err := s.storageState.Put(key, got, nil); err != nil {
+		return err
+	}
+	s.handoffPending.Store(key, struct{}{})
+	return s.flushPendingHandoff(key)
 }
 
 // revokeChangedHandoffAuthorization runs under the queue key lock before a
 // changed row is persisted. Revocation is durable even if progress later regresses.
 func (s *Storage) revokeChangedHandoffAuthorization(e *Entry) error {
 	key := handoffAuthorizationPrefix + normalizeMainEntryKey(e.InfoHash)
+	if err := s.flushPendingHandoff(key); err != nil {
+		return err
+	}
 	proof, err := s.storageState.Get(key)
 	if hybrid.IsNotFound(err) {
 		return nil
@@ -103,10 +129,14 @@ func (s *Storage) revokeChangedHandoffAuthorization(e *Entry) error {
 	if err := s.storageState.Delete(key); err != nil && !hybrid.IsNotFound(err) {
 		return err
 	}
-	return s.storageState.Sync()
+	s.handoffPending.Store(key, struct{}{})
+	return s.flushPendingHandoff(key)
 }
 
 func (s *Storage) authorizedTransferSnapshot(e *Entry) (*Entry, error) {
+	if err := s.flushPendingHandoff(handoffAuthorizationPrefix + normalizeMainEntryKey(e.InfoHash)); err != nil {
+		return nil, err
+	}
 	if !FailedUncachedHandoff(e) {
 		return nil, nil
 	}
@@ -146,6 +176,9 @@ func (s *Storage) ValidateTransferCleanup(e *Entry) error {
 	// Provider IDs can back library symlinks even for a different hash. Scan
 	// raw main snapshots rather than reentering this key's lifecycle lock.
 	return s.entries.ForEach(func(key string, data []byte) error {
+		if key == "__migration_status__" {
+			return nil
+		}
 		main, err := decodeEntryForKey(key, data, ErrQueuedDeletionIdentityMismatch, "main collision check")
 		if err != nil {
 			return err

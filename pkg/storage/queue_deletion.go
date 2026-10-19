@@ -27,6 +27,20 @@ const queueDeletionTombstoneVersion = 1
 const QueuePlacementScopeTransferOnly = "queued_transfer_only"
 const QueuePlacementScopeAll = "all_placements"
 
+func (s *Storage) syncQueueDeletionRow() error {
+	if s.queueRowSyncForTest != nil {
+		return s.queueRowSyncForTest()
+	}
+	return s.queue.Sync()
+}
+
+func (s *Storage) syncQueueDeletionIntent() error {
+	if s.queueIntentSyncForTest != nil {
+		return s.queueIntentSyncForTest()
+	}
+	return s.queueTombstones.Sync()
+}
+
 type queueDeletionPhase string
 
 const (
@@ -328,6 +342,12 @@ func (s *Storage) prepareQueuedDeletion(
 	}
 	if found {
 		if tombstone.PlacementScope == QueuePlacementScopeTransferOnly {
+			if scope == QueuePlacementScopeAll && placementCleanup && len(placementSnapshots) == 0 {
+				return nil, fmt.Errorf("queue-only administrative cleanup cannot adopt immutable client intent; finish client cleanup and reconcile provider placements manually")
+			}
+			if scope == QueuePlacementScopeTransferOnly && preserveFiles && !tombstone.PreserveFiles {
+				return nil, fmt.Errorf("preserving retry cannot resume pending file deletion; retry original deleteFiles=true operation")
+			}
 			return queueDeletionIntentFromTombstone(key, tombstone)
 		}
 		if scope == QueuePlacementScopeTransferOnly {
@@ -371,6 +391,15 @@ func (s *Storage) prepareQueuedDeletion(
 		return queueDeletionIntentFromTombstone(key, tombstone)
 	}
 
+	if state.queueDeleting {
+		// Completion may have removed the intent from the memory index before
+		// its sync failed. A client retry must finish that barrier before an
+		// absent row can count as success or a replacement can be admitted.
+		if err := s.syncQueueDeletionIntent(); err != nil {
+			return nil, fmt.Errorf("sync cleared queue deletion intent: %w", err)
+		}
+		state.queueDeleting = false
+	}
 	entry, err := s.getQueuedRaw(key)
 	if err != nil {
 		return nil, err
@@ -583,14 +612,14 @@ func (s *Storage) RetireQueuedDeletionRow(
 		if err := s.queue.Delete(key); err != nil {
 			return fmt.Errorf("retire queued deletion row: %w", err)
 		}
-		if err := s.queue.Sync(); err != nil {
-			return fmt.Errorf("sync retired queued deletion row: %w", err)
-		}
 	case IsQueuedEntryNotFound(err):
-		// A prior attempt made the row deletion durable but crashed before
-		// advancing the tombstone. Continue the same exact intent.
+		// The row may be absent only from memory after a failed sync. Retry
+		// the durability barrier before advancing the same exact intent.
 	default:
 		return fmt.Errorf("inspect queued deletion row: %w", err)
+	}
+	if err := s.syncQueueDeletionRow(); err != nil {
+		return fmt.Errorf("sync retired queued deletion row: %w", err)
 	}
 
 	if tombstone.Phase != queueDeletionRowRetired {
@@ -606,10 +635,14 @@ func (s *Storage) RetireQueuedDeletionRow(
 }
 
 // CompleteQueuedDeletion clears an intent only after its row is durably absent
-// and every representable cleanup obligation has been acknowledged.
+// and every representable cleanup obligation has been acknowledged. Optional
+// localCleanup callbacks run under the per-hash lifecycle lock, after the admin
+// durability gate. They must only perform local file work: never reenter Storage
+// or make provider/network calls.
 func (s *Storage) CompleteQueuedDeletion(
 	infohash string,
 	incarnation string,
+	localCleanup ...func() error,
 ) error {
 	key := normalizeMainEntryKey(infohash)
 	ref, err := s.acquireMainEntryState(key)
@@ -627,6 +660,12 @@ func (s *Storage) CompleteQueuedDeletion(
 		return err
 	}
 	if !found {
+		if state.queueDeleting {
+			if err := s.syncQueueDeletionIntent(); err != nil {
+				return fmt.Errorf("sync cleared queue deletion intent: %w", err)
+			}
+			state.queueDeleting = false
+		}
 		return nil
 	}
 	state.queueDeleting = true
@@ -653,17 +692,37 @@ func (s *Storage) CompleteQueuedDeletion(
 	} else if !IsQueuedEntryNotFound(err) {
 		return fmt.Errorf("verify retired queue deletion row: %w", err)
 	}
+	// A cleared in-memory admin snapshot is not proof of durable completion.
+	// Sync before consulting it, under the same key lock used to install it.
+	// Keep that lock through local cleanup and intent completion so a concurrent
+	// administrator cannot install an obligation in the check/use interval.
+	if err := s.syncMainCleanupState(); err != nil {
+		return err
+	}
+	admin, adminFound, err := s.loadMainEntryTombstone(key)
+	if err != nil {
+		return err
+	}
+	if adminFound && len(admin.PlacementSnapshot) != 0 {
+		return fmt.Errorf("queue deletion awaits administrative placement cleanup")
+	}
+	for _, cleanup := range localCleanup {
+		if err := cleanup(); err != nil {
+			return err
+		}
+	}
 	if err := s.storageState.Delete(handoffAuthorizationPrefix + key); err != nil && !hybrid.IsNotFound(err) {
 		return err
 	}
-	if err := s.storageState.Sync(); err != nil {
+	if err := s.syncHandoffState(); err != nil {
 		return err
 	}
+	s.handoffPending.Delete(handoffAuthorizationPrefix + key)
 	if err := s.queueTombstones.Delete(key); err != nil &&
 		!hybrid.IsNotFound(err) {
 		return fmt.Errorf("clear queue deletion intent: %w", err)
 	}
-	if err := s.queueTombstones.Sync(); err != nil {
+	if err := s.syncQueueDeletionIntent(); err != nil {
 		return fmt.Errorf("sync cleared queue deletion intent: %w", err)
 	}
 	state.queueDeleting = false

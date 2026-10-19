@@ -304,11 +304,6 @@ func (q *Queue) deleteWithPreparation(infohash string, cleanup func(*storage.Ent
 			return false, err
 		}
 	}
-	if deleteFiles && !intent.PreserveFiles {
-		if err := q.deleteEntryFiles(intent.Entry); err != nil {
-			return false, err
-		}
-	}
 	if err := q.storage.RetireQueuedDeletionRow(
 		intent.InfoHash,
 		intent.QueueIncarnation,
@@ -318,6 +313,12 @@ func (q *Queue) deleteWithPreparation(infohash string, cleanup func(*storage.Ent
 	if err := q.storage.CompleteQueuedDeletion(
 		intent.InfoHash,
 		intent.QueueIncarnation,
+		func() error {
+			if deleteFiles && !intent.PreserveFiles {
+				return q.deleteEntryFiles(intent.Entry)
+			}
+			return nil
+		},
 	); err != nil {
 		return false, err
 	}

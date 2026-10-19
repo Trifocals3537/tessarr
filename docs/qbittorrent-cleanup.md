@@ -28,6 +28,10 @@ Authorization binds the queue incarnation, owner/endpoint, active provider/ID,
 failure reason/state and progress baseline. A queue update that changes this
 evidence durably revokes authorization; changing it back does not restore it.
 Missing or stale authorization falls back to benign queue/staging cleanup.
+A failed authorization or revocation sync is different: an in-memory durability
+latch rejects subsequent evidence updates, destructive preparation and
+reauthorization until the pending barrier succeeds. A proof disappearing from
+the memory index does not acknowledge its durable revocation.
 
 After workers drain, the final incarnation is classified while preparing its
 durable deletion intent. Client intents carry `queued_transfer_only` scope and,
@@ -56,6 +60,51 @@ synced snapshot in the main deletion tombstone, even when resuming a benign
 client intent with no provider callback. Main cleanup runs before queue files;
 provider errors preserve the admin obligation for retry/restart. The existing
 client intent is neither widened nor upgraded from preserving files.
+
+## Failed requests and retries
+
+- A false or omitted `deleteFiles` request cannot resume an unfinished true
+  client deletion. It returns an error without cancelling providers, removing
+  files, or forgetting the original intent—even when provider cleanup already
+  succeeded and only files remain. Retry the original `deleteFiles=true`
+  operation, or allow restart recovery to finish its durable obligations.
+- A false-first intent remains preserving when subsequently retried with true.
+- Pending administrative main cleanup gates same-hash local file deletion and
+  queue-intent completion in live calls as well as recovery. An ordinary client
+  retry cannot perform the admin's provider deletion. The queue row may already
+  be retired to prevent workers restarting; its intent and staging remain.
+  Retry the administrative operation while the main row exists, or let startup
+  recovery finish the independent snapshot after restart. Unrelated hashes are
+  not blocked by that snapshot.
+- Queue-only administrative deletion (no main row) cannot adopt an existing
+  client intent. It fails closed rather than widen scope or report provider
+  deletion it did not perform. Record the retained intent's provider IDs and
+  manually reconcile the provider obligation; the original client operation can
+  then finish according to its own policy. Repeating the incompatible admin
+  request, including after reopening storage, does not upgrade the intent.
+  A fresh queue-only admin deletion still persists and retries its destructive
+  intent normally.
+- Known migration metadata is excluded from provider collision scans. Malformed
+  actual entry records still block destructive cleanup.
+- Failed queue-row retirement and intent-removal syncs remain barriers on every
+  retry, even after the record disappears from the memory index. Completion
+  reopens the queue key only after the cleared intent is durably synced, so a
+  replacement cannot be admitted early or remain blocked after a successful retry.
+
+### Regression matrix
+
+| Boundary | Coverage |
+| --- | --- |
+| Handoff durability | Repeated failed sync; changed/reverted evidence; failed authorization and reauthorization; completion retries; subprocess exit without Close and reopen before/after the successful barrier |
+| Preserving retries | Manager false retry with provider pending or only files pending; HTTP false/omitted flags; false-first preservation |
+| Administrative gate | Both admin APIs followed by true/false client retries; preserving and non-preserving intents; reopen/recovery; unrelated hashes; completion-sync failure; shared key lock through local cleanup |
+| Queue-only admin | Existing benign intent rejected without expansion or false success; reopen/retry; fresh destructive intent retries after provider failure |
+| Migration | Legitimate migration status accepted; corrupt real record rejected |
+| Queue durability | Repeated row-retirement and intent-removal sync failures; direct and client completion retries; replacement admission and reopen after a successful barrier |
+
+The crash test models process termination, not physical power loss or a storage
+device that lies about fsync. The durability argument depends on successful
+filesystem sync having its documented meaning.
 
 ## Protocol limitation
 

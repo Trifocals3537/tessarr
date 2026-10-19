@@ -5,6 +5,13 @@ import (
 	"fmt"
 )
 
+func (s *Storage) syncMainCleanupState() error {
+	if s.mainCleanupSyncForTest != nil {
+		return s.mainCleanupSyncForTest()
+	}
+	return s.entryTombstones.Sync()
+}
+
 // PrepareMainDeletionPlacements persists the independently requested admin
 // cleanup under an already installed main deletion tombstone, before queue
 // retirement or provider work. Existing snapshots are immutable on retry.
@@ -37,7 +44,7 @@ func (s *Storage) PrepareMainDeletionPlacements(entry *Entry) error {
 			return err
 		}
 	}
-	return s.entryTombstones.Sync()
+	return s.syncMainCleanupState()
 }
 
 // MainDeletionPlacementIntents returns only durable admin snapshots, never
@@ -85,5 +92,5 @@ func (s *Storage) CompleteMainDeletionPlacements(infohash string) error {
 	if err := s.entryTombstones.Put(ref.key, data, nil); err != nil {
 		return err
 	}
-	return s.entryTombstones.Sync()
+	return s.syncMainCleanupState()
 }
