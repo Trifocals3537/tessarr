@@ -32,7 +32,7 @@ Usenet streaming.
 
 Native binaries are the primary deployment path for seedboxes and other
 user-managed Linux hosts. Download the archive for your architecture from this
-fork's [GitHub Releases](https://github.com/Trifocals3537/tessarr/releases),
+fork's [GitHub Releases](https://github.com/Trifocals3537/decypharr/releases),
 verify it with the published `SHA256SUMS`, and install it:
 
 ```bash
@@ -137,10 +137,6 @@ Without this, the host mount can be healthy while the media container keeps the
 old FUSE mount and reports `Transport endpoint is not connected`. See the
 [Docker installation notes](docs/src/content/docs/guides/installation.md#media-server-containers)
 for verification and managed-host guidance.
-
-> Prefer not to self-host? A managed Tessarr instance is available
-> via [ElfHosted](https://store.elfhosted.com/product/tessarr/?utm_source=github&utm_medium=readme&utm_campaign=tessarr-readme),
-> preconfigured alongside Sonarr/Radarr to route requests to your debrid provider (7-day trial).
 
 ## Documentation
 

@@ -422,7 +422,7 @@ class TessarrUtils {
                 } else {
                     const releaseLink = document.createElement('a');
                     releaseLink.href =
-                        `https://github.com/Trifocals3537/tessarr/releases/tag/v${encodeURIComponent(version)}`;
+                        `https://github.com/Trifocals3537/decypharr/releases/tag/v${encodeURIComponent(version)}`;
                     releaseLink.target = '_blank';
                     releaseLink.rel = 'noopener noreferrer';
                     releaseLink.className =

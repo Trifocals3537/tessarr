@@ -17,7 +17,7 @@ export default defineConfig({
                 Header: './src/components/Header.astro',
             },
             social: [
-                {label: 'GitHub', icon: 'github', href: 'https://github.com/Trifocals3537/tessarr'},
+                {label: 'GitHub', icon: 'github', href: 'https://github.com/Trifocals3537/decypharr'},
             ],
             sidebar: [
                 {
