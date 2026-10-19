@@ -7,21 +7,21 @@ import (
 )
 
 func getEnv(key string) string {
-	return os.Getenv("DECYPHARR_" + key)
+	return os.Getenv("TESSARR_" + key)
 }
 
 func parseBool(val string) bool {
 	return val == "true" || val == "1" || val == "yes"
 }
 
-// applyEnvOverrides applies environment variable overrides with DECYPHARR_ prefix
+// applyEnvOverrides applies environment variable overrides with TESSARR_ prefix
 // Environment variables use __ (double underscore) for nested fields and array indices
 // Examples:
 //
-//	DECYPHARR_PORT=9090
-//	DECYPHARR_DOWNLOAD_FOLDER=/downloads
-//	DECYPHARR_DEBRIDS__0__NAME=realdebrid
-//	DECYPHARR_DEBRIDS__0__API_KEY=abc123
+//	TESSARR_PORT=9090
+//	TESSARR_DOWNLOAD_FOLDER=/downloads
+//	TESSARR_DEBRIDS__0__NAME=realdebrid
+//	TESSARR_DEBRIDS__0__API_KEY=abc123
 func (c *Config) applyEnvOverrides() {
 	// Root level fields
 	if val := getEnv("PORT"); val != "" {
@@ -52,11 +52,19 @@ func (c *Config) applyEnvOverrides() {
 			c.MaxActiveDownloads = v
 		}
 	}
+	if val := getEnv("JOB_QUEUE_CAPACITY"); val != "" {
+		if v, err := strconv.Atoi(val); err == nil {
+			c.JobQueueCapacity = v
+		}
+	}
 	if val := getEnv("SKIP_PRE_CACHE"); val != "" {
 		c.SkipPreCache = parseBool(val)
 	}
 	if val := getEnv("ALWAYS_RM_TRACKER_URLS"); val != "" {
 		c.AlwaysRmTrackerUrls = parseBool(val)
+	}
+	if val := getEnv("RELATIVE_SYMLINKS"); val != "" {
+		c.RelativeSymlinks = parseBool(val)
 	}
 	if val := getEnv("MIN_FILE_SIZE"); val != "" {
 		c.MinFileSize = val

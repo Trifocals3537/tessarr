@@ -2,19 +2,78 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
-	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/sirrobot01/decypharr/pkg/usenet"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/usenet"
 )
 
-func (m *Manager) restoreActiveDownloadJobs() {
+// recoverInterruptedDownloads clears process-local work left in the durable
+// queue by a stopped process. It must run synchronously before constructing the
+// JobQueue or starting any scheduler/intake: a background reset could clear a
+// flag that a new worker has already claimed. Provider placements, progress and
+// download states remain intact; normal restoration resumes the existing work.
+func (m *Manager) recoverInterruptedDownloads(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.queue == nil || m.queue.storage == nil {
+		return fmt.Errorf("download queue storage is unavailable")
+	}
+	interrupted := func(entry *storage.Entry) bool {
+		return entry.State == storage.EntryStateDownloading && entry.IsDownloading
+	}
+	// Unlike ListFilter, propagate a failed scan instead of starting workers
+	// with a partially recovered (or apparently empty) queue.
+	entries, err := m.queue.storage.FilterQueued(interrupted)
+	if err != nil {
+		return err
+	}
+	recovered := 0
+	for _, snapshot := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Re-read through the lifecycle gate; never bind a scanned payload to a
+		// newer generation or resurrect a row hidden by an explicit deletion.
+		entry, err := m.queue.GetTorrent(snapshot.InfoHash)
+		if storage.IsQueuedEntryNotFound(err) || errors.Is(err, ErrQueueEntryDeleting) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read interrupted download %s: %w", snapshot.InfoHash, err)
+		}
+		if !interrupted(entry) {
+			continue
+		}
+		entry.IsDownloading = false
+		if err := m.queue.Update(entry); err != nil {
+			return fmt.Errorf("reset interrupted download %s: %w", entry.InfoHash, err)
+		}
+		recovered++
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if recovered > 0 {
+		if err := m.queue.Sync(); err != nil {
+			return fmt.Errorf("sync recovered download queue: %w", err)
+		}
+		m.logger.Info().Int("count", recovered).Msg("Recovered interrupted local downloads")
+	}
+	return nil
+}
+
+func (m *Manager) restoreActiveDownloadJobs(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+
 	entries := m.queue.ListFilter("", config.ProtocolAll, storage.EntryStateDownloading, nil, "", false)
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].AddedOn.Before(entries[j].AddedOn)
@@ -22,22 +81,37 @@ func (m *Manager) restoreActiveDownloadJobs() {
 
 	// Existing active downloads reserve slots before queued imports are resumed.
 	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
 		if entry.Status == debridTypes.TorrentStatusQueued || m.nzbNeedsReprocessing(entry) {
 			continue
 		}
-		_ = m.SubmitJob(&Job{
+		if err := m.submitRestoredJob(ctx, &Job{
 			ID:    entry.InfoHash,
 			Type:  jobTypeForEntry(entry),
 			Entry: entry,
-		})
+		}); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			entry.MarkAsError(err)
+			_ = m.queue.Update(entry)
+		}
 	}
 
 	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
 		if entry.Status != debridTypes.TorrentStatusQueued && !m.nzbNeedsReprocessing(entry) {
 			continue
 		}
-		job, err := m.rebuildQueuedJob(entry)
+		job, err := m.rebuildQueuedJob(ctx, entry)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			entry.MarkAsError(err)
 			_ = m.queue.Update(entry)
 			continue
@@ -46,7 +120,10 @@ func (m *Manager) restoreActiveDownloadJobs() {
 			entry.Status = debridTypes.TorrentStatusQueued
 		}
 		_ = m.queue.Update(entry)
-		if err := m.SubmitJob(job); err != nil {
+		if err := m.submitRestoredJob(ctx, job); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			entry.MarkAsError(err)
 			_ = m.queue.Update(entry)
 		}
@@ -68,9 +145,9 @@ func (m *Manager) nzbNeedsReprocessing(entry *storage.Entry) bool {
 	return err == nil && meta != nil && (meta.Status == usenet.NZBStatusParsing || meta.Status == usenet.NZBStatusDownloading)
 }
 
-func (m *Manager) rebuildQueuedJob(entry *storage.Entry) (*Job, error) {
+func (m *Manager) rebuildQueuedJob(ctx context.Context, entry *storage.Entry) (*Job, error) {
 	if entry.IsNZB() {
-		return m.rebuildQueuedNZBJob(entry)
+		return m.rebuildQueuedNZBJob(ctx, entry)
 	}
 	return m.rebuildQueuedTorrentJob(entry)
 }
@@ -85,9 +162,9 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 		}, nil
 	}
 
-	magnet, err := utils.GetMagnetInfo(entry.Magnet, m.config.AlwaysRmTrackerUrls)
+	magnet, err := m.torrentMagnetForEntry(entry)
 	if err != nil {
-		magnet = utils.ConstructMagnet(entry.InfoHash, entry.Name)
+		return nil, err
 	}
 
 	downloadUncached := entry.DownloadUncached
@@ -109,29 +186,42 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 	return job, nil
 }
 
-func (m *Manager) rebuildQueuedNZBJob(entry *storage.Entry) (*Job, error) {
+func (m *Manager) rebuildQueuedNZBJob(ctx context.Context, entry *storage.Entry) (*Job, error) {
 	if m.usenet == nil {
 		return nil, fmt.Errorf("usenet is not configured")
 	}
-	sourcePath := entry.Magnet
-	if meta, err := m.usenet.GetNZBHeader(entry.InfoHash); err == nil && meta != nil && meta.Path != "" {
-		sourcePath = meta.Path
+	var (
+		content []byte
+		err     error
+	)
+	meta, metaErr := m.usenet.GetNZBHeader(entry.InfoHash)
+	if metaErr == nil && meta != nil && meta.Path != "" {
+		content, err = m.usenet.ReadNZBSource(entry.InfoHash, meta.Path)
+	} else {
+		if metaErr != nil && !usenet.IsNZBNotFound(metaErr) {
+			return nil, fmt.Errorf("inspect queued NZB metadata: %w", metaErr)
+		}
+		content, err = m.usenet.ReadStagedNZB(entry.InfoHash, entry.Magnet)
 	}
-	content, err := os.ReadFile(sourcePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read queued NZB source: %w", err)
 	}
 
 	name := entry.OriginalFilename
 	if name == "" {
 		name = entry.Name
 	}
-	meta, groups, err := m.usenet.ParseWithID(context.Background(), entry.InfoHash, name, content, entry.Category)
+	meta, groups, err := m.usenet.ParseWithID(ctx, entry.InfoHash, name, content, entry.Category)
 	if err != nil {
 		return nil, fmt.Errorf("usenet parse failed: %w", err)
 	}
-	if entry.Magnet != "" && sourcePath == entry.Magnet {
-		m.usenet.RemoveStagedNZB(entry.Magnet)
+	// A previous attempt may have parsed successfully and then failed before
+	// removing its staged source. Always retry the exact ID-bound removal even
+	// when this attempt preferred the persisted .nzb source.
+	if entry.Magnet != "" {
+		if err := m.usenet.RemoveStagedNZB(entry.InfoHash, entry.Magnet); err != nil {
+			return nil, fmt.Errorf("remove staged NZB source: %w", err)
+		}
 	}
 
 	entry.Magnet = ""
@@ -145,7 +235,7 @@ func (m *Manager) rebuildQueuedNZBJob(entry *storage.Entry) (*Job, error) {
 
 	req := NewNZBRequest(
 		meta.Name,
-		downloadFolderForEntry(m.config.DownloadFolder, entry),
+		m.config.DownloadFolder,
 		content,
 		m.arr.GetOrCreate(entry.Category),
 		entry.Action,

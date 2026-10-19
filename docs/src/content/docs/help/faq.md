@@ -1,26 +1,26 @@
 ---
 title: Frequently Asked Questions
-description: Common questions about Decypharr.
+description: Common questions about Tessarr.
 ---
 
 ## General
 
-### What is Decypharr?
+### What is Tessarr?
 
-Decypharr is a media gateway that provides a unified interface for accessing Debrid providers (Real Debrid, All Debrid,
+Tessarr is a media gateway that provides a unified interface for accessing Debrid providers (Real Debrid, All Debrid,
 etc.) and Usenet via Sonarr, Radarr, and other *Arr applications. It acts as a QBitTorrent/Sabnzbd-compatible download
 client.
 
 ### Is it free?
 
-Yes, Decypharr itself is free and open source. However, you need subscriptions to:
+Yes, Tessarr itself is free and open source. However, you need subscriptions to:
 
 - Debrid providers (Real Debrid, All Debrid, etc.)
 - Usenet providers (if using Usenet features)
 
 ### How is this different from just using Debrid directly?
 
-Decypharr adds:
+Tessarr adds:
 
 - Arr integration (Sonarr/Radarr compatibility)
 - File mounting (DFS, Rclone, WebDAV)
@@ -33,7 +33,7 @@ Decypharr adds:
 ### Where is the config file located?
 
 - **Docker**: `/config/config.json` (mapped volume)
-- **Binary**: You choose the location on first run `./decypharr --config /path/to/`
+- **Binary**: You choose the location on first run `./tessarr --config /path/to/`
 
 ### Can I use environment variables instead of config.json?
 
@@ -49,8 +49,9 @@ See [Configuration Reference](../guides/configuration/) for all options.
 
 ### How do I get my API token?
 
-After setup, go to **Settings** → **Auth** in the web UI. Your API token is displayed once after initial setup - save it
-immediately.
+Go to **Settings** → **Auth** and regenerate the token. The new token is shown
+only in that authenticated response, so save it immediately. Configuration
+reads report only whether a token exists and never return the stored token.
 
 To regenerate:
 
@@ -58,6 +59,8 @@ To regenerate:
 curl -X POST -H "Authorization: Bearer OLD_TOKEN" \
   http://localhost:8282/api/refresh-token
 ```
+
+The response field is named `token`.
 
 ## Debrid Providers
 
@@ -74,7 +77,7 @@ Yes! Add multiple providers in config:
 }
 ```
 
-Decypharr will automatically distribute torrents across providers based on available slots.
+Tessarr will automatically distribute torrents across providers based on available slots.
 
 ### How do I handle Debrid rate limits?
 
@@ -119,7 +122,7 @@ Configure `minimum_free_slot` to switch to backup provider:
 }
 ```
 
-If RD has <5 free slots, Decypharr uses All Debrid.
+If RD has <5 free slots, Tessarr uses All Debrid.
 
 ## Mounting
 
@@ -160,7 +163,7 @@ id plex
 Yes, use WebDAV:
 
 ```
-http://decypharr:8282/webdav/
+http://tessarr:8282/webdav/
 ```
 
 Mount as network drive in Windows/macOS/Linux. See [WebDAV Guide](../guides/mounting/webdav/).
@@ -169,7 +172,7 @@ Mount as network drive in Windows/macOS/Linux. See [WebDAV Guide](../guides/moun
 
 ### Do I need Sabnzbd or NZBGet?
 
-No! Decypharr connects directly to NNTP servers. Just add your Usenet provider(s) in config.
+No! Tessarr connects directly to NNTP servers. Just add your Usenet provider(s) in config.
 
 ### Why is Usenet processing slow?
 
@@ -203,12 +206,12 @@ And per-provider:
 
 ### Path mapping not working?
 
-Ensure Arr and Decypharr see files at the **same path**.
+Ensure Arr and Tessarr see files at the **same path**.
 
 **Wrong** (Docker):
 
 ```yaml
-decypharr:
+tessarr:
   volumes:
     - /mnt/storage:/data
 sonarr:
@@ -219,7 +222,7 @@ sonarr:
 **Correct**:
 
 ```yaml
-decypharr:
+tessarr:
   volumes:
     - /mnt/storage:/mnt/storage
 sonarr:
@@ -237,8 +240,8 @@ sonarr:
 
 Yes! Add both download clients:
 
-1. **Decypharr (QBitTorrent)** for torrents
-2. **Decypharr (Sabnzbd)** for NZBs
+1. **Tessarr (QBitTorrent)** for torrents
+2. **Tessarr (Sabnzbd)** for NZBs
 
 Set different priorities in Arr.
 
@@ -304,9 +307,9 @@ Actual usage depends on your viewing patterns.
 
 ### WebUI won't load
 
-1. Verify Decypharr is running:
+1. Verify Tessarr is running:
    ```bash
-   docker logs decypharr
+   docker logs tessarr
    curl http://localhost:8282/version
    ```
 2. Check port binding
@@ -339,8 +342,8 @@ rm /path/to/config.json  # Binary
 **Docker**:
 
 ```bash
-docker logs decypharr
-docker logs -f decypharr  # Follow
+docker logs tessarr
+docker logs -f tessarr  # Follow
 ```
 
 **Binary**: stdout (redirect to file if needed)
@@ -355,17 +358,17 @@ Set log level:
 
 ### Moving from MKVToolNix/Stremio/etc?
 
-Decypharr can coexist:
+Tessarr can coexist:
 
 1. Keep existing setup running
-2. Add Decypharr as additional download client in Arrs
-3. Set higher priority for Decypharr
+2. Add Tessarr as additional download client in Arrs
+3. Set higher priority for Tessarr
 4. Test with new downloads
 5. Once stable, remove old client
 
 ### Switching from Rclone mount to DFS?
 
-1. Stop Decypharr
+1. Stop Tessarr
 2. Change config:
    ```json
    {"mount": {"type": "dfs"}}
@@ -374,4 +377,4 @@ Decypharr can coexist:
 4. Verify mount at same path
 5. Test playback
 
-No need to re-download - Decypharr reuses existing Debrid torrents.
+No need to re-download - Tessarr reuses existing Debrid torrents.

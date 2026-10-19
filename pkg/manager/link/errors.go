@@ -3,10 +3,17 @@ package link
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
+	"time"
 )
 
 // ErrorCategory defines the type of link error and its retry behavior
 type ErrorCategory int
+
+// CodeLinkRefreshCooldown identifies local, per-file refresh suppression, not
+// an observed provider throttle. It still uses the normal backoff semantics.
+const CodeLinkRefreshCooldown = "link_refresh_cooldown"
 
 const (
 	// CategoryPermanent - Don't retry (file deleted, unauthorized)
@@ -15,8 +22,10 @@ const (
 	CategoryRetryable
 	// CategoryRefetchable - Get new link (expired, invalid code)
 	CategoryRefetchable
-	// CategoryAccountIssue - Disable account (bandwidth exceeded)
+	// CategoryAccountIssue - Temporarily suspend account (bandwidth/quota pressure)
 	CategoryAccountIssue
+	// CategoryThrottled - wait and retry the same link (429)
+	CategoryThrottled
 )
 
 // String returns a human-readable name for the error category
@@ -30,6 +39,8 @@ func (c ErrorCategory) String() string {
 		return "refetchable"
 	case CategoryAccountIssue:
 		return "account_issue"
+	case CategoryThrottled:
+		return "throttled"
 	default:
 		return "unknown"
 	}
@@ -37,9 +48,10 @@ func (c ErrorCategory) String() string {
 
 // Error represents a structured error with retry semantics
 type Error struct {
-	Err      error
-	Category ErrorCategory
-	Code     string // Error code from provider (e.g., "bandwidth_exceeded", "404")
+	Err        error
+	Category   ErrorCategory
+	Code       string        // Stable code from a provider or local link policy
+	RetryAfter time.Duration // delay from a throttled response or local cooldown
 }
 
 // Error implements the error interface
@@ -65,9 +77,27 @@ func (e *Error) ShouldRefetch() bool {
 	return e.Category == CategoryRefetchable
 }
 
-// ShouldDisableAccount returns true if the account should be disabled
-func (e *Error) ShouldDisableAccount() bool {
+// ShouldSuspendAccount returns true when provider pressure should temporarily
+// remove the account from selection and schedule a recovery probe.
+func (e *Error) ShouldSuspendAccount() bool {
 	return e.Category == CategoryAccountIssue
+}
+
+// ShouldDisableAccount is retained for source compatibility. Account-issue
+// errors are now temporary suspensions rather than permanent disables.
+func (e *Error) ShouldDisableAccount() bool {
+	return e.ShouldSuspendAccount()
+}
+
+// ShouldBackoff reports whether the same link should be retried after a delay.
+func (e *Error) ShouldBackoff() bool {
+	return e.Category == CategoryThrottled
+}
+
+// IsRetryable allows callers outside this package to preserve transient error
+// semantics without importing ErrorCategory.
+func (e *Error) IsRetryable() bool {
+	return e.Category != CategoryPermanent
 }
 
 // IsPermanent returns true if the error is permanent and no retry should happen
@@ -121,7 +151,7 @@ func NewRefetchableError(err error, code string) *Error {
 	return NewLinkError(err, CategoryRefetchable, code)
 }
 
-// NewAccountError creates an error that requires disabling the account
+// NewAccountError creates an error that temporarily suspends the account.
 func NewAccountError(err error, code string) *Error {
 	return NewLinkError(err, CategoryAccountIssue, code)
 }
@@ -130,7 +160,7 @@ func NewAccountError(err error, code string) *Error {
 func ErrorCodeToLinkError(code string) *Error {
 	switch code {
 	case "link_not_found":
-		return NewPermanentError(ErrLinkNotFound, code)
+		return NewRefetchableError(ErrLinkNotFound, code)
 	case "bandwidth_exceeded", "quota_exceeded", "daily_limit_exceeded", "bytes_limit_reached":
 		return NewAccountError(ErrBandwidthExceeded, code)
 	case "link_expired":
@@ -142,14 +172,52 @@ func ErrorCodeToLinkError(code string) *Error {
 	case "401", "unauthorized":
 		return NewPermanentError(ErrUnauthorized, code)
 	case "404":
-		return NewPermanentError(Err404, code)
+		return NewRefetchableError(Err404, code)
 	case "429":
-		return NewRetryableError(Err429, code)
-	case "503":
-		return NewRetryableError(Err503, code)
+		return NewLinkError(Err429, CategoryThrottled, code)
+	case "408", "425", "500", "502", "503", "504", "read_pxy_timeout":
+		return NewRetryableError(fmt.Errorf("temporary download-link failure: %s", code), code)
 	default:
 		return NewPermanentError(fmt.Errorf("unknown error code: %s", code), code)
 	}
+}
+
+// ClassifyHTTPStatus classifies errors returned by a generated download URL.
+// Authentication-shaped statuses at this layer usually mean the signed link
+// rotated or expired, while throttling and 5xx failures should reuse the same
+// URL instead of creating provider API traffic.
+func ClassifyHTTPStatus(status int, header http.Header) *Error {
+	switch {
+	case status == http.StatusBadRequest || status == http.StatusUnauthorized ||
+		status == http.StatusForbidden || status == http.StatusNotFound ||
+		status == http.StatusGone:
+		return NewRefetchableError(fmt.Errorf("HTTP %d: download link rejected", status), strconv.Itoa(status))
+	case status == http.StatusRequestedRangeNotSatisfiable:
+		return NewPermanentError(errors.New("HTTP 416: requested range not satisfiable"), "416")
+	case status == http.StatusTooManyRequests:
+		err := NewLinkError(Err429, CategoryThrottled, "429")
+		err.RetryAfter = parseRetryAfter(header.Get("Retry-After"), time.Now())
+		return err
+	case status == http.StatusRequestTimeout || status == http.StatusTooEarly || status >= 500:
+		return NewRetryableError(fmt.Errorf("HTTP %d", status), strconv.Itoa(status))
+	default:
+		return NewPermanentError(fmt.Errorf("unexpected HTTP status %d", status), strconv.Itoa(status))
+	}
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if delay := at.Sub(now); delay > 0 {
+			return delay
+		}
+	}
+	return 0
 }
 
 // IsLinkError checks if an error is a LinkError
@@ -165,4 +233,18 @@ func GetLinkError(err error) *Error {
 		return linkErr
 	}
 	return nil
+}
+
+// safeRefetchLogCode permits only known rejection codes, never arbitrary
+// provider text that might contain signed links or account credentials.
+func safeRefetchLogCode(code string) string {
+	switch code {
+	case "400", "401", "403", "404", "410",
+		"link_not_found", "link_expired", "invalid_download_code",
+		"range_probe_status", "range_probe_encoding", "range_probe_content_range",
+		"range_probe_content_length", "range_probe_body_length":
+		return code
+	default:
+		return "unknown"
+	}
 }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Tessarr media gateway
+Documentation=https://github.com/Trifocals3537/decypharr
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tessarr --config %h/.tessarr
+EnvironmentFile=-%h/.tessarr/environment
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

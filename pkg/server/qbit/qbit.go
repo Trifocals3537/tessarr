@@ -1,10 +1,10 @@
 package qbit
 
 import (
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/pkg/manager"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
 type QBit struct {
@@ -14,6 +14,7 @@ type QBit struct {
 	logger                  zerolog.Logger
 	Tags                    []string
 	manager                 *manager.Manager
+	sessions                *qbitSessionStore
 }
 
 func New(manager *manager.Manager) *QBit {
@@ -24,5 +25,6 @@ func New(manager *manager.Manager) *QBit {
 		alwaysRemoveTrackerURLS: cfg.AlwaysRmTrackerUrls,
 		manager:                 manager,
 		logger:                  logger.New("qbit"),
+		sessions:                newQbitSessionStore(),
 	}
 }

@@ -8,12 +8,12 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/nntp"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/fs/reader"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/types"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/nntp"
-	"github.com/sirrobot01/decypharr/pkg/usenet/fs/reader"
-	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 	"go4.org/readerutil"
 )
 
@@ -29,6 +29,7 @@ type PrefetchableReaderAt interface {
 
 // FS implements fs.FS for RAR volumes backed by NNTP Segments
 type FS struct {
+	pools         *reader.Pools
 	ctx           context.Context
 	volumes       *xsync.Map[string, *types.Volume]
 	client        *nntp.Client // Connection client for all readers
@@ -39,6 +40,11 @@ type FS struct {
 
 // Option configures the filesystem
 type Option func(*FS)
+
+// WithPools shares one service-run memory budget with every filesystem reader.
+func WithPools(pools *reader.Pools) Option {
+	return func(f *FS) { f.pools = pools }
+}
 
 // NewFS creates a new filesystem backed by the provided connection nntpClient.
 // prefetchSize is the amount of data to prefetch ahead in bytes (e.g., 16*1024*1024 for 16MB)
@@ -94,6 +100,7 @@ func (f *FS) Open(name string) (fs.File, error) {
 	}
 
 	return &File{
+		pools:         f.pools,
 		info:          info,
 		ctx:           f.ctx,
 		manager:       f.client,
@@ -220,6 +227,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithPools(f.pools),
 		)
 	} else {
 		streamReader, err = reader.NewStreamingReader(
@@ -230,6 +238,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithPools(f.pools),
 		)
 	}
 

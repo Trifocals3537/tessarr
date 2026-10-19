@@ -6,9 +6,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/utils"
 
-	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/Trifocals3537/tessarr/pkg/arr"
 )
 
 type contextKey string
@@ -29,14 +30,38 @@ func getMode(ctx context.Context) string {
 
 func (s *SABnzbd) categoryContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		category := r.URL.Query().Get("category")
-		if category == "" {
-			// Check form data
-			_ = r.ParseForm()
-			category = r.Form.Get("category")
+		contentType := strings.ToLower(r.Header.Get("Content-Type"))
+		var err error
+		if strings.Contains(contentType, "multipart/form-data") {
+			err = utils.ParseMultipartFormBounded(
+				w,
+				r,
+				utils.MaxImportRequestBytes,
+				utils.MaxMultipartMemoryBytes,
+			)
+			if r.MultipartForm != nil {
+				defer r.MultipartForm.RemoveAll()
+			}
+			if err == nil &&
+				utils.MultipartFormPartCount(r.MultipartForm) > utils.MaxMultipartFormParts {
+				s.writeError(w, "Request has too many multipart fields", http.StatusRequestEntityTooLarge)
+				return
+			}
+		} else {
+			err = utils.ParseFormBounded(w, r, utils.MaxImportRequestBytes)
 		}
+		if err != nil {
+			if utils.IsRequestTooLarge(err) {
+				s.writeError(w, "Request is too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			s.writeError(w, "Invalid form request", http.StatusBadRequest)
+			return
+		}
+
+		category := r.FormValue("category")
 		if category == "" {
-			category = r.FormValue("category")
+			category = r.FormValue("cat")
 		}
 
 		ctx := context.WithValue(r.Context(), categoryKey, strings.TrimSpace(category))
@@ -61,22 +86,20 @@ func getCategory(ctx context.Context) string {
 // modeContext extracts the mode parameter from the request
 func (s *SABnzbd) modeContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mode := r.URL.Query().Get("mode")
-		if mode == "" {
-			// Check form data
-			_ = r.ParseForm()
-			mode = r.Form.Get("mode")
-		}
+		// categoryContext has already parsed the request through the bounded
+		// form helpers, so FormValue can safely support both query parameters
+		// and the POST form fields used by SAB-compatible clients.
+		mode := r.FormValue("mode")
+		category := getCategory(r.Context())
 
-		// Extract category for Arr integration
-		category := r.URL.Query().Get("cat")
-		if category == "" {
-			category = r.Form.Get("cat")
+		// Keep the Arr admitted by authContext. Replacing it here used to
+		// discard configured provider selection and download policy after
+		// authentication had already succeeded.
+		a := getArrFromContext(r.Context())
+		if a == nil {
+			downloadUncached := false
+			a = arr.New(category, "", "", false, &downloadUncached, "", "auto")
 		}
-
-		// Create a default Arr instance for the category
-		downloadUncached := false
-		a := arr.New(category, "", "", false, &downloadUncached, "", "auto")
 
 		ctx := context.WithValue(r.Context(), modeKey, strings.TrimSpace(mode))
 		ctx = context.WithValue(ctx, arrKey, a)
@@ -90,8 +113,8 @@ func (s *SABnzbd) modeContext(next http.Handler) http.Handler {
 // Only a valid host and token will be added to the context/config. The rest are manual
 func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.URL.Query().Get("ma_username")
-		token := r.URL.Query().Get("ma_password")
+		host := r.FormValue("ma_username")
+		token := r.FormValue("ma_password")
 		category := getCategory(r.Context())
 		a, err := s.authenticate(category, host, token)
 		if err != nil {
@@ -105,40 +128,12 @@ func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 
 func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, error) {
 	cfg := config.Get()
-	a := s.manager.Arr().Get(category)
-	if a == nil {
-		// Arr is not yet in runtime storage — look for a matching config entry
-		// so we inherit its download_uncached setting. If no config match,
-		// leave nil so SendToDebrid falls back to the debrid provider's setting.
-		var downloadUncached *bool
-		for _, cfgArr := range config.Get().Arrs {
-			if cfgArr.Name == category {
-				downloadUncached = cfgArr.DownloadUncached
-				break
-			}
-		}
-		a = arr.New(category, username, password, false, downloadUncached, "", "auto")
+	arrStorage := s.manager.Arr()
+	if matched := arrStorage.MatchCredentials(category, username, password); matched != nil {
+		return matched, nil
 	}
-	arrValidated := false // This is a flag to indicate if arr validation was successful
-	if (username == "" || password == "") && cfg.UseAuth {
-		return nil, fmt.Errorf("unauthorized: Host and token are required for authentication(you've enabled authentication)")
+	if cfg.UseAuth && !config.VerifyAuth(username, password) {
+		return nil, fmt.Errorf("unauthorized: invalid credentials")
 	}
-	if a.Source == "auto" {
-		a.Host = username
-		a.Token = password
-	}
-	if err := a.Validate(); err == nil {
-		arrValidated = true
-	}
-
-	if !arrValidated && cfg.UseAuth {
-		// If arr validation failed, try to use user auth validation
-		if !config.VerifyAuth(username, password) {
-			return nil, fmt.Errorf("unauthorized: invalid credentials")
-		}
-	}
-	if username != "" && password != "" {
-		s.manager.Arr().AddOrUpdate(a)
-	}
-	return a, nil
+	return arrStorage.GetOrCreate(category), nil
 }

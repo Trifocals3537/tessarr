@@ -2,6 +2,7 @@ package notifications
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,7 +11,7 @@ import (
 
 	json "github.com/bytedance/sonic"
 
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/config"
 )
 
 // DiscordEmbed represents a Discord embed object
@@ -47,7 +48,7 @@ func (d *DiscordNotifier) Name() string {
 }
 
 // Send dispatches the notification to Discord
-func (d *DiscordNotifier) Send(event Event) error {
+func (d *DiscordNotifier) Send(ctx context.Context, event Event) error {
 	if d.webhookURL == "" {
 		return nil
 	}
@@ -68,7 +69,7 @@ func (d *DiscordNotifier) Send(event Event) error {
 		return fmt.Errorf("failed to marshal discord webhook: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, d.webhookURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.webhookURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to create discord request: %w", err)
 	}
@@ -108,23 +109,23 @@ func (d *DiscordNotifier) getColor(status string) int {
 func (d *DiscordNotifier) getHeader(event config.NotificationEvent) string {
 	switch event {
 	case config.EventDownloadComplete:
-		return "[Decypharr] Download Completed"
+		return "[Tessarr] Download Completed"
 	case config.EventDownloadFailed:
-		return "[Decypharr] Download Failed"
+		return "[Tessarr] Download Failed"
 	case config.EventRepairPending:
-		return "[Decypharr] Repair Completed, Awaiting action"
+		return "[Tessarr] Repair Completed, Awaiting action"
 	case config.EventRepairComplete:
-		return "[Decypharr] Repair Complete"
+		return "[Tessarr] Repair Complete"
 	case config.EventRepairFailed:
-		return "[Decypharr] Repair Failed"
+		return "[Tessarr] Repair Failed"
 	case config.EventRepairCancelled:
-		return "[Decypharr] Repair Cancelled"
+		return "[Tessarr] Repair Cancelled"
 	default:
 		// Split the event string and capitalize the first letter of each word
 		evs := strings.Split(string(event), "_")
 		for i, ev := range evs {
 			evs[i] = strings.ToTitle(ev)
 		}
-		return "[Decypharr] " + strings.Join(evs, " ")
+		return "[Tessarr] " + strings.Join(evs, " ")
 	}
 }

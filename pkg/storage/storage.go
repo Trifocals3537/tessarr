@@ -7,13 +7,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/safepath"
+	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
 
-var storeNames = []string{"entries", "queue", "items", "repair_state", "repair_runs"}
+var storeNames = []string{
+	"entries",
+	"queue",
+	"items",
+	"storage_state",
+	"repair_state",
+	"repair_runs",
+	"repair_recoveries",
+	"entry_tombstones",
+	"queue_tombstones",
+	"migration_cleanups",
+}
 
 // legacyStoreNames are buckets from the v1 repair system. They are removed
 // on startup so they don't accumulate dead data.
@@ -21,26 +33,52 @@ var legacyStoreNames = []string{"repair_jobs", "repair_keys"}
 
 // Storage handles persistence using HybridStore
 type Storage struct {
-	entries     *hybrid.Store
-	queue       *hybrid.Store
-	entryItems  *hybrid.Store
-	repairState *hybrid.Store
-	repairRuns  *hybrid.Store
-	dir         string
-	logger      zerolog.Logger
+	entries      *hybrid.Store
+	queue        *hybrid.Store
+	entryItems   *hybrid.Store
+	storageState *hybrid.Store
+	// Durability hooks inject sync failures; production leaves them nil.
+	handoffSyncForTest     func() error
+	mainCleanupSyncForTest func() error
+	queueRowSyncForTest    func() error
+	queueIntentSyncForTest func() error
+	// Per-key durability latches survive lifecycle-state eviction. Operations
+	// on each key are serialized by its lifecycle lock.
+	handoffPending   sync.Map
+	repairState      *hybrid.Store
+	repairRuns       *hybrid.Store
+	repairRecoveries *hybrid.Store
+	entryTombstones  *hybrid.Store
+	queueTombstones  *hybrid.Store
+	migrationCleanup *hybrid.Store
+	mainEntries      *mainEntryLifecycle
+	dir              string
+	logger           zerolog.Logger
 
-	healthCountsMu      sync.Mutex
-	healthCounts        map[HealthStatus]int
-	healthCountsBuiltAt time.Time
+	// Lock order: per-key lifecycle -> placementPublicationMu -> entryItemsMu
+	// -> hybrid store locks. Never take a lifecycle lock while holding this
+	// mutex, and never retain it across provider/network work.
+	placementPublicationMu sync.Mutex
+	entryItemsMu           sync.Mutex
+	entryItemsDirty        bool
+	startupComplete        bool
+	entryHealthMu          sync.Mutex
+	healthCountsMu         sync.Mutex
+	healthCounts           map[HealthStatus]int
+	healthCountsBuiltAt    time.Time
+	migrationCleanupMu     sync.Mutex
+	torrentSourcesMu       sync.Mutex
+	torrentSourceBytes     int64
 }
-
-
-
 
 func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hybrid.Store, error) {
 	items := make(map[string]*hybrid.Store)
 	for _, name := range storeNames {
 		config := baseConfig
+		if name == "repair_recoveries" {
+			// Arr mutations must never outrun their durable intent record.
+			config.SyncInterval = 0
+		}
 		config.DataPath = filepath.Join(baseDir, name+".db")
 		store, err := hybrid.New(config)
 		if err != nil {
@@ -55,21 +93,32 @@ func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hyb
 }
 
 func dropLegacyStores(baseDir string, log zerolog.Logger) {
+	rooted, absoluteRoot, err := safepath.OpenRoot(baseDir)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to open storage root for legacy cleanup")
+		return
+	}
+	defer rooted.Close()
 	for _, name := range legacyStoreNames {
-		path := filepath.Join(baseDir, name+".db")
-		if _, err := os.Stat(path); err == nil {
-			if err := os.RemoveAll(path); err != nil {
-				log.Warn().Err(err).Str("path", path).Msg("Failed to remove legacy repair bucket")
-			} else {
-				log.Info().Str("path", path).Msg("Removed legacy repair bucket")
-			}
+		relative := name + ".db"
+		if _, err := rooted.Lstat(relative); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			log.Warn().Err(err).Str("store", relative).Msg("Failed to inspect legacy repair bucket")
+			continue
+		}
+		if err := rooted.RemoveAll(relative); err != nil {
+			log.Warn().Err(err).Str("store", relative).Msg("Failed to remove legacy repair bucket")
+		} else {
+			log.Info().Str("path", filepath.Join(absoluteRoot, relative)).Msg("Removed legacy repair bucket")
 		}
 	}
 }
 
 func NewStorage(dbPath string) (*Storage, error) {
-	dbPath = filepath.Clean(dbPath)
-	if err := os.MkdirAll(dbPath, 0755); err != nil {
+	var err error
+	dbPath, err = safepath.EnsureRoot(dbPath, 0o755)
+	if err != nil {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
@@ -90,13 +139,41 @@ func NewStorage(dbPath string) (*Storage, error) {
 	}
 
 	s := &Storage{
-		entries:     itemStores["entries"],
-		queue:       itemStores["queue"],
-		entryItems:  itemStores["items"],
-		repairState: itemStores["repair_state"],
-		repairRuns:  itemStores["repair_runs"],
-		dir:         dbPath,
-		logger:      log,
+		entries:          itemStores["entries"],
+		queue:            itemStores["queue"],
+		entryItems:       itemStores["items"],
+		storageState:     itemStores["storage_state"],
+		repairState:      itemStores["repair_state"],
+		repairRuns:       itemStores["repair_runs"],
+		repairRecoveries: itemStores["repair_recoveries"],
+		entryTombstones:  itemStores["entry_tombstones"],
+		queueTombstones:  itemStores["queue_tombstones"],
+		migrationCleanup: itemStores["migration_cleanups"],
+		mainEntries:      newMainEntryLifecycle(),
+		dir:              dbPath,
+		logger:           log,
+	}
+
+	needsEntryItemRecovery, err := s.beginEntryItemSession()
+	if err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("start entry-item recovery session: %w", err)
+	}
+	needsSharedFolderUpgrade, err := s.needsEntryItemSharedFolderUpgrade()
+	if err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("inspect entry-item integrity version: %w", err)
+	}
+	if needsEntryItemRecovery {
+		if _, err := s.reconcileEntryItems(); err != nil {
+			_ = s.Close()
+			return nil, fmt.Errorf("recover entry-item index: %w", err)
+		}
+	}
+
+	if err := s.recoverMainEntryTombstones(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("recover main entry deletions: %w", err)
 	}
 
 	if count, err := s.MigrateMetadata(); err != nil {
@@ -104,13 +181,50 @@ func NewStorage(dbPath string) (*Storage, error) {
 	} else if count > 0 {
 		log.Info().Int("count", count).Msg("Migrated entry metadata to new format")
 	}
+	if needsSharedFolderUpgrade {
+		if !needsEntryItemRecovery {
+			repaired, err := s.reconcileEntryItems()
+			if err != nil {
+				_ = s.Close()
+				return nil, fmt.Errorf("upgrade shared-folder entry-item index: %w", err)
+			}
+			if repaired > 0 {
+				log.Info().Int("count", repaired).
+					Msg("Repaired shared-folder entry-item index")
+			}
+		}
+		if err := s.markEntryItemSharedFolderUpgrade(); err != nil {
+			_ = s.Close()
+			return nil, err
+		}
+	}
+	if err := s.PruneTorrentSources(); err != nil {
+		log.Warn().Err(err).Msg("Failed to prune unreferenced torrent sources")
+	}
 
+	s.startupComplete = true
 	return s, nil
 }
 
 func (s *Storage) Close() error {
 	var errs []error
-	stores := []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns}
+	if s.startupComplete {
+		if err := s.markEntryItemsClean(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	stores := []*hybrid.Store{
+		s.entries,
+		s.queue,
+		s.entryItems,
+		s.storageState,
+		s.repairState,
+		s.repairRuns,
+		s.repairRecoveries,
+		s.entryTombstones,
+		s.queueTombstones,
+		s.migrationCleanup,
+	}
 	for _, store := range stores {
 		if store == nil {
 			continue
@@ -128,7 +242,18 @@ func (s *Storage) Close() error {
 // DiskSize returns the total on-disk size of all stores (O(1), no filesystem walk).
 func (s *Storage) DiskSize() int64 {
 	var size int64
-	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.repairState, s.repairRuns} {
+	for _, store := range []*hybrid.Store{
+		s.entries,
+		s.queue,
+		s.entryItems,
+		s.storageState,
+		s.repairState,
+		s.repairRuns,
+		s.repairRecoveries,
+		s.entryTombstones,
+		s.queueTombstones,
+		s.migrationCleanup,
+	} {
 		if store != nil {
 			size += store.DiskSize()
 		}
@@ -157,30 +282,4 @@ func (s *Storage) GetMigrationStatus() (*SystemMigrationStatus, error) {
 		return nil, err
 	}
 	return ProtoToSystemMigrationStatus(&pb), nil
-}
-
-func (s *Storage) copyFrom(other *Storage) error {
-	pairs := []struct {
-		name string
-		from *hybrid.Store
-		to   *hybrid.Store
-	}{
-		{"entries", other.entries, s.entries},
-		{"queue", other.queue, s.queue},
-		{"items", other.entryItems, s.entryItems},
-		{"repair_state", other.repairState, s.repairState},
-		{"repair_runs", other.repairRuns, s.repairRuns},
-	}
-
-	for _, p := range pairs {
-		if p.from == nil || p.to == nil {
-			continue
-		}
-		if err := p.from.ForEach(func(key string, value []byte) error {
-			return p.to.Put(key, value, nil)
-		}); err != nil {
-			return fmt.Errorf("failed to copy %s: %w", p.name, err)
-		}
-	}
-	return nil
 }

@@ -2,31 +2,39 @@ package reader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
+	"github.com/Trifocals3537/tessarr/internal/crypto"
+	"github.com/Trifocals3537/tessarr/internal/nntp"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/crypto"
-	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
-var decryptionBufPool = sync.Pool{}
-
-func acquireDecryptionBuffer(size int) []byte {
-	v := decryptionBufPool.Get()
-	if v == nil {
-		return make([]byte, size)
-	}
-	buf := v.([]byte)
-	if cap(buf) < size {
-		return make([]byte, size)
-	}
-	return buf[:size]
+type decryptionBuffer struct {
+	data []byte
 }
 
-func releaseDecryptionBuffer(buf []byte) {
+var decryptionBufPool = sync.Pool{
+	New: func() any { return &decryptionBuffer{} },
+}
+
+func acquireDecryptionBuffer(size int) *decryptionBuffer {
+	buf := decryptionBufPool.Get().(*decryptionBuffer)
+	if cap(buf.data) < size {
+		buf.data = make([]byte, size)
+	} else {
+		buf.data = buf.data[:size]
+	}
+	return buf
+}
+
+func releaseDecryptionBuffer(buf *decryptionBuffer) {
+	if buf == nil {
+		return
+	}
 	decryptionBufPool.Put(buf)
 }
 
@@ -62,10 +70,11 @@ type StreamingReader struct {
 	readOffset atomic.Int64
 
 	// Lifecycle
-	ctx    context.Context
-	cancel context.CancelFunc
-	closed atomic.Bool
-	logger zerolog.Logger
+	ctx     context.Context
+	cancel  context.CancelFunc
+	closed  atomic.Bool
+	closeMu sync.Mutex
+	logger  zerolog.Logger
 
 	// Stats
 	stats *ReaderStats
@@ -192,10 +201,18 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 	sr.cache.PinRange(startSeg, endSeg)
 	defer sr.cache.UnpinRange(startSeg, endSeg)
 
+	// Track seek position per consumer, not globally. A distant seek may drop
+	// this session's stale queued hints, but it must never discard read-ahead
+	// requested by another viewer sharing the same StreamingReader.
+	session := prefetchSessionFromContext(ctx)
+	if session != nil && session.observeRead(startSeg, endSeg, sr.config.PrefetchAhead) {
+		sr.fetcher.CancelPendingPrefetch(session)
+	}
+
 	// Queue prefetch for read-ahead (non-blocking)
 	prefetchEnd := min(endSeg+sr.config.PrefetchAhead, sr.segCount-1)
 	if prefetchEnd > endSeg {
-		sr.fetcher.QueuePrefetchRange(endSeg+1, prefetchEnd)
+		sr.fetcher.QueuePrefetchRange(ctx, endSeg+1, prefetchEnd)
 	}
 
 	// Ensure all required segments are available (may block for downloads)
@@ -235,6 +252,7 @@ func (sr *StreamingReader) readAtPlain(ctx context.Context, p []byte, off int64)
 // progressive performance degradation on large files.
 func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int64, startSeg, endSeg int) (int, error) {
 	totalRead := 0
+	filledThrough := off
 
 	for segIdx := startSeg; segIdx <= endSeg; segIdx++ {
 		// Wait for segment to be ready
@@ -252,10 +270,22 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 		if readStart >= readEnd {
 			continue
 		}
+		if readStart < filledThrough {
+			return totalRead, fmt.Errorf(
+				"segment %d starts at %d behind delivered offset %d",
+				segIdx, readStart, filledThrough,
+			)
+		}
 
 		outOffset := readStart - off
 		segDataOffset := readStart - segStart
 		copyLen := readEnd - readStart
+		if outOffset < 0 || copyLen <= 0 || outOffset+copyLen > int64(len(p)) {
+			return totalRead, fmt.Errorf(
+				"segment %d resolved invalid output range %d-%d for %d-byte read",
+				segIdx, outOffset, outOffset+copyLen, len(p),
+			)
+		}
 
 		// Read only the needed slice directly into the output buffer.
 		// No intermediate scratch buffer — zero extra allocation, zero amplification.
@@ -276,8 +306,12 @@ func (sr *StreamingReader) readFromCache(ctx context.Context, p []byte, off int6
 				return totalRead, fmt.Errorf("segment %d still missing after re-fetch", segIdx)
 			}
 		}
+		if int64(n) != copyLen {
+			return totalRead, fmt.Errorf("segment %d returned %d bytes, want %d", segIdx, n, copyLen)
+		}
 
 		totalRead += n
+		filledThrough = readEnd
 	}
 
 	return totalRead, nil
@@ -298,8 +332,9 @@ func (sr *StreamingReader) readAtEncrypted(ctx context.Context, p []byte, off in
 	}
 
 	bufLen := alignedEnd - alignedStart
-	buf := acquireDecryptionBuffer(int(bufLen))
-	defer releaseDecryptionBuffer(buf)
+	pooled := acquireDecryptionBuffer(int(bufLen))
+	defer releaseDecryptionBuffer(pooled)
+	buf := pooled.data
 
 	// Read aligned data
 	n, err := sr.readAtPlain(ctx, buf, alignedStart)
@@ -406,7 +441,7 @@ func (sr *StreamingReader) Prefetch(ctx context.Context, off, length int64) {
 	}
 
 	startSeg, endSeg := sr.cache.SegmentsForRange(off, length)
-	sr.fetcher.QueuePrefetchRange(startSeg, endSeg)
+	sr.fetcher.QueuePrefetchRange(ctx, startSeg, endSeg)
 }
 
 // Read implements io.Reader using ReadAt with tracked position.
@@ -469,19 +504,28 @@ func (sr *StreamingReader) Stats() map[string]int64 {
 	return sr.stats.Snapshot()
 }
 
-// Close releases all resources.
+// Close releases all resources. Reader cancellation and worker shutdown happen
+// once, while transient disk cleanup failures receive a small bounded retry.
+// Production owners call Close once and then release the reader, so the retry
+// must live here rather than depending on a later Close call.
 func (sr *StreamingReader) Close() error {
-	if sr.closed.Swap(true) {
-		return nil
+	sr.closeMu.Lock()
+	defer sr.closeMu.Unlock()
+
+	if !sr.closed.Swap(true) {
+		sr.cancel()
+
+		// Close fetcher first (stops downloads)
+		sr.fetcher.Close()
 	}
 
-	sr.cancel()
-
-	// Close fetcher first (stops downloads)
-	sr.fetcher.Close()
-
-	// Then close cache (cleans up files)
-	return sr.cache.Close()
+	var shutdownErr error
+	cleanupErr := retryCacheCleanup(func() error {
+		attemptShutdownErr, attemptCleanupErr := sr.cache.closeAttempt()
+		shutdownErr = errors.Join(shutdownErr, attemptShutdownErr)
+		return attemptCleanupErr
+	})
+	return errors.Join(shutdownErr, cleanupErr)
 }
 
 // Pool manages a pool of readers for efficient resource sharing.

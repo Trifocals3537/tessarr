@@ -1,19 +1,23 @@
 package usenet
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/safepath"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sourcegraph/conc/pool"
 	"google.golang.org/protobuf/proto"
 )
@@ -21,10 +25,17 @@ import (
 const (
 	metaFileExtension = ".meta"
 	metaDirName       = "meta"
+	metaReadBatchSize = 256
 	// metaMigrationMarker is written to the meta dir once all legacy proto
 	// files have been upgraded to the v2 codec, so migration runs at most once.
 	metaMigrationMarker = ".codec-v2.done"
 )
+
+var ErrNZBNotFound = errors.New("NZB not found")
+
+func IsNZBNotFound(err error) bool {
+	return errors.Is(err, ErrNZBNotFound)
+}
 
 const (
 	NZBStatusPending     = "pending"
@@ -48,7 +59,8 @@ type NZBStorage struct {
 // NewNZBStorage creates a new file-based NZB storage
 func NewNZBStorage() (*NZBStorage, error) {
 	metaDir := filepath.Join(config.GetMainPath(), "usenet", metaDirName)
-	if err := os.MkdirAll(metaDir, 0755); err != nil {
+	metaDir, err := safepath.EnsureRoot(metaDir, 0o755)
+	if err != nil {
 		return nil, fmt.Errorf("failed to create meta directory: %w", err)
 	}
 
@@ -66,31 +78,36 @@ func NewNZBStorage() (*NZBStorage, error) {
 	return s, nil
 }
 
-// metaFilePath returns the path for a given NZB ID
-func (s *NZBStorage) metaFilePath(id string) string {
-	return filepath.Join(s.metaDir, id+metaFileExtension)
+// metaFilePath returns the exact path for a canonical NZB ID.
+func (s *NZBStorage) metaFilePath(id string) (string, error) {
+	return metadataFilePath(s.metaDir, id, nzbMetaSuffix)
 }
 
 // recalculateStatsLocked rebuilds cached stats by scanning metadata files.
 // Caller must hold s.mu.
 func (s *NZBStorage) recalculateStatsLocked() error {
-	entries, err := os.ReadDir(s.metaDir)
-	if err != nil {
-		return fmt.Errorf("failed to read meta directory: %w", err)
-	}
-
 	count := 0
 	var totalSize int64
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != metaFileExtension {
-			continue
+	err := scanMetadataDirectory(s.metaDir, metaReadBatchSize, func(entry os.DirEntry) error {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != metaFileExtension {
+			return nil
+		}
+		id := strings.TrimSuffix(entry.Name(), metaFileExtension)
+		path, err := s.metaFilePath(id)
+		if err != nil {
+			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Ignoring invalid NZB meta filename")
+			return nil
 		}
 		count++
-		info, err := entry.Info()
+		info, err := statMetadataFile(s.metaDir, path)
 		if err != nil {
 			return fmt.Errorf("failed to stat meta file %s: %w", entry.Name(), err)
 		}
 		totalSize += info.Size()
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to read meta directory: %w", err)
 	}
 
 	s.metaCount = count
@@ -103,15 +120,21 @@ func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if nzb == nil {
+		return fmt.Errorf("NZB is nil")
+	}
 	data, err := encodeNZBV2(nzb)
 	if err != nil {
 		return fmt.Errorf("failed to encode NZB: %w", err)
 	}
 
-	path := s.metaFilePath(nzb.ID)
+	path, err := s.metaFilePath(nzb.ID)
+	if err != nil {
+		return err
+	}
 	var oldSize int64
 	alreadyExists := false
-	if info, statErr := os.Stat(path); statErr == nil {
+	if info, statErr := statMetadataFile(s.metaDir, path); statErr == nil {
 		alreadyExists = true
 		oldSize = info.Size()
 	} else if !os.IsNotExist(statErr) {
@@ -119,13 +142,16 @@ func (s *NZBStorage) AddNZB(nzb *storage.NZB) error {
 	}
 
 	// Write atomically using temp file
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	tmpPath, err := metadataFilePath(s.metaDir, nzb.ID, nzbMetaTempSuffix)
+	if err != nil {
+		return err
+	}
+	if err := writeMetadataFile(s.metaDir, tmpPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write NZB meta file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := renameMetadataFile(s.metaDir, tmpPath, path); err != nil {
+		_ = removeMetadataFile(s.metaDir, tmpPath)
 		return fmt.Errorf("failed to rename NZB meta file: %w", err)
 	}
 
@@ -145,16 +171,26 @@ func (s *NZBStorage) GetNZB(id string) (*storage.NZB, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.metaFilePath(id)
-	data, err := os.ReadFile(path)
+	path, err := s.metaFilePath(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readMetadataFile(s.metaDir, path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
 
-	return decodeNZB(data)
+	nzb, err := decodeNZB(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateStoredNZBIdentity(id, nzb); err != nil {
+		return nil, err
+	}
+	return nzb, nil
 }
 
 // GetNZBHeader retrieves an NZB without its segment map. It is far cheaper than
@@ -164,19 +200,31 @@ func (s *NZBStorage) GetNZBHeader(id string) (*storage.NZB, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.metaFilePath(id)
-	data, err := os.ReadFile(path)
+	path, err := s.metaFilePath(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readMetadataFile(s.metaDir, path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
 
+	var nzb *storage.NZB
 	if isCodecV2(data) {
-		return decodeNZBV2Header(data)
+		nzb, err = decodeNZBV2Header(data)
+	} else {
+		nzb, err = decodeNZB(data)
 	}
-	return decodeNZB(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateStoredNZBIdentity(id, nzb); err != nil {
+		return nil, err
+	}
+	return nzb, nil
 }
 
 // SampleFileMessageIDs returns the sampled message ids for a single file,
@@ -189,11 +237,14 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	path := s.metaFilePath(id)
-	data, err := os.ReadFile(path)
+	path, err := s.metaFilePath(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readMetadataFile(s.metaDir, path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("nzb not found: %s", id)
+			return nil, fmt.Errorf("%w: %s", ErrNZBNotFound, id)
 		}
 		return nil, fmt.Errorf("failed to read NZB meta file: %w", err)
 	}
@@ -206,6 +257,9 @@ func (s *NZBStorage) SampleFileMessageIDs(id, filename string, percent int) ([]s
 	// Legacy proto: full decode then sample in memory.
 	nzb, err := decodeNZB(data)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateStoredNZBIdentity(id, nzb); err != nil {
 		return nil, err
 	}
 	f := nzb.GetFileByName(filename)
@@ -234,22 +288,39 @@ func decodeNZB(data []byte) (*storage.NZB, error) {
 	return protoToNZB(&pb), nil
 }
 
+func validateStoredNZBIdentity(requestedID string, nzb *storage.NZB) error {
+	canonical, err := canonicalNZBID(requestedID)
+	if err != nil {
+		return err
+	}
+	if nzb == nil {
+		return fmt.Errorf("stored NZB %s decoded to nil", canonical)
+	}
+	if nzb.ID != canonical {
+		return fmt.Errorf("stored NZB identity mismatch: requested %q, record contains %q", canonical, nzb.ID)
+	}
+	return nil
+}
+
 // DeleteNZB removes an NZB from file storage
 func (s *NZBStorage) DeleteNZB(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	path := s.metaFilePath(id)
+	path, err := s.metaFilePath(id)
+	if err != nil {
+		return err
+	}
 	var oldSize int64
 	alreadyExists := false
-	if info, statErr := os.Stat(path); statErr == nil {
+	if info, statErr := statMetadataFile(s.metaDir, path); statErr == nil {
 		alreadyExists = true
 		oldSize = info.Size()
 	} else if !os.IsNotExist(statErr) {
 		return fmt.Errorf("failed to stat NZB meta file before delete: %w", statErr)
 	}
 
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := removeMetadataFile(s.metaDir, path); err != nil {
 		return fmt.Errorf("failed to delete NZB meta file: %w", err)
 	}
 
@@ -271,32 +342,37 @@ func (s *NZBStorage) ForEachNZB(fn func(*storage.NZB) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entries, err := os.ReadDir(s.metaDir)
-	if err != nil {
-		return fmt.Errorf("failed to read meta directory: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != metaFileExtension {
-			continue
+	err := scanMetadataDirectory(s.metaDir, metaReadBatchSize, func(entry os.DirEntry) error {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != metaFileExtension {
+			return nil
 		}
 
-		path := filepath.Join(s.metaDir, entry.Name())
-		data, err := os.ReadFile(path)
+		id := strings.TrimSuffix(entry.Name(), metaFileExtension)
+		path, err := s.metaFilePath(id)
+		if err != nil {
+			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Ignoring invalid NZB meta filename")
+			return nil
+		}
+		data, err := readMetadataFile(s.metaDir, path)
 		if err != nil {
 			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Failed to read NZB meta file")
-			continue
+			return nil
 		}
 
 		nzb, err := decodeNZB(data)
 		if err != nil {
 			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Failed to decode NZB")
-			continue
+			return nil
+		}
+		if err := validateStoredNZBIdentity(id, nzb); err != nil {
+			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Ignoring mismatched NZB metadata")
+			return nil
 		}
 
-		if err := fn(nzb); err != nil {
-			return err
-		}
+		return fn(nzb)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to iterate NZB metadata: %w", err)
 	}
 
 	return nil
@@ -307,19 +383,22 @@ func (s *NZBStorage) GetAllNZBIDs() ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entries, err := os.ReadDir(s.metaDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read meta directory: %w", err)
-	}
-
 	var ids []string
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != metaFileExtension {
-			continue
+	err := scanMetadataDirectory(s.metaDir, metaReadBatchSize, func(entry os.DirEntry) error {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != metaFileExtension {
+			return nil
 		}
 		// Extract ID from filename (remove .meta extension)
-		id := entry.Name()[:len(entry.Name())-len(metaFileExtension)]
+		id := strings.TrimSuffix(entry.Name(), metaFileExtension)
+		if _, err := canonicalNZBID(id); err != nil {
+			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Ignoring invalid NZB meta filename")
+			return nil
+		}
 		ids = append(ids, id)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read meta directory: %w", err)
 	}
 
 	return ids, nil
@@ -327,8 +406,13 @@ func (s *NZBStorage) GetAllNZBIDs() ([]string, error) {
 
 // Exists checks if an NZB exists in storage
 func (s *NZBStorage) Exists(id string) bool {
-	path := s.metaFilePath(id)
-	_, err := os.Stat(path)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	path, err := s.metaFilePath(id)
+	if err != nil {
+		return false
+	}
+	_, err = statMetadataFile(s.metaDir, path)
 	return err == nil
 }
 
@@ -363,32 +447,53 @@ func (s *NZBStorage) Stats() map[string]any {
 // always observe a fully-decodable file (old proto or new v2). Decode failures
 // are logged and skipped rather than aborting. Returns the number migrated.
 func (s *NZBStorage) MigrateLegacy() (int, error) {
+	return s.MigrateLegacyContext(context.Background())
+}
+
+// MigrateLegacyContext is the lifecycle-aware form of MigrateLegacy. A reset
+// can cancel an old Usenet instance before a replacement starts touching the
+// same metadata directory.
+func (s *NZBStorage) MigrateLegacyContext(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if s.migrationMarkerExists() {
 		return 0, nil
 	}
 
-	s.mu.RLock()
-	entries, err := os.ReadDir(s.metaDir)
-	s.mu.RUnlock()
+	// Cheap first-byte probe (lock-free) to collect only the legacy files.
+	var legacy []string
+	err := scanMetadataDirectory(s.metaDir, metaReadBatchSize, func(entry os.DirEntry) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != metaFileExtension {
+			return nil
+		}
+		id := strings.TrimSuffix(entry.Name(), metaFileExtension)
+		path, err := s.metaFilePath(id)
+		if err != nil {
+			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Migration: ignoring invalid meta filename")
+			return nil
+		}
+		v2, err := fileIsCodecV2(s.metaDir, path)
+		if err != nil {
+			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Migration: failed to probe file")
+			return nil
+		}
+		if !v2 {
+			legacy = append(legacy, id)
+		}
+		return nil
+	})
 	if err != nil {
 		return 0, fmt.Errorf("failed to read meta directory: %w", err)
 	}
-
-	// Cheap first-byte probe (lock-free) to collect only the legacy files.
-	var legacy []string
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != metaFileExtension {
-			continue
-		}
-		path := filepath.Join(s.metaDir, entry.Name())
-		v2, err := fileIsCodecV2(path)
-		if err != nil {
-			s.logger.Warn().Err(err).Str("file", entry.Name()).Msg("Migration: failed to probe file")
-			continue
-		}
-		if !v2 {
-			legacy = append(legacy, path)
-		}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 
 	if len(legacy) == 0 {
@@ -399,25 +504,37 @@ func (s *NZBStorage) MigrateLegacy() (int, error) {
 	s.logger.Info().Int("legacy", len(legacy)).Msg("Migration: upgrading legacy NZB meta to v2")
 
 	var migrated, failed atomic.Int64
-	pl := pool.New().WithMaxGoroutines(min(runtime.NumCPU(), 6))
+	pl := pool.New().WithContext(ctx).WithMaxGoroutines(min(runtime.NumCPU(), 6))
 
-	for _, path := range legacy {
-		pl.Go(func() {
-			ok, err := s.migrateFile(path)
+	for _, id := range legacy {
+		if ctx.Err() != nil {
+			break
+		}
+		pl.Go(func(taskCtx context.Context) error {
+			if err := taskCtx.Err(); err != nil {
+				return err
+			}
+			ok, err := s.migrateFile(id)
 			if err != nil {
-				s.logger.Warn().Err(err).Str("file", filepath.Base(path)).Msg("Migration: failed to migrate file")
+				s.logger.Warn().Err(err).Str("nzb_id", id).Msg("Migration: failed to migrate file")
 				failed.Add(1)
-				return
+				return nil
 			}
 			if ok {
 				if n := migrated.Add(1); n%1000 == 0 {
 					s.logger.Info().Int64("migrated", n).Int("total", len(legacy)).Msg("Migration: progress")
 				}
 			}
+			return taskCtx.Err()
 		})
 	}
 
-	pl.Wait()
+	if err := pl.Wait(); err != nil {
+		return int(migrated.Load()), err
+	}
+	if err := ctx.Err(); err != nil {
+		return int(migrated.Load()), err
+	}
 
 	// Recompute cached stats once from disk rather than racing per-file deltas.
 	s.mu.Lock()
@@ -435,8 +552,12 @@ func (s *NZBStorage) MigrateLegacy() (int, error) {
 // read/decode/encode runs lock-free; the storage lock is held only for the
 // final re-check + atomic rename so a concurrent AddNZB can't be clobbered
 // (AddNZB always writes v2, so a file that became v2 meanwhile is skipped).
-func (s *NZBStorage) migrateFile(path string) (bool, error) {
-	data, err := os.ReadFile(path)
+func (s *NZBStorage) migrateFile(id string) (bool, error) {
+	path, err := s.metaFilePath(id)
+	if err != nil {
+		return false, err
+	}
+	data, err := readMetadataFile(s.metaDir, path)
 	if err != nil {
 		return false, fmt.Errorf("read: %w", err)
 	}
@@ -448,14 +569,20 @@ func (s *NZBStorage) migrateFile(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("decode: %w", err)
 	}
+	if err := validateStoredNZBIdentity(id, nzb); err != nil {
+		return false, err
+	}
 	out, err := encodeNZBV2(nzb)
 	if err != nil {
 		return false, fmt.Errorf("encode: %w", err)
 	}
 
 	// Unique temp name so it can't collide with AddNZB's "<path>.tmp".
-	tmpPath := path + ".v2tmp"
-	if err := os.WriteFile(tmpPath, out, 0644); err != nil {
+	tmpPath, err := metadataFilePath(s.metaDir, id, nzbMetaV2TempSuffix)
+	if err != nil {
+		return false, err
+	}
+	if err := writeMetadataFile(s.metaDir, tmpPath, out, 0644); err != nil {
 		return false, fmt.Errorf("write temp: %w", err)
 	}
 
@@ -463,36 +590,44 @@ func (s *NZBStorage) migrateFile(path string) (bool, error) {
 	defer s.mu.Unlock()
 	// If AddNZB rewrote this file as v2 while we were encoding, its content is
 	// newer — don't overwrite it with our re-encoded older copy.
-	if cur, cerr := fileIsCodecV2(path); cerr == nil && cur {
-		_ = os.Remove(tmpPath)
+	if cur, cerr := fileIsCodecV2(s.metaDir, path); cerr == nil && cur {
+		_ = removeMetadataFile(s.metaDir, tmpPath)
 		return false, nil
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := renameMetadataFile(s.metaDir, tmpPath, path); err != nil {
+		_ = removeMetadataFile(s.metaDir, tmpPath)
 		return false, fmt.Errorf("rename: %w", err)
 	}
 	return true, nil
 }
 
-func (s *NZBStorage) migrationMarkerPath() string {
-	return filepath.Join(s.metaDir, metaMigrationMarker)
+func (s *NZBStorage) migrationMarkerPath() (string, error) {
+	return safepath.JoinIdentifiers(s.metaDir, metaMigrationMarker)
 }
 
 func (s *NZBStorage) migrationMarkerExists() bool {
-	_, err := os.Stat(s.migrationMarkerPath())
+	path, err := s.migrationMarkerPath()
+	if err != nil {
+		return false
+	}
+	_, err = statMetadataFile(s.metaDir, path)
 	return err == nil
 }
 
 func (s *NZBStorage) writeMigrationMarker() {
-	if err := os.WriteFile(s.migrationMarkerPath(), []byte("v2\n"), 0644); err != nil {
+	path, err := s.migrationMarkerPath()
+	if err == nil {
+		err = writeMetadataFile(s.metaDir, path, []byte("v2\n"), 0644)
+	}
+	if err != nil {
 		s.logger.Warn().Err(err).Msg("Migration: failed to write completion marker")
 	}
 }
 
 // fileIsCodecV2 cheaply reports whether a meta file already uses the v2 codec
 // by reading only its first byte.
-func fileIsCodecV2(path string) (bool, error) {
-	f, err := os.Open(path)
+func fileIsCodecV2(root, path string) (bool, error) {
+	f, err := openMetadataFile(root, path)
 	if err != nil {
 		return false, err
 	}
@@ -509,74 +644,6 @@ func fileIsCodecV2(path string) (bool, error) {
 // ============================================================================
 // Conversion functions between storage.NZB and NZBProto
 // ============================================================================
-
-func nzbToProto(nzb *storage.NZB) *NZBProto {
-	pb := &NZBProto{
-		Id:               nzb.ID,
-		Name:             nzb.Name,
-		Title:            nzb.Title,
-		Path:             nzb.Path,
-		TotalSize:        nzb.TotalSize,
-		DatePostedUnix:   nzb.DatePosted.Unix(),
-		Category:         nzb.Category,
-		Groups:           nzb.Groups,
-		Downloaded:       nzb.Downloaded,
-		AddedOnUnix:      nzb.AddedOn.Unix(),
-		LastActivityUnix: nzb.LastActivity.Unix(),
-		Status:           nzb.Status,
-		Progress:         nzb.Progress,
-		Percentage:       nzb.Percentage,
-		SizeDownloaded:   nzb.SizeDownloaded,
-		Eta:              nzb.ETA,
-		Speed:            nzb.Speed,
-		CompletedOnUnix:  nzb.CompletedOn.Unix(),
-		IsBad:            nzb.IsBad,
-		Storage:          nzb.Storage,
-		FailMessage:      nzb.FailMessage,
-		Password:         nzb.Password,
-	}
-
-	pb.Files = make([]*NZBFileProto, len(nzb.Files))
-	for i, f := range nzb.Files {
-		pb.Files[i] = nzbFileToProto(&f)
-	}
-
-	return pb
-}
-
-func nzbFileToProto(f *storage.NZBFile) *NZBFileProto {
-	pb := &NZBFileProto{
-		NzbId:         f.NzbID,
-		Name:          f.Name,
-		InternalPath:  f.InternalPath,
-		Size:          f.Size,
-		StartOffset:   f.StartOffset,
-		Groups:        f.Groups,
-		FileType:      string(f.FileType),
-		Password:      f.Password,
-		IsDeleted:     f.IsDeleted,
-		IsStored:      f.IsStored,
-		SegmentSize:   f.SegmentSize,
-		EncryptionKey: f.EncryptionKey,
-		EncryptionIv:  f.EncryptionIV,
-		IsEncrypted:   f.IsEncrypted,
-	}
-
-	pb.Segments = make([]*NZBSegmentProto, len(f.Segments))
-	for i, s := range f.Segments {
-		pb.Segments[i] = &NZBSegmentProto{
-			Number:           int32(s.Number),
-			MessageId:        s.MessageID,
-			Bytes:            s.Bytes,
-			StartOffset:      s.StartOffset,
-			EndOffset:        s.EndOffset,
-			Group:            s.Group,
-			SegmentDataStart: s.SegmentDataStart,
-		}
-	}
-
-	return pb
-}
 
 func protoToNZB(pb *NZBProto) *storage.NZB {
 	nzb := &storage.NZB{

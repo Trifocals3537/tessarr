@@ -121,3 +121,20 @@ func b64(s string) string {
 	}
 	return sb.String()
 }
+
+func TestNormalizeHashesSplitsDeduplicatesAndTrims(t *testing.T) {
+	got := normalizeHashes([]string{
+		" AAA |bbb|| ",
+		"aaa",
+		" CCC ",
+	})
+	want := []string{"AAA", "bbb", "CCC"}
+	if len(got) != len(want) {
+		t.Fatalf("normalizeHashes() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("normalizeHashes()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}

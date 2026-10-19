@@ -1,4 +1,4 @@
-// Configuration management for Decypharr
+// Configuration management for Tessarr
 class ConfigManager {
     constructor() {
         this.debridCount = 0;
@@ -7,6 +7,7 @@ class ConfigManager {
         this.debridDirectoryCounts = {};
         this.directoryFilterCounts = {};
         this.virtualFolderCount = 0;
+        this.redactedSecret = '__TESSARR_REDACTED__';
 
         this.refs = {
             configForm: document.getElementById('configForm'),
@@ -35,7 +36,7 @@ class ConfigManager {
         const urlParams = new URLSearchParams(window.location.search);
         if (urlParams.has('inco')) {
             const errMsg = urlParams.get('inco');
-            window.decypharrUtils.createToast(`Incomplete configuration: ${errMsg}`, 'warning');
+            window.tessarrUtils.createToast(`Incomplete configuration: ${errMsg}`, 'warning');
         }
     }
 
@@ -51,6 +52,11 @@ class ConfigManager {
 
         const addRuleBtn = document.getElementById('addQueueCleanupRuleBtn');
         if (addRuleBtn) addRuleBtn.addEventListener('click', () => this.addQueueCleanupCustomRow());
+
+		const strmEnabled = document.getElementById('strm.enabled');
+		if (strmEnabled) strmEnabled.addEventListener('change', () => this.updateStrmControls());
+		const regenerateStrm = document.getElementById('strmRegenerateBtn');
+		if (regenerateStrm) regenerateStrm.addEventListener('click', () => this.regenerateStrmLibrary());
     }
 
     // Display labels for the built-in queue-cleanup catalog. IDs MUST match
@@ -83,7 +89,7 @@ class ConfigManager {
 
     async loadConfiguration() {
         try {
-            const response = await window.decypharrUtils.fetcher('/api/config');
+            const response = await window.tessarrUtils.fetcher('/api/config');
             if (!response.ok) {
                 throw new Error('Failed to load configuration');
             }
@@ -93,7 +99,7 @@ class ConfigManager {
 
         } catch (error) {
             console.error('Error loading configuration:', error);
-            window.decypharrUtils.createToast('Error loading configuration', 'error');
+            window.tessarrUtils.createToast('Error loading configuration', 'error');
         }
     }
 
@@ -136,7 +142,52 @@ class ConfigManager {
 
         // Load repair config
         this.populateRepairSettings(config.repair, config.arrs);
+
+		// Load mountless STRM-library settings.
+		this.populateStrmSettings(config.strm);
     }
+
+	populateStrmSettings(strm = {}) {
+		const enabled = document.getElementById('strm.enabled');
+		const path = document.getElementById('strm.path');
+		const delivery = document.getElementById('strm.delivery_mode');
+		const keepExtension = document.getElementById('strm.keep_media_extension');
+		if (enabled) enabled.checked = !!strm.enabled;
+		if (path) path.value = strm.path || '';
+		if (delivery) delivery.value = strm.delivery_mode || 'proxy';
+		if (keepExtension) keepExtension.checked = !!strm.keep_media_extension;
+		this.updateStrmControls();
+	}
+
+	updateStrmControls() {
+		const active = !!document.getElementById('strm.enabled')?.checked;
+		document.querySelectorAll('.strm-setting').forEach((element) => {
+			element.disabled = !active;
+		});
+	}
+
+	collectStrmConfig() {
+		return {
+			enabled: !!document.getElementById('strm.enabled')?.checked,
+			path: document.getElementById('strm.path')?.value.trim() || '',
+			delivery_mode: document.getElementById('strm.delivery_mode')?.value || 'proxy',
+			keep_media_extension: !!document.getElementById('strm.keep_media_extension')?.checked,
+		};
+	}
+
+	async regenerateStrmLibrary() {
+		const button = document.getElementById('strmRegenerateBtn');
+		if (button) button.disabled = true;
+		try {
+			const response = await window.tessarrUtils.fetcher('/api/strm/regenerate', {method: 'POST'});
+			if (!response.ok) throw new Error((await response.text()) || 'Could not start regeneration');
+			window.tessarrUtils.createToast('STRM library regeneration started.', 'success');
+		} catch (error) {
+			window.tessarrUtils.createToast(`STRM regeneration failed: ${error.message}`, 'error');
+		} finally {
+			if (button) button.disabled = !document.getElementById('strm.enabled')?.checked;
+		}
+	}
 
     populateRepairSettings(repair, arrs) {
         // Always refresh the arrs multi-select so it tracks the latest *Arrs config.
@@ -163,6 +214,7 @@ class ConfigManager {
         if ($('repair.workers')) $('repair.workers').value = repair.workers || 5;
         if ($('repair.nntp_connection_percent')) $('repair.nntp_connection_percent').value = repair.nntp_connection_percent || 20;
         if ($('repair.strategy')) $('repair.strategy').value = repair.strategy || 'per_entry';
+        if ($('repair.stop_schedule')) $('repair.stop_schedule').value = repair.stop_schedule || '';
         if ($('repair.auto_repair')) $('repair.auto_repair').checked = !!repair.auto_repair;
         if ($('repair.skip_nzb_repair')) $('repair.skip_nzb_repair').checked = !!repair.skip_nzb_repair;
     }
@@ -181,6 +233,7 @@ class ConfigManager {
             workers: parseInt($('repair.workers')?.value, 10) || 0,
             nntp_connection_percent: parseInt($('repair.nntp_connection_percent')?.value, 10) || 0,
             strategy: $('repair.strategy')?.value || 'per_entry',
+            stop_schedule: $('repair.stop_schedule')?.value.trim() || '',
             auto_repair: $('repair.auto_repair')?.checked || false,
             skip_nzb_repair: $('repair.skip_nzb_repair')?.checked || false,
             arrs,
@@ -191,7 +244,7 @@ class ConfigManager {
         const fields = [
             'log_level', 'url_base', 'bind_address', 'port',
             'min_file_size', 'max_file_size', 'folder_naming',
-            'refresh_dirs', 'disable_webdav', 'app_url'
+            'refresh_dirs', 'disable_webdav', 'allow_samples', 'app_url'
         ];
 
         fields.forEach(field => {
@@ -214,9 +267,9 @@ class ConfigManager {
 
     populateDownloadSettings(config) {
         const fields = [
-            'remove_stalled_after', 'nzb_user_agent', 'download_folder',
+            'remove_stalled_after', 'uncached_stall_timeout', 'nzb_user_agent', 'download_folder',
             'refresh_interval', 'max_active_downloads', 'skip_pre_cache',
-            'always_rm_tracker_urls', 'default_download_action'
+            'always_rm_tracker_urls', 'relative_symlinks', 'default_download_action'
         ];
 
         fields.forEach(field => {
@@ -243,13 +296,13 @@ class ConfigManager {
         // Handle webhook URL
         const webhookElement = document.getElementById('notifications.webhook_url');
         if (webhookElement && notificationsConfig.webhook_url) {
-            webhookElement.value = notificationsConfig.webhook_url;
+            this.populateSecretInput(webhookElement, notificationsConfig.webhook_url);
         }
 
         // Handle callback URL
         const callbackElement = document.getElementById('notifications.callback_url');
         if (callbackElement && notificationsConfig.callback_url) {
-            callbackElement.value = notificationsConfig.callback_url;
+            this.populateSecretInput(callbackElement, notificationsConfig.callback_url);
         }
 
         // Handle events checkboxes
@@ -267,13 +320,12 @@ class ConfigManager {
         if (!mountConfig) return;
 
         // Handle mount type radio buttons
-        if (mountConfig.type) {
-            const typeRadio = document.querySelector(`input[name="mount.type"][value="${mountConfig.type}"]`);
-            if (typeRadio) {
-                typeRadio.checked = true;
-                // Trigger change event to switch to the correct tab
-                typeRadio.dispatchEvent(new Event('change'));
-            }
+        const mountType = mountConfig.type || 'none';
+        const typeRadio = document.querySelector(`input[name="mount.type"][value="${mountType}"]`);
+        if (typeRadio) {
+            typeRadio.checked = true;
+            // Trigger change event to switch to the correct tab
+            typeRadio.dispatchEvent(new Event('change'));
         }
 
         // Handle mount path
@@ -340,9 +392,35 @@ class ConfigManager {
         fields.forEach(field => {
             const element = document.querySelector(`[name="mount.external_rclone.${field}"]`);
             if (element && externalRcloneConfig[field] !== undefined) {
-                element.value = externalRcloneConfig[field];
+                if (field === 'rc_password') {
+                    this.populateSecretInput(element, externalRcloneConfig[field]);
+                } else {
+                    element.value = externalRcloneConfig[field];
+                }
             }
         });
+    }
+
+    populateSecretInput(input, value) {
+        const values = Array.isArray(value) ? value : [value];
+        if (values.includes(this.redactedSecret)) {
+            input.value = '';
+            input.dataset.secretConfigured = 'true';
+            input.placeholder = 'Configured — enter a replacement';
+            input.required = false;
+            return;
+        }
+
+        input.value = Array.isArray(value) ? value.join('\n') : (value || '');
+        delete input.dataset.secretConfigured;
+    }
+
+    collectSecretValue(input) {
+        if (!input) return '';
+        if (!input.value && input.dataset.secretConfigured === 'true') {
+            return this.redactedSecret;
+        }
+        return input.value;
     }
 
     addDebridConfig(data = {}) {
@@ -405,8 +483,10 @@ class ConfigManager {
             if (input) {
                 if (input.type === 'checkbox') {
                     input.checked = value;
+                } else if (['api_key', 'proxy', 'rc_pass'].includes(key)) {
+                    this.populateSecretInput(input, value);
                 } else if (key === 'download_api_keys' && Array.isArray(value)) {
-                    input.value = value.join('\n');
+                    this.populateSecretInput(input, value);
                     // Apply masking to populated textarea
                     if (input.tagName.toLowerCase() === 'textarea') {
                         input.style.webkitTextSecurity = 'disc';
@@ -534,7 +614,7 @@ class ConfigManager {
                                 </label>
                                 <input type="text" class="input w-full" 
                                        name="debrid[${index}].user_agent" id="debrid[${index}].user_agent" 
-                                       placeholder="Decypharr/1.0">
+                                       placeholder="Tessarr/1.0">
                                 <span class="text-sm opacity-70">Custom User Agent for this debrid</span>
                             </div>
                             <div>
@@ -590,17 +670,6 @@ class ConfigManager {
                             <div>
                                 <span class="font-medium">Download Uncached</span>
                                 <div class="label-text-alt">Download uncached files</div>
-                            </div>
-                        </label>
-                    </div>
-
-                    <div>
-                        <label class="label cursor-pointer justify-start gap-2">
-                            <input type="checkbox" class="checkbox checkbox-primary" 
-                                   name="debrid[${index}].add_samples" id="debrid[${index}].add_samples">
-                             <div>
-                                <span class=" font-medium">Add Samples</span>
-                                <div class="label-text-alt">Include sample files</div>
                             </div>
                         </label>
                     </div>
@@ -753,20 +822,21 @@ class ConfigManager {
 
     getFilterTemplate(debridIndex, dirIndex, filterIndex, filterType) {
         const filterConfig = this.getFilterConfig(filterType);
+		const escape = window.tessarrUtils.escapeHtml;
 
         return `
             <div class="filter-item flex items-center gap-3 p-3 bg-base-100 rounded-lg border border-base-300">
                 <div class="badge ${filterConfig.badgeClass} badge-sm">
-                    ${filterConfig.label}
+                    ${escape(filterConfig.label)}
                 </div>
                 <input type="hidden"
                        name="debrid[${debridIndex}].directory[${dirIndex}].filter[${filterIndex}].type"
-                       value="${filterType}">
+                       value="${escape(filterType)}">
                 <div class="flex-1">
                     <input type="text" 
                            class="input input-sm w-full webdav-field"
                            name="debrid[${debridIndex}].directory[${dirIndex}].filter[${filterIndex}].value"
-                           placeholder="${filterConfig.placeholder}">
+                           placeholder="${escape(filterConfig.placeholder)}">
                 </div>
                 <button type="button" class="btn btn-error btn-xs" onclick="this.closest('.filter-item').remove();">
                     <i class="bi bi-x"></i>
@@ -922,7 +992,7 @@ class ConfigManager {
         });
 
         // Generate option elements
-        return debridNames.map(name => `<option value="${window.decypharrUtils.escapeHtml(name)}">${window.decypharrUtils.escapeHtml(name)}</option>`).join('');
+        return debridNames.map(name => `<option value="${window.tessarrUtils.escapeHtml(name)}">${window.tessarrUtils.escapeHtml(name)}</option>`).join('');
     }
 
     updateArrDebridDropdowns() {
@@ -967,6 +1037,11 @@ class ConfigManager {
             if (input) {
                 if (input.type === 'checkbox') {
                     input.checked = value;
+                } else if (key === 'download_uncached') {
+                    // Tri-state select: absent/null = inherit, explicit boolean = override.
+                    input.value = (value === true || value === false) ? String(value) : 'inherit';
+                } else if (key === 'token') {
+                    this.populateSecretInput(input, value);
                 } else {
                     input.value = value;
                 }
@@ -996,7 +1071,7 @@ class ConfigManager {
                         ` : ''}
                     </div>
 
-                    <input type="hidden" name="arr[${index}].source" value="${data.source || ''}">
+                    <input type="hidden" name="arr[${index}].source" value="${window.tessarrUtils.escapeHtml(data.source || '')}">
 
                     <div class="grid grid-cols-1 gap-3">
                         <div>
@@ -1056,11 +1131,16 @@ class ConfigManager {
                         </div>
 
                         <div class="rounded-box bg-base-200/50 px-3 py-2">
-                            <label class="label cursor-pointer justify-start gap-2 p-0">
-                                <input type="checkbox" class="checkbox checkbox-sm checkbox-primary"
-                                       name="arr[${index}].download_uncached" id="arr[${index}].download_uncached">
-                                <span class="text-sm leading-tight">Download Uncached</span>
+                            <label class="label" for="arr[${index}].download_uncached">
+                                <span class="text-sm font-medium">Uncached Downloads</span>
                             </label>
+                            <select class="select w-full select-sm"
+                                    name="arr[${index}].download_uncached" id="arr[${index}].download_uncached">
+                                <option value="inherit">Inherit provider policy (recommended)</option>
+                                <option value="true">Allow uncached</option>
+                                <option value="false">Cached only</option>
+                            </select>
+                            <span class="text-sm opacity-70">When set, this overrides every provider's own uncached setting for this Arr</span>
                         </div>
                     </div>
                 </div>
@@ -1083,8 +1163,8 @@ class ConfigManager {
                 throw new Error(validation.errors.join('\n'));
             }
 
-            const response = await window.decypharrUtils.fetcher('/api/config', {
-                method: 'POST',
+            const response = await window.tessarrUtils.fetcher('/api/config', {
+                method: 'PATCH',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(config)
             });
@@ -1103,20 +1183,20 @@ class ConfigManager {
             }
 
             if (restarted) {
-                window.decypharrUtils.createToast('Configuration saved successfully! Services are restarting...', 'success');
+                window.tessarrUtils.createToast('Configuration saved successfully! Services are restarting...', 'success');
                 // Reload page after a delay to allow services to restart
                 setTimeout(() => {
                     window.location.reload();
                 }, 2000);
             } else {
                 // Applied live — no restart, no disruptive reload.
-                window.decypharrUtils.createToast('Configuration saved and applied.', 'success');
+                window.tessarrUtils.createToast('Configuration saved and applied.', 'success');
                 this.refs.loadingOverlay.classList.add('hidden');
             }
 
         } catch (error) {
             console.error('Error saving configuration:', error);
-            window.decypharrUtils.createToast(`Error saving configuration: ${error.message}`, 'error');
+            window.tessarrUtils.createToast(`Error saving configuration: ${error.message}`, 'error');
             this.refs.loadingOverlay.classList.add('hidden');
         }
     }
@@ -1143,16 +1223,19 @@ class ConfigManager {
         });
 
         if (config.mount.type === "") {
-            errors.push('Mount type is required when ');
+            errors.push('Mount type is required');
         }
 
-        if (config.mount.mount_path === "") {
-            errors.push('Mount path is required when Rclone is enabled');
+        if (config.mount.type !== 'none' && config.mount.mount_path === "") {
+            errors.push('Mount path is required when mounting is enabled');
         }
 
         if (config.repair?.enabled && !config.repair.schedule) {
             errors.push('Repair: schedule is required when Repair is enabled');
         }
+		if (config.strm?.enabled && !config.strm.path) {
+			errors.push('STRM Library: export path is required when enabled');
+		}
         return {
             valid: errors.length === 0,
             errors
@@ -1180,7 +1263,9 @@ class ConfigManager {
                 .split(',').map(ext => ext.trim()).filter(Boolean),
             min_file_size: document.querySelector('[name="min_file_size"]').value,
             max_file_size: document.querySelector('[name="max_file_size"]').value,
+            allow_samples: document.querySelector('[name="allow_samples"]').checked,
             remove_stalled_after: document.querySelector('[name="remove_stalled_after"]').value || "10m",
+            uncached_stall_timeout: document.querySelector('[name="uncached_stall_timeout"]')?.value.trim() || "",
             nzb_user_agent: document.querySelector('[name="nzb_user_agent"]').value,
             download_folder: document.querySelector('[name="download_folder"]').value,
             refresh_interval: document.querySelector('[name="refresh_interval"]').value || "30s",
@@ -1188,6 +1273,7 @@ class ConfigManager {
             max_active_downloads: parseInt(document.querySelector('[name="max_active_downloads"]').value) || 5,
             skip_pre_cache: document.querySelector('[name="skip_pre_cache"]').checked,
             always_rm_tracker_urls: document.querySelector('[name="always_rm_tracker_urls"]').checked,
+            relative_symlinks: document.querySelector('[name="relative_symlinks"]').checked,
             folder_naming: document.querySelector('[name="folder_naming"]')?.value || "",
             disable_webdav: document.querySelector('[name="disable_webdav"]').checked,
             refresh_dirs: document.querySelector('[name="refresh_dirs"]')?.value || "",
@@ -1212,7 +1298,10 @@ class ConfigManager {
             notifications: this.collectNotificationsConfig(),
 
             // Collect repair config
-            repair: this.collectRepairConfig()
+			repair: this.collectRepairConfig(),
+
+			// Mountless media library
+			strm: this.collectStrmConfig()
         };
     }
 
@@ -1231,8 +1320,8 @@ class ConfigManager {
 
         return {
             enabled: enabledElement ? enabledElement.checked : false,
-            webhook_url: webhookElement ? webhookElement.value : '',
-            callback_url: callbackElement ? callbackElement.value : '',
+            webhook_url: this.collectSecretValue(webhookElement),
+            callback_url: this.collectSecretValue(callbackElement),
             events: events
         };
     }
@@ -1262,7 +1351,7 @@ class ConfigManager {
                 host: hostInput.value,
                 port: parseInt(portInput.value) || 119,
                 username: usernameInput.value,
-                password: passwordInput.value,
+                password: this.collectSecretValue(passwordInput),
                 backbone: backboneInput.value.trim(),
                 ssl: sslInput.checked,
                 max_connections: parseInt(maxConnectionsInput.value) || 100,
@@ -1310,7 +1399,6 @@ class ConfigManager {
             const proxyInput = getField('proxy');
             const downloadUncachedInput = getField('download_uncached');
             const unpackRarInput = getField('unpack_rar');
-            const addSamplesInput = getField('add_samples');
             const userAgentInput = getField('user_agent');
             const downloadKeysTextarea = getField('download_api_keys');
             const torrentsRefreshIntervalInput = getField('torrents_refresh_interval');
@@ -1318,7 +1406,7 @@ class ConfigManager {
             const autoExpireLinksAfterInput = getField('auto_expire_links_after');
 
             if (!nameInput || !providerInput || !apiKeyInput || !rateLimitInput || !repairRateLimitInput || !downloadRateLimitInput ||
-                !minimumFreeSlotInput || !proxyInput || !downloadUncachedInput || !unpackRarInput || !addSamplesInput ||
+                !minimumFreeSlotInput || !proxyInput || !downloadUncachedInput || !unpackRarInput ||
                 !userAgentInput || !torrentsRefreshIntervalInput || !downloadLinksRefreshIntervalInput || !autoExpireLinksAfterInput) {
                 return;
             }
@@ -1326,15 +1414,14 @@ class ConfigManager {
             const debrid = {
                 name: nameInput.value,
                 provider: providerInput.value,
-                api_key: apiKeyInput.value,
+                api_key: this.collectSecretValue(apiKeyInput),
                 rate_limit: rateLimitInput.value,
                 repair_rate_limit: repairRateLimitInput.value,
                 download_rate_limit: downloadRateLimitInput.value,
                 minimum_free_slot: parseInt(minimumFreeSlotInput.value) || 0,
-                proxy: proxyInput.value,
+                proxy: this.collectSecretValue(proxyInput),
                 download_uncached: downloadUncachedInput.checked,
                 unpack_rar: unpackRarInput.checked,
-                add_samples: addSamplesInput.checked,
                 user_agent: userAgentInput.value
             };
 
@@ -1344,6 +1431,8 @@ class ConfigManager {
                     .split('\n')
                     .map(key => key.trim())
                     .filter(key => key.length > 0);
+            } else if (downloadKeysTextarea?.dataset.secretConfigured === 'true') {
+                debrid.download_api_keys = [this.redactedSecret];
             }
 
             debrid.torrents_refresh_interval = torrentsRefreshIntervalInput.value;
@@ -1380,12 +1469,16 @@ class ConfigManager {
             const arr = {
                 name: nameInput.value,
                 host: hostInput.value,
-                token: tokenInput.value,
+                token: this.collectSecretValue(tokenInput),
                 skip_repair: skipRepairInput.checked,
-                download_uncached: downloadUncachedInput.checked,
                 selected_debrid: selectedDebridInput.value,
                 source: sourceInput.value
             };
+
+            // Tri-state: omit the key entirely to inherit provider policy.
+            if (downloadUncachedInput.value === 'true' || downloadUncachedInput.value === 'false') {
+                arr.download_uncached = downloadUncachedInput.value === 'true';
+            }
 
             if (arr.name && arr.host) {
                 arrs.push(arr);
@@ -1413,7 +1506,7 @@ class ConfigManager {
             }
         });
 
-        const esc = window.decypharrUtils.escapeHtml;
+        const esc = window.tessarrUtils.escapeHtml;
         catalogEl.innerHTML = this.queueCleanupCatalog.map(c => {
             const action = c.id in savedActions ? savedActions[c.id] : '';
             return `
@@ -1432,7 +1525,7 @@ class ConfigManager {
     addQueueCleanupCustomRow(match = '', action = '') {
         const customEl = document.getElementById('queueCleanupCustom');
         if (!customEl) return;
-        const esc = window.decypharrUtils.escapeHtml;
+        const esc = window.tessarrUtils.escapeHtml;
         const row = document.createElement('div');
         row.className = 'grid grid-cols-1 md:grid-cols-12 gap-2 queue-cleanup-custom-row';
         row.innerHTML = `
@@ -1485,7 +1578,7 @@ class ConfigManager {
         return {
             rc_url: document.querySelector('[name="mount.external_rclone.rc_url"]')?.value || "",
             rc_username: document.querySelector('[name="mount.external_rclone.rc_username"]')?.value || "",
-            rc_password: document.querySelector('[name="mount.external_rclone.rc_password"]')?.value || "",
+            rc_password: this.collectSecretValue(document.querySelector('[name="mount.external_rclone.rc_password"]')),
         };
     }
 
@@ -1570,7 +1663,7 @@ class ConfigManager {
                     navigator.registerProtocolHandler(
                         'magnet',
                         `${window.location.origin}${window.urlBase}download?magnet=%s`,
-                        'Decypharr'
+                        'Tessarr'
                     );
                     localStorage.setItem('magnetHandler', 'true');
                     const btn = document.getElementById('registerMagnetLink');
@@ -1578,13 +1671,13 @@ class ConfigManager {
                     btn.classList.remove('btn-primary');
                     btn.classList.add('btn-success');
                     btn.disabled = true;
-                    window.decypharrUtils.createToast('Magnet link handler registered successfully');
+                    window.tessarrUtils.createToast('Magnet link handler registered successfully');
                 } catch (error) {
                     console.error('Failed to register magnet link handler:', error);
-                    window.decypharrUtils.createToast('Failed to register magnet link handler', 'error');
+                    window.tessarrUtils.createToast('Failed to register magnet link handler', 'error');
                 }
             } else {
-                window.decypharrUtils.createToast('Magnet link registration not supported in this browser', 'warning');
+                window.tessarrUtils.createToast('Magnet link registration not supported in this browser', 'warning');
             }
         };
 
@@ -1603,8 +1696,11 @@ class ConfigManager {
     populateAPIToken(config) {
         const tokenDisplay = document.getElementById('api-token-display');
         if (tokenDisplay) {
-            tokenDisplay.value = config.api_token || '****';
+			tokenDisplay.value = config.api_token_configured ? 'Configured (hidden)' : 'Not configured';
+			tokenDisplay.dataset.tokenAvailable = 'false';
         }
+		const copyButton = document.getElementById('copy-token-btn');
+		if (copyButton) copyButton.disabled = true;
 
         // Populate username (password is not populated for security)
         const usernameField = document.getElementById('auth-username');
@@ -1644,7 +1740,7 @@ class ConfigManager {
                             <input type="text"
                                    class="input input-bordered w-full"
                                    name="virtual_folder_${id}_name"
-                                   value="${window.decypharrUtils.escapeHtml(folderName)}"
+                                   value="${window.tessarrUtils.escapeHtml(folderName)}"
                                    placeholder="e.g., Movies, TV Shows, 4K"
                                    required>
                             <span class="text-sm opacity-70">This folder will appear in your mount</span>
@@ -1663,12 +1759,12 @@ class ConfigManager {
                                         <input type="text"
                                                class="input input-bordered input-sm flex-1"
                                                name="virtual_folder_${id}_filter_key_${index}"
-                                               value="${window.decypharrUtils.escapeHtml(key)}"
+                                               value="${window.tessarrUtils.escapeHtml(key)}"
                                                placeholder="Filter key (e.g., name, category)">
                                         <input type="text"
                                                class="input input-bordered input-sm flex-1"
                                                name="virtual_folder_${id}_filter_value_${index}"
-                                               value="${window.decypharrUtils.escapeHtml(value)}"
+                                               value="${window.tessarrUtils.escapeHtml(value)}"
                                                placeholder="Filter value (e.g., *movie*, tv)">
                                         <button type="button" class="btn btn-sm btn-ghost btn-circle" onclick="configManager.removeVirtualFolderFilter(${id}, ${index});">
                                             <i class="bi bi-trash"></i>
@@ -1818,6 +1914,8 @@ class ConfigManager {
             if (input) {
                 if (input.type === 'checkbox') {
                     input.checked = value;
+                } else if (key === 'password') {
+                    this.populateSecretInput(input, value);
                 } else {
                     input.value = value;
                 }

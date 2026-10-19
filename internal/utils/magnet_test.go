@@ -1,14 +1,21 @@
 package utils
 
 import (
+	"bytes"
+	"context"
+	"encoding/base32"
+	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/sirrobot01/decypharr/internal/testutil"
+	"github.com/Trifocals3537/tessarr/internal/testutil"
+	"github.com/anacrolix/torrent/metainfo"
 )
 
 // checkMagnet is a helper function that verifies magnet properties
@@ -83,6 +90,37 @@ func TestGetMagnetFromFile_RealTorrentFile_StripFalse(t *testing.T) {
 	testMagnetFromFile(t, torrentPath, false, expectedInfoHash, expectedName, expectedLink, expectedTrackerCount)
 }
 
+func TestGetMagnetFromBytesStripsTrackersFromUploadedFileWithoutChangingHash(t *testing.T) {
+	torrentData, err := os.ReadFile(testutil.GetTestTorrentPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := GetMagnetFromBytes(torrentData, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sanitized, err := GetMagnetFromBytes(torrentData, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sanitized.InfoHash != original.InfoHash {
+		t.Fatalf("sanitized infohash = %q, want %q", sanitized.InfoHash, original.InfoHash)
+	}
+	if bytes.Equal(sanitized.File, torrentData) {
+		t.Fatal("sanitized torrent bytes were not rewritten")
+	}
+	metadata, err := metainfo.Load(bytes.NewReader(sanitized.File))
+	if err != nil {
+		t.Fatalf("load sanitized torrent: %v", err)
+	}
+	if metadata.Announce != "" || len(metadata.AnnounceList) != 0 {
+		t.Fatalf("sanitized torrent retains trackers: announce=%q tiers=%d", metadata.Announce, len(metadata.AnnounceList))
+	}
+	if got := metadata.HashInfoBytes().HexString(); got != original.InfoHash {
+		t.Fatalf("sanitized file infohash = %q, want %q", got, original.InfoHash)
+	}
+}
+
 func TestGetMagnetFromFile_MagnetFile_StripTrue(t *testing.T) {
 	expectedInfoHash := "8a19577fb5f690970ca43a57ff1011ae202244b8"
 	expectedName := "ubuntu-25.04-desktop-amd64.iso"
@@ -145,6 +183,61 @@ func TestGetMagnetFromUrl_MagnetLink_StripFalse(t *testing.T) {
 	t.Logf("Generated magnet link with trackers: %s", magnet.Link)
 }
 
+func TestGetMagnetFromURLContextAcceptsRawInfoHashes(t *testing.T) {
+	t.Parallel()
+
+	const expectedInfoHash = "8a19577fb5f690970ca43a57ff1011ae202244b8"
+	decoded, err := hex.DecodeString(expectedInfoHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base32Hash := base32.StdEncoding.EncodeToString(decoded)
+
+	for _, test := range []struct {
+		name   string
+		source string
+	}{
+		{name: "uppercase hex", source: "  " + strings.ToUpper(expectedInfoHash) + "  "},
+		{name: "base32", source: strings.ToLower(base32Hash)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			magnet, err := GetMagnetFromURLContext(
+				context.Background(),
+				test.source,
+				false,
+				MaxMetadataFileBytes,
+			)
+			if err != nil {
+				t.Fatalf("GetMagnetFromURLContext failed: %v", err)
+			}
+
+			checkMagnet(
+				t,
+				magnet,
+				expectedInfoHash,
+				"",
+				"magnet:?xt=urn:btih:"+expectedInfoHash,
+				0,
+				false,
+			)
+		})
+	}
+}
+
+func TestGetMagnetFromURLContextRejectsInvalidTorrentSource(t *testing.T) {
+	t.Parallel()
+
+	_, err := GetMagnetFromURLContext(
+		context.Background(),
+		"not-a-torrent-source",
+		false,
+		MaxMetadataFileBytes,
+	)
+	if err == nil || err.Error() != "invalid torrent URL or infohash" {
+		t.Fatalf("expected a generic invalid source error, got %v", err)
+	}
+}
+
 // testMagnetFromHttpTorrent is a helper function for tests that use GetMagnetFromUrl with HTTP torrent links
 func testMagnetFromHttpTorrent(t *testing.T, torrentPath string, rmTrackerUrls bool, expectedInfoHash, expectedName, expectedLink string, expectedTrackerCount int) {
 	t.Helper()
@@ -194,4 +287,78 @@ func TestGetMagnetFromUrl_TorrentLink_StripFalse(t *testing.T) {
 	expectedTrackerCount := 2
 
 	testMagnetFromHttpTorrent(t, "ubuntu-25.04-desktop-amd64.iso.torrent", false, expectedInfoHash, expectedName, expectedLink, expectedTrackerCount)
+}
+
+func TestGetMagnetFromFileBoundedRejectsOversizedTorrent(t *testing.T) {
+	t.Parallel()
+
+	file, err := os.Open(testutil.GetTestTorrentPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	_, err = GetMagnetFromFileBounded(file, "sample.torrent", false, 8)
+	if !errors.Is(err, ErrContentTooLarge) {
+		t.Fatalf("expected ErrContentTooLarge, got %v", err)
+	}
+}
+
+func TestGetMagnetFromURLContextRejectsStatusChunkedOversizeAndTimeout(t *testing.T) {
+	t.Parallel()
+
+	t.Run("status is redacted", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "no", http.StatusForbidden)
+		}))
+		defer server.Close()
+
+		_, err := GetMagnetFromURLContext(
+			context.Background(),
+			server.URL+"/private/passkey?token=secret-value",
+			false,
+			32,
+		)
+		if err == nil || !strings.Contains(err.Error(), "status code 403") {
+			t.Fatalf("expected status error, got %v", err)
+		}
+		for _, secret := range []string{"passkey", "secret-value"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("magnet error exposed %q: %v", secret, err)
+			}
+		}
+	})
+
+	t.Run("chunked oversize", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			_, _ = w.Write([]byte("123456789"))
+		}))
+		defer server.Close()
+
+		_, err := GetMagnetFromURLContext(context.Background(), server.URL, false, 8)
+		if !errors.Is(err, ErrContentTooLarge) {
+			t.Fatalf("expected ErrContentTooLarge, got %v", err)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(
+			_ http.ResponseWriter,
+			r *http.Request,
+		) {
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		_, err := GetMagnetFromURLContext(ctx, server.URL, false, 32)
+		if err == nil || !strings.Contains(err.Error(), "request timed out") {
+			t.Fatalf("expected timeout error, got %v", err)
+		}
+	})
 }

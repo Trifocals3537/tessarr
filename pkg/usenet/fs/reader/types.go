@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
 )
 
 // SegmentMeta holds metadata for a single Usenet segment.
@@ -28,7 +28,8 @@ type SegmentMeta struct {
 	EndOffset   int64 // Inclusive end offset
 
 	// yEnc decoding hints
-	SegmentDataStart int64 // Offset within decoded data where actual file data begins
+	SegmentDataStart int64                       // Offset within decoded data where actual file data begins
+	Source           *storage.NZBArticleGeometry // Original posted-file geometry, nil for legacy maps.
 }
 
 // NewSegmentMeta creates a SegmentMeta from a storage.NZBSegment.
@@ -40,6 +41,7 @@ func NewSegmentMeta(seg storage.NZBSegment) SegmentMeta {
 		StartOffset:      seg.StartOffset,
 		EndOffset:        seg.EndOffset,
 		SegmentDataStart: seg.SegmentDataStart,
+		Source:           seg.Source,
 	}
 }
 
@@ -99,6 +101,10 @@ func (s SegmentState) String() string {
 
 // Config holds configuration for StreamingReader.
 type Config struct {
+	// Pools shares the memory budget across readers in one service run. A nil
+	// value gives a standalone reader its own lifecycle-scoped pool.
+	Pools *Pools
+
 	// MaxDisk is the maximum disk space to use for segment caching (default: 256MB).
 	MaxDisk int64
 
@@ -143,7 +149,7 @@ func PrefetchAheadSegments(readAheadBytes int64, segments []SegmentMeta) int {
 	const (
 		fallbackSegBytes = 750 * 1024 // typical usenet segment
 		minAhead         = 16
-		maxAhead         = 256 // matches the prefetch channel depth
+		maxAhead         = 256 // matches the bounded prefetch scheduler depth
 	)
 	if readAheadBytes <= 0 {
 		return 0
@@ -174,6 +180,11 @@ func WithDiskPath(path string) Option {
 	return func(c *Config) {
 		c.DiskPath = path
 	}
+}
+
+// WithPools sets the lifecycle-scoped cache pools for this reader.
+func WithPools(pools *Pools) Option {
+	return func(c *Config) { c.Pools = pools }
 }
 
 // WithMaxConnections sets the maximum concurrent NNTP downloads.
@@ -228,25 +239,31 @@ type ReaderStats struct {
 	DownloadErrors  atomic.Int64
 
 	// Prefetch
-	PrefetchHits   atomic.Int64
-	PrefetchMisses atomic.Int64
+	PrefetchHits       atomic.Int64
+	PrefetchMisses     atomic.Int64
+	PrefetchCancelled  atomic.Int64 // stale hints removed for one canceled/seeking consumer
+	PrefetchRebalanced atomic.Int64 // far-ahead hints displaced to give another consumer a fair share
+	PrefetchCoalesced  atomic.Int64 // duplicate cross-consumer hints served by one active fetch
 }
 
 // Snapshot returns a copy of the current stats.
 func (s *ReaderStats) Snapshot() map[string]int64 {
 	return map[string]int64{
-		"reads":            s.Reads.Load(),
-		"bytes_read":       s.BytesRead.Load(),
-		"read_errors":      s.ReadErrors.Load(),
-		"cache_hits":       s.CacheHits.Load(),
-		"cache_misses":     s.CacheMisses.Load(),
-		"evictions":        s.Evictions.Load(),
-		"downloads":        s.Downloads.Load(),
-		"download_bytes":   s.DownloadBytes.Load(),
-		"download_retries": s.DownloadRetries.Load(),
-		"download_errors":  s.DownloadErrors.Load(),
-		"prefetch_hits":    s.PrefetchHits.Load(),
-		"prefetch_misses":  s.PrefetchMisses.Load(),
+		"reads":               s.Reads.Load(),
+		"bytes_read":          s.BytesRead.Load(),
+		"read_errors":         s.ReadErrors.Load(),
+		"cache_hits":          s.CacheHits.Load(),
+		"cache_misses":        s.CacheMisses.Load(),
+		"evictions":           s.Evictions.Load(),
+		"downloads":           s.Downloads.Load(),
+		"download_bytes":      s.DownloadBytes.Load(),
+		"download_retries":    s.DownloadRetries.Load(),
+		"download_errors":     s.DownloadErrors.Load(),
+		"prefetch_hits":       s.PrefetchHits.Load(),
+		"prefetch_misses":     s.PrefetchMisses.Load(),
+		"prefetch_cancelled":  s.PrefetchCancelled.Load(),
+		"prefetch_rebalanced": s.PrefetchRebalanced.Load(),
+		"prefetch_coalesced":  s.PrefetchCoalesced.Load(),
 	}
 }
 

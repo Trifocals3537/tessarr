@@ -56,7 +56,8 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
     "auto_repair": true,
     "skip_nzb_repair": false,
     "notify_on_complete": false,
-    "nntp_connection_percent": 20
+    "nntp_connection_percent": 20,
+    "stop_schedule": "06:00"
   }
 }
 ```
@@ -74,6 +75,32 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
 | `skip_nzb_repair`         | Skip NZB / Usenet entries during scheduled sweeps.                                      | `false` |
 | `notify_on_complete`      | Send a notification when a sweep finishes.                                               | `false`     |
 | `nntp_connection_percent` | Percentage of NNTP connections the probe is allowed to use. Avoids starving downloads.   | `20`        |
+| `stop_schedule`           | Optional cron expression, clock time, or interval. If a repair sweep is still running when this fires, it's stopped early. Leave empty to always run to completion. | — |
+
+### Stop schedule
+
+`stop_schedule` is useful when a repair sweep needs to finish (or get out of the way) before something else happens — for example, before your overnight maintenance window ends, or before peak-usage hours when probes would compete for bandwidth.
+
+- The repair sweep is cancelled at the next firing of `stop_schedule`, mid-probe if necessary. Entries not yet probed are left as they were before this repair sweep (their existing health and `next_check_due_at` are untouched, so they're picked up again on the next scheduled run).
+- The run is recorded as `completed` (not `cancelled`), with `cancel_reason` noting it was stopped by schedule.
+- What happens to entries this repair sweep *did* manage to probe and found broken is controlled by `auto_repair`, same as any other repair sweep:
+  - `auto_repair: true` repairs them via the normal Arr delete + re-search flow.
+  - `auto_repair: false` leaves them recorded as broken without triggering Arr repair.
+
+#### Multi-day coverage
+
+Each repair sweep probes due entries **oldest-checked-first** (never-checked entries first, then least-recently-checked, ...). Probing an entry updates its `last_checked_at` immediately, which moves it to the back of the queue for future repair sweeps.
+
+This means a repair sweep scheduled daily with a `stop_schedule` (e.g. `schedule: "0 0 * * *"`, `stop_schedule: "0 9 * * *"`) makes guaranteed forward progress across days, as long as `recheck_interval` is comfortably longer than the time it takes to cycle through the whole library:
+
+- Day 1, 00:00–09:00: probes the oldest N due entries (or however many fit in 9 hours), marking each one's `last_checked_at` as it finishes.
+- Day 1, 09:00: `stop_schedule` fires, the repair sweep stops. The remaining entries are untouched and stay oldest in the queue.
+- Day 2, 00:00: the next repair sweep's `due` set excludes everything probed on day 1 (their `last_checked_at` is now within `recheck_interval`), so it continues with the next-oldest N.
+- This repeats until the whole library has been probed within one `recheck_interval` window, then the cycle restarts from the oldest again.
+
+If a full repair sweep would take 2 days at 9 hours/day but `recheck_interval` is `168h` (1 week), this comfortably completes a full pass well before entries become due again. If `recheck_interval` is shorter than the time a full cycle actually takes, some entries may go stale before they're re-probed — increase `recheck_interval`, the daily window, or `workers` to compensate.
+
+
 
 ### Strategies
 
@@ -82,8 +109,44 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
 
 ### Sources
 
-- **`arr`** — walks Sonarr / Radarr media, resolves each item to an entry through the symlink target, and probes that entry. Broken files are enriched with Arr identifiers so repair can call `DeleteFiles` + `SearchMissing` directly.
+- **`arr`** — walks Sonarr / Radarr media, resolves each item to an entry through the symlink target, and probes that entry. Broken files are enriched with Arr identifiers for the durable recovery flow below.
 - **`managed`** — walks managed entries directly. Used when you don't have an Arr in front, or for entries imported outside the Arr flow. NZB-only managed brokens have no Arr re-acquire path; they stay `broken` with `failure_reason=usenet_segment_missing` for you to react to manually.
+
+### Optional NZB content verification
+
+The normal NZB probe checks whether sampled articles are available. For a
+manual, deeper check, call `POST /api/repair/run` with
+`"verify_content": true`. After the availability probe succeeds, Tessarr
+reads up to 512 logical bytes from the start of supported media files and
+checks for a recognized container signature.
+
+This mode is deliberately conservative:
+
+- It runs only when explicitly requested through the repair API. Imports,
+  scheduled sweeps, and single-entry UI rechecks remain availability-only.
+- Deep reads are serialized globally, use one NNTP connection, and disable
+  read-ahead so they do not fan out into streaming-sized work. The bounded
+  read normally fits within one article.
+- Strong head signatures are checked for common Matroska/WebM, ISO base media
+  (MP4/MOV), AVI/WAV, Ogg, FLV, ASF, MPEG, transport-stream, and audio
+  containers. Ambiguous, text-based, and tail-signature formats remain
+  availability-only instead of being rejected.
+- A recognized media container is accepted even if its filename extension is
+  mislabeled. Cancellation and transient read or decoder errors are
+  inconclusive; only a completed non-matching read is marked
+  `usenet_corrupt_content`.
+
+When `verify_content` is enabled and the request omits `protocol`, the run is
+narrowed to `nzb`. When it omits `auto_repair`, the run defaults to detect-only
+even if scheduled repair is configured to repair automatically. Set
+`ignore_last_checked: true` if you also want to recheck entries whose health is
+still fresh.
+
+:::caution
+Setting `auto_repair: true` explicitly allows the usual Arr delete and
+re-search flow for files this deeper check marks broken. Run detect-only first
+and review the results.
+:::
 
 ## Workflow
 
@@ -91,10 +154,61 @@ You can force a recheck on any one entry from the Browse UI or the API. This wor
 2. Candidates are selected per the rules above.
 3. For each candidate, the entry is marked `repairing` and probed by a worker.
 4. The entry's health is updated with the probe outcome (`healthy` / `broken` / `unknown`), broken files, fingerprint, and timestamps.
-5. If `auto_repair` is on and the entry has Arr-known broken files, they are batched per Arr and submitted via delete + search. After the repair attempt, only those entries are re-probed.
+5. If `auto_repair` is on and the entry has Arr-known broken files, repair saves a durable recovery record before deleting the exact Arr file and requesting its replacement. Later repair runs check whether Arr has imported a new file for the same movie or episodes.
 6. The run record's stats are updated live throughout, so the status panel reflects progress without needing to wait for completion.
 
 A failure to persist a single entry's health update is logged but never aborts the sweep.
+
+### Durable Arr recovery
+
+Recovery is backend-only and supports Sonarr and Radarr. It is inspired by
+upstream beta's exact-binding and mutation-intent approach, without replacing
+this fork's storage, mount, or UI.
+
+- Before any deletion, Tessarr saves the old Arr file ID, path, size, and
+  media identities to a synchronously flushed `repair_recoveries.db` store.
+  Sonarr multi-episode files retain **all** their episode IDs.
+- History blocklisting requires the **exact original download ID** and matching
+  media. A newer grab for the same movie or episode is never substituted.
+  Unavailable or incomplete history stops preflight before deletion. If exact
+  grab history is absent, repair uses an explicit, targeted search.
+- Automatic failed-download redownload settings, including interactive-search
+  settings, determine whether a separate search is necessary.
+- Each non-idempotent request has a saved intent. Transport failures, server
+  errors, redirects, and missing search receipts have an uncertain outcome.
+  Repair checks exact failed history or a matching command before proceeding;
+  it does not blindly resend those requests. Definitive rejections can be
+  retried on a later eligible run, no sooner than five minutes.
+- Pending work survives restarts, run-history pruning, health-state clearing,
+  and disappearance from Arr's library enumeration. Automatic replay runs only
+  during repair-enabled sweeps; detect-only sweeps send no recovery mutations.
+  Current Arr exclusions, protocol scope, and manually selected entry names
+  still apply. A changed Arr endpoint stops the old job.
+- Restart recovery can reconcile an already-deleted file. It cannot newly
+  delete an existing file solely on the basis of stale persisted health; a
+  fresh broken probe or an explicit **Fix Broken** action must authorize that.
+- An accepted search means **waiting for import**, not repaired. The run's
+  `repaired` counter increases only when Arr reports a different imported file
+  ID for the exact movie or every affected episode. This confirms an Arr import,
+  not playback or provider health.
+- Source entries are retained, even after import confirmation. Repair no longer
+  deletes a whole source entry merely because Arr accepted a replacement
+  request, and never performs a second local unlink after Arr deletes its file.
+
+The existing status API includes `recovery_counts` for `pending`,
+`waiting_for_import`, `needs_attention`, and `import_confirmed`. Run statistics
+also include `repair_pending`; a completed *run* can still have pending recovery.
+Errors are logged with an opaque recovery ID, Arr name, and phase, without URLs,
+API tokens, or response bodies.
+
+Uncertain requests remain `needs_attention` until their outcome can be
+reconciled or the replacement is imported. A request with no observed import
+after 24 hours also needs attention; it is not repeatedly searched. Check Arr's
+history and command results, resolve any rejection there, or search/import the
+specific media in Arr. The next eligible run recognizes the replacement.
+Disable repair or exclude that Arr to stop automatic recovery; clearing health
+badges or run history is not cancellation of unfinished recovery work.
+Completed receipts expire after 30 days; unfinished intent is never age-pruned.
 
 ## Stop and disable
 
@@ -113,7 +227,7 @@ A failure to persist a single entry's health update is logged but never aborts t
 | `GET`    | `/api/repair/config`                  | Read current config.                                                     |
 | `PUT`    | `/api/repair/config`                  | Update config (validates cron, workers, source).                         |
 | `GET`    | `/api/repair/status`                  | Active run summary, last completed run, and counts of entries by status. |
-| `POST`   | `/api/repair/run`                     | Trigger a sweep now. Body can include `ignore_last_checked`, `auto_repair`, `unrestrict_link`, and `protocol`. |
+| `POST`   | `/api/repair/run`                     | Trigger a sweep now. Body can include `ignore_last_checked`, `auto_repair`, `unrestrict_link`, `verify_content`, and `protocol`. |
 | `POST`   | `/api/repair/stop`                    | Cancel the active run.                                                   |
 | `GET`    | `/api/repair/runs`                    | Run history.                                                             |
 | `GET`    | `/api/repair/runs/{id}`               | Run detail.                                                              |
@@ -132,6 +246,16 @@ curl -X POST http://localhost:8282/api/repair/run \
   -H "Authorization: Bearer YOUR_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"protocol":"all","unrestrict_link":true}'
+```
+
+Run a deeper, detect-only NZB content check (including freshly checked
+entries):
+
+```bash
+curl -X POST http://localhost:8282/api/repair/run \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"verify_content":true,"ignore_last_checked":true,"auto_repair":false,"protocol":"nzb"}'
 ```
 
 Stop the active sweep:

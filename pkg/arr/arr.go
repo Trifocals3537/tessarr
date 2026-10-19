@@ -9,14 +9,16 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/request"
+	"github.com/Trifocals3537/tessarr/internal/utils"
 	json "github.com/bytedance/sonic"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/internal/request"
-	"github.com/sirrobot01/decypharr/internal/utils"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -35,10 +37,12 @@ var (
 	sharedClient *request.Client
 )
 
+const arrRequestTimeout = 2 * time.Minute
+
 func getSharedClient() *request.Client {
 	sharedOnce.Do(func() {
 		sharedClient = request.New(
-			request.WithTimeout(0),
+			request.WithTimeout(arrRequestTimeout),
 			request.WithMaxRetries(5),
 		)
 	})
@@ -60,9 +64,9 @@ type Arr struct {
 
 	Type             Type   `json:"type"`
 	SkipRepair       bool   `json:"skip_repair"`
-	DownloadUncached *bool  `json:"download_uncached"`
-	SelectedDebrid   string `json:"selected_debrid,omitempty"` // The debrid service selected for this arr
-	Source           Source `json:"source,omitempty"`          // The source of the arr, e.g. "auto", "manual". Auto means it was automatically detected from the arr
+	DownloadUncached *bool  `json:"download_uncached,omitempty"` // Tri-state: nil = inherit provider policy, true = allow uncached, false = cached-only
+	SelectedDebrid   string `json:"selected_debrid,omitempty"`   // The debrid service selected for this arr
+	Source           Source `json:"source,omitempty"`            // The source of the arr, e.g. "auto", "manual". Auto means it was automatically detected from the arr
 }
 
 func New(name, host, token string, skipRepair bool, downloadUncached *bool, selectedDebrid, source string) *Arr {
@@ -82,6 +86,10 @@ func New(name, host, token string, skipRepair bool, downloadUncached *bool, sele
 // cancels the in-flight HTTP call — this is what lets the repair pipeline
 // abort long Sonarr enumerations when a user presses Stop.
 func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload any, res any) (*http.Response, error) {
+	return a.requestCtx(ctx, getSharedClient(), method, endpoint, payload, res)
+}
+
+func (a *Arr) requestCtx(ctx context.Context, client *request.Client, method, endpoint string, payload any, res any) (*http.Response, error) {
 	if a.Token == "" || a.Host == "" {
 		return nil, fmt.Errorf("arr not configured")
 	}
@@ -110,23 +118,35 @@ func (a *Arr) RequestCtx(ctx context.Context, method, endpoint string, payload a
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", a.Token)
 
-	resp, err := getSharedClient().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 
-	// Parse success result if provided. Stream-decode directly from the
-	// response body so large payloads (e.g. full Sonarr series lists) don't
-	// sit on the heap as raw bytes alongside the decoded object graph.
-	if res != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		defer resp.Body.Close()
-		dec := json.ConfigDefault.NewDecoder(resp.Body)
-		if err := dec.Decode(res); err != nil && err != io.EOF {
-			return resp, fmt.Errorf("failed to decode response: %w", err)
+	// Decode successful responses without Sonic's per-read buffer growth or
+	// response-backed strings. RequestCtx owns the body when a decode target
+	// is provided; response-only callers receive ownership and must close it.
+	if res != nil {
+		defer closeArrResponse(resp)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if err := request.DecodeJSON(resp, res); err != nil && err != io.EOF {
+				return resp, fmt.Errorf("failed to decode response: %w", err)
+			}
 		}
 	}
 
 	return resp, nil
+}
+
+// closeArrResponse releases response-only Arr command connection slots. It
+// reads only a bounded prefix so callers do not retain large API payloads just
+// to make pooled connections reusable.
+func closeArrResponse(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.CopyN(io.Discard, resp.Body, 64<<10)
 }
 
 // Request is the no-context shim for legacy callers. Prefer RequestCtx for
@@ -147,9 +167,7 @@ func (a *Arr) Validate() error {
 	if err != nil {
 		return err
 	}
-	if resp.Body != nil {
-		defer resp.Body.Close()
-	}
+	defer closeArrResponse(resp)
 	// If response is not 200 or 404(this is the case for Lidarr, etc), return an error
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
 		return fmt.Errorf("failed to validate arr %s: %s", a.Name, resp.Status)
@@ -295,22 +313,25 @@ func (s *Storage) SyncFromConfig(arrs []config.Arr) {
 	s.arrs = newMaps
 }
 
-func (s *Storage) Monitor() {
-	wg := sync.WaitGroup{}
-	wg.Add(s.arrs.Size())
+func (s *Storage) Monitor(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	var group errgroup.Group
 	s.arrs.Range(func(name string, arr *Arr) bool {
-		_, _, _ = s.sg.Do(fmt.Sprintf("cleanup_%s", arr.Name), func() (any, error) {
-			go func() {
-				defer wg.Done()
-				if err := arr.CleanupQueue(); err != nil {
-					s.logger.Error().Err(err).Msgf("Failed to cleanup arr %s", arr.Name)
-				}
-			}()
-			return nil, nil
+		if ctx.Err() != nil {
+			return false
+		}
+		group.Go(func() error {
+			_, err, _ := s.sg.Do(fmt.Sprintf("cleanup_%s", name), func() (any, error) {
+				return nil, arr.CleanupQueueCtx(ctx)
+			})
+			return err
 		})
 		return true
 	})
-	wg.Wait()
+	return group.Wait()
 }
 
 func (a *Arr) Refresh() error {
@@ -324,9 +345,7 @@ func (a *Arr) Refresh() error {
 	if err != nil {
 		return err
 	}
-	if resp.Body != nil {
-		defer resp.Body.Close()
-	}
+	defer closeArrResponse(resp)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("failed to refresh monitored downloads: %s", resp.Status)
 	}

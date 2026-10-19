@@ -51,7 +51,7 @@ func (r Rclone) IsZero() bool {
 type DFS struct {
 	// Core settings
 	CacheExpiry          string `json:"cache_expiry,omitempty"`           // 1h, 30m etc
-	CacheDir             string `json:"cache_dir,omitempty"`              // /tmp/decypharr-cache
+	CacheDir             string `json:"cache_dir,omitempty"`              // /tmp/tessarr-cache
 	DiskCacheSize        string `json:"disk_cache_size,omitempty"`        // 10GB, 50GB etc
 	CacheCleanupInterval string `json:"cache_cleanup_interval,omitempty"` // 10m, 1h etc
 

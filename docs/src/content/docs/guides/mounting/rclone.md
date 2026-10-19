@@ -3,7 +3,7 @@ title: Rclone Mounting
 description: Using embedded Rclone for mounting.
 ---
 
-Decypharr includes an embedded Rclone instance with full VFS support.
+Tessarr includes an embedded Rclone instance with full VFS support.
 
 ## Configuration
 
@@ -11,7 +11,7 @@ Decypharr includes an embedded Rclone instance with full VFS support.
 {
   "mount": {
     "type": "rclone",
-    "mount_path": "/mnt/decypharr",
+    "mount_path": "/mnt/tessarr",
     "rclone": {
       "cache_dir": "/cache/rclone",
       "vfs_cache_mode": "writes",

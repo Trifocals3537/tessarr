@@ -1,14 +1,21 @@
 {{ define "setup" }}
 <div class="flex min-h-screen items-center justify-center bg-base-200 p-4">
-    <div class="card w-full max-w-4xl bg-base-100 shadow-xl">
-        <div class="card-body">
+    <div class="card tessarr-card tessarr-setup-card overflow-hidden bg-base-100">
+        <div class="card-body min-w-0">
             <div class="flex justify-between items-center mb-4">
-                <h2 class="card-title">Setup Wizard</h2>
+				<div class="flex items-center gap-3">
+					<img src="{{.URLBase}}images/logo.png" alt="Tessarr" class="h-12 w-12">
+					<div>
+						<p class="tessarr-kicker">Welcome</p>
+						<h2 class="card-title text-2xl">Tessarr Setup</h2>
+						<p class="text-sm opacity-70">Many sources. One library.</p>
+					</div>
+				</div>
             </div>
 
             <!-- Progress indicator -->
-            <div class="mb-8">
-                <ul class="steps w-full">
+            <div class="mb-8 w-full min-w-0 max-w-full overflow-x-auto pb-2">
+                <ul class="steps min-w-[44rem] w-full">
                     <li class="step" data-step="1" id="step-indicator-1">Authentication</li>
                     <li class="step" data-step="2" id="step-indicator-2">Debrid Account</li>
                     <li class="step" data-step="3" id="step-indicator-3">Usenet Provider</li>
@@ -235,7 +242,7 @@
                             <label class="label cursor-pointer gap-2">
                                 <input type="radio" name="mount_type" value="dfs" class="radio" id="mount-type-dfs"
                                        checked>
-                                <span class="label-text">DFS (Decypharr File System)</span>
+                                <span class="label-text">DFS (Tessarr File System)</span>
                             </label>
                             <label class="label cursor-pointer gap-2">
                                 <input type="radio" name="mount_type" value="rclone" class="radio"
@@ -259,7 +266,7 @@
                             <span>Mount Path</span>
                         </label>
                         <input type="text" class="input input-bordered w-full" id="mount-path" name="mount_path"
-                               placeholder="/mnt/decypharr" required>
+                               placeholder="/mnt/tessarr" required>
                         <label class="label">
                             <span class="label-text-alt">Path where the filesystem will be mounted</span>
                         </label>
@@ -270,7 +277,7 @@
                             <span>Cache Directory</span>
                         </label>
                         <input type="text" class="input input-bordered w-full" id="cache-dir" name="cache_dir"
-                               placeholder="/tmp/decypharr-cache" required>
+                               placeholder="/tmp/tessarr-cache" required>
                         <label class="label">
                             <span class="label-text-alt">Directory for caching file chunks</span>
                         </label>

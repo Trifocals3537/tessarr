@@ -166,9 +166,10 @@
                             <div class="stat-figure text-info">
                                 <i class="bi bi-memory text-2xl"></i>
                             </div>
-                            <div class="stat-title">Memory Used</div>
+                            <div class="stat-title" id="memory-label">Memory Used</div>
                             <div class="stat-value text-info" id="memory-used">-</div>
                             <div class="stat-desc" id="heap-alloc">Heap: -</div>
+                            <div class="stat-desc" id="runtime-memory">Go runtime: -</div>
                         </div>
                         <div class="stat">
                             <div class="stat-figure text-success">
@@ -538,7 +539,7 @@
                 ? `${formatNumber(circuitBreakers)} ${circuitBreakers === 1 ? 'file' : 'files'} temporarily paused`
                 : 'Cache reads normal';
             const cacheHealthTitle = circuitBreakers > 0
-                ? 'Decypharr paused cache reads for these files after repeated provider errors. It will retry automatically.'
+                ? 'Tessarr paused cache reads for these files after repeated provider errors. It will retry automatically.'
                 : 'Cache reads are operating normally.';
             const cacheHealthIcon = circuitBreakers > 0 ? 'bi-shield-exclamation' : 'bi-shield-check';
 
@@ -558,8 +559,8 @@
                             <i class="bi bi-speedometer2 text-2xl"></i>
                         </div>
                         <div class="stat-title">Download Speed</div>
-                        <div class="stat-value text-info">${window.decypharrUtils.formatBytes(downloadSpeed)}/s</div>
-                        <div class="stat-desc">Total: ${window.decypharrUtils.formatBytes(totalDownloaded)}</div>
+                        <div class="stat-value text-info">${window.tessarrUtils.formatBytes(downloadSpeed)}/s</div>
+                        <div class="stat-desc">Total: ${window.tessarrUtils.formatBytes(totalDownloaded)}</div>
                     </div>
                     <div class="stat">
                         <div class="stat-figure ${hitRateClass}">
@@ -611,8 +612,8 @@
                             <i class="bi bi-hdd text-2xl"></i>
                         </div>
                         <div class="stat-title">Disk Used</div>
-                        <div class="stat-value mount-stat-value-compact ${cacheUsageTextClass}">${window.decypharrUtils.formatBytes(cacheTotalSize)}</div>
-                        <div class="stat-desc">${cacheUtilizationPercent}% of ${window.decypharrUtils.formatBytes(cacheMaxSize)}</div>
+                        <div class="stat-value mount-stat-value-compact ${cacheUsageTextClass}">${window.tessarrUtils.formatBytes(cacheTotalSize)}</div>
+                        <div class="stat-desc">${cacheUtilizationPercent}% of ${window.tessarrUtils.formatBytes(cacheMaxSize)}</div>
                     </div>
                     <div class="stat">
                         <div class="stat-figure text-accent">
@@ -628,7 +629,7 @@
                         </div>
                         <div class="stat-title">Cache Health</div>
                         <div class="stat-value mount-stat-value-compact ${cacheHealthClass}">${cacheHealthLabel}</div>
-                        <div class="stat-desc ${cacheHealthClass}" title="${window.decypharrUtils.escapeHtml(cacheHealthTitle)}">${cacheHealthDesc}</div>
+                        <div class="stat-desc ${cacheHealthClass}" title="${window.tessarrUtils.escapeHtml(cacheHealthTitle)}">${cacheHealthDesc}</div>
                     </div>
             `;
 
@@ -649,7 +650,7 @@
 
         async function runDFSCacheCleanup(button) {
             try {
-                const response = await window.decypharrUtils.fetcher('/api/mount/cache/cleanup', {
+                const response = await window.tessarrUtils.fetcher('/api/mount/cache/cleanup', {
                     method: 'POST',
                     loadingButton: button,
                 });
@@ -667,12 +668,12 @@
                 const toastType = warnings > 0 ? 'warning' : 'success';
                 const toastMessage = warnings > 0
                     ? `Cache cleanup completed with ${warnings} warning(s).`
-                    : `Cache cleanup completed. Freed ${window.decypharrUtils.formatBytes(freedBytes)} and evicted ${formatNumber(removedItems)} file(s).`;
+                    : `Cache cleanup completed. Freed ${window.tessarrUtils.formatBytes(freedBytes)} and evicted ${formatNumber(removedItems)} file(s).`;
 
-                window.decypharrUtils.createToast(toastMessage, toastType);
+                window.tessarrUtils.createToast(toastMessage, toastType);
                 loadStats();
             } catch (error) {
-                window.decypharrUtils.createToast(`Cache cleanup failed: ${error.message}`, 'error');
+                window.tessarrUtils.createToast(`Cache cleanup failed: ${error.message}`, 'error');
             }
         }
 
@@ -693,9 +694,9 @@
                 filesEl.textContent = formatNumber(cacheItems);
             }
             if (diskUsedEl) {
-                const sizeText = window.decypharrUtils.formatBytes(cacheSize);
+                const sizeText = window.tessarrUtils.formatBytes(cacheSize);
                 diskUsedEl.textContent = cacheMax > 0
-                    ? `${sizeText} / ${window.decypharrUtils.formatBytes(cacheMax)}`
+                    ? `${sizeText} / ${window.tessarrUtils.formatBytes(cacheMax)}`
                     : `${sizeText} / unlimited`;
             }
 
@@ -739,7 +740,7 @@
             }
 
             try {
-                const response = await window.decypharrUtils.fetcher('/api/mount/cache/purge', {
+                const response = await window.tessarrUtils.fetcher('/api/mount/cache/purge', {
                     method: 'POST',
                     loadingButton: button,
                 });
@@ -759,12 +760,12 @@
                 const skippedText = skippedBusyItems > 0 ? ` Skipped ${formatNumber(skippedBusyItems)} active item(s).` : '';
                 const toastMessage = warnings > 0
                     ? `Cache purge completed with ${warnings} warning(s).${skippedText}`
-                    : `Cache purge completed. Freed ${window.decypharrUtils.formatBytes(freedBytes)} and removed ${formatNumber(removedItems)} file(s).${skippedText}`;
+                    : `Cache purge completed. Freed ${window.tessarrUtils.formatBytes(freedBytes)} and removed ${formatNumber(removedItems)} file(s).${skippedText}`;
 
-                window.decypharrUtils.createToast(toastMessage, toastType);
+                window.tessarrUtils.createToast(toastMessage, toastType);
                 loadStats();
             } catch (error) {
-                window.decypharrUtils.createToast(`Cache purge failed: ${error.message}`, 'error');
+                window.tessarrUtils.createToast(`Cache purge failed: ${error.message}`, 'error');
             }
         }
 
@@ -788,8 +789,8 @@
                 html += `
                     <div class="stat">
                         <div class="stat-title">Transferred</div>
-                        <div class="stat-value text-primary">${window.decypharrUtils.formatBytes(cs.bytes || 0)}</div>
-                        <div class="stat-desc">Speed: ${window.decypharrUtils.formatBytes(cs.speed || 0)}/s</div>
+                        <div class="stat-value text-primary">${window.tessarrUtils.formatBytes(cs.bytes || 0)}</div>
+                        <div class="stat-desc">Speed: ${window.tessarrUtils.formatBytes(cs.speed || 0)}/s</div>
                     </div>
                     <div class="stat">
                         <div class="stat-title">Transfers</div>
@@ -803,8 +804,8 @@
                     </div>
                     <div class="stat">
                         <div class="stat-title">Uptime</div>
-                        <div class="stat-value text-accent">${window.decypharrUtils.formatDuration(cs.elapsedTime)}</div>
-                        <div class="stat-desc">Transfer: ${window.decypharrUtils.formatDuration(cs.transferTime)}</div>
+                        <div class="stat-value text-accent">${window.tessarrUtils.formatDuration(cs.elapsedTime)}</div>
+                        <div class="stat-desc">Transfer: ${window.tessarrUtils.formatDuration(cs.transferTime)}</div>
                     </div>
                 `;
             }
@@ -814,8 +815,8 @@
                 html += `
                     <div class="stat">
                         <div class="stat-title">Rclone Memory</div>
-                        <div class="stat-value text-accent">${window.decypharrUtils.formatBytes(ms.Sys || 0)}</div>
-                        <div class="stat-desc">Heap: ${window.decypharrUtils.formatBytes(ms.TotalAlloc || 0)}</div>
+                        <div class="stat-value text-accent">${window.tessarrUtils.formatBytes(ms.Sys || 0)}</div>
+                        <div class="stat-desc">Heap: ${window.tessarrUtils.formatBytes(ms.TotalAlloc || 0)}</div>
                     </div>
                 `;
             }
@@ -840,15 +841,15 @@
                             <div class="card-body">
                                 <div class="flex justify-between items-start mb-2">
                                     <h4 class="font-medium text-sm truncate flex-1 mr-2">${transfer.name || 'Unknown'}</h4>
-                                    <span class="text-xs text-base-content/70">${window.decypharrUtils.formatBytes(transfer.speed || 0)}/s</span>
+                                    <span class="text-xs text-base-content/70">${window.tessarrUtils.formatBytes(transfer.speed || 0)}/s</span>
                                 </div>
                                 <div class="flex items-center gap-2">
                                     <progress class="progress progress-primary flex-1" value="${progress}" max="100"></progress>
                                     <span class="text-xs font-mono">${progress.toFixed(1)}%</span>
                                 </div>
                                 <div class="flex justify-between text-xs text-base-content/60 mt-1">
-                                    <span>${window.decypharrUtils.formatBytes(transfer.bytes || 0)} / ${window.decypharrUtils.formatBytes(transfer.size || 0)}</span>
-                                    <span>ETA: ${transfer.eta ? window.decypharrUtils.formatDuration(transfer.eta) : 'Unknown'}</span>
+                                    <span>${window.tessarrUtils.formatBytes(transfer.bytes || 0)} / ${window.tessarrUtils.formatBytes(transfer.size || 0)}</span>
+                                    <span>ETA: ${transfer.eta ? window.tessarrUtils.formatDuration(transfer.eta) : 'Unknown'}</span>
                                 </div>
                             </div>
                         </div>
@@ -872,11 +873,11 @@
                 html += `
                     <div class="stat bg-base-200 rounded-lg p-3">
                         <div class="stat-title text-xs">Bytes Per Seconds</div>
-                        <div class="stat-value text-sm">${window.decypharrUtils.formatBytes(rclone.bandwidth.bytesPerSecond)}</div>
+                        <div class="stat-value text-sm">${window.tessarrUtils.formatBytes(rclone.bandwidth.bytesPerSecond)}</div>
                     </div>
                     <div class="stat bg-base-200 rounded-lg p-3">
                         <div class="stat-title text-xs">Rate</div>
-                        <div class="stat-value text-sm">${window.decypharrUtils.formatBytes(rclone.bandwidth.rate)}</div>
+                        <div class="stat-value text-sm">${window.tessarrUtils.formatBytes(rclone.bandwidth.rate)}</div>
                     </div>
                 `;
 
@@ -941,7 +942,7 @@
                                     <p class="text-xs text-base-content/70 truncate" title="${stream.file_name}">${stream.file_name}</p>
                                 </div>
                                 <div class="text-right flex-shrink-0 ml-2">
-                                    <div class="text-sm font-mono">${window.decypharrUtils.formatBytes(stream.file_size)}</div>
+                                    <div class="text-sm font-mono">${window.tessarrUtils.formatBytes(stream.file_size)}</div>
                                     <div class="text-xs text-base-content/60">${formatUptime(duration)}</div>
                                 </div>
                             </div>
@@ -1069,7 +1070,7 @@
                                                 <p class="text-xs text-base-content/70">${account.username || '-'}</p>
                                             </div>
                                             <div class="text-right flex-shrink-0 ml-2">
-                                                <div class="text-xs text-base-content/60">Daily Usage: ${window.decypharrUtils.formatBytes(account.traffic_used || 0)}</div>
+                                                <div class="text-xs text-base-content/60">Daily Usage: ${window.tessarrUtils.formatBytes(account.traffic_used || 0)}</div>
                                                 <div class="text-xs text-base-content/60">Expires: ${account.expiration ? new Date(account.expiration).toLocaleDateString() : 'Unknown'}</div>
                                             </div>
 
@@ -1092,6 +1093,7 @@
             // Render usenet provider
             if (hasUsenet) {
                 const pool = usenetData.pool || {};
+                const buffers = usenetData.buffers || {};
                 const nntpProviders = usenetData.providers || [];
 
                 const maxConns = pool.max_connections || 0;
@@ -1118,6 +1120,8 @@
                                     <div class="text-sm text-base-content/70">${formatNumber(totalCreated)} / ${formatNumber(maxConns)} connections</div>
                                 </div>
                             </div>
+
+                            <p class="mt-3 text-sm text-base-content/70">Stream buffer allocations: ${window.tessarrUtils.formatBytes(buffers.memory_allocated || 0)} · In use: ${window.tessarrUtils.formatBytes(buffers.memory_in_use || 0)}</p>
 
                             <!-- Connection Pool Bar -->
                             <div class="mt-4">
@@ -1231,8 +1235,10 @@
             const sys = stats.system || {};
             document.getElementById('uptime').textContent = formatUptime(sys.uptime_seconds);
             document.getElementById('start-time').textContent = `Started: ${sys.start_time || '-'}`;
-            document.getElementById('memory-used').textContent = sys.memory_used || '-';
+            document.getElementById('memory-label').textContent = sys.process_rss_mb ? 'Process Memory (RSS)' : 'Go Runtime Memory';
+            document.getElementById('memory-used').textContent = sys.process_rss_mb || sys.memory_used || '-';
             document.getElementById('heap-alloc').textContent = `Heap: ${sys.heap_alloc_mb || '-'} · Released: ${sys.heap_released_mb || '-'}`;
+            document.getElementById('runtime-memory').textContent = `Go runtime: ${sys.memory_used || '-'}`;
             document.getElementById('goroutines').textContent = formatNumber(sys.goroutines || 0);
             document.getElementById('gc-cycles').textContent = `GC: ${formatNumber(sys.gc_cycles || 0)} cycles`;
             document.getElementById('num-cpu').textContent = sys.num_cpu || '-';
@@ -1242,7 +1248,7 @@
 
             // Storage stats
             if (stats.storage) {
-                document.getElementById('db-size').textContent = window.decypharrUtils.formatBytes(stats.storage.db_size || 0);
+                document.getElementById('db-size').textContent = window.tessarrUtils.formatBytes(stats.storage.db_size || 0);
                 document.getElementById('total-entries').textContent = formatNumber(stats.storage.total_entries || 0);
             }
 

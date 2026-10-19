@@ -52,13 +52,12 @@ func (r *rangeSet) insert(off, length int64) (added int64) {
 		return 0
 	}
 	end := off + length
-	added = length - r.coverage(off, end)
 	// Binary search for the first extent that ends >= off (i.e., could
 	// overlap or be adjacent to the new range).
 	i := sort.Search(len(r.rs), func(i int) bool { return r.rs[i].end >= off })
 	if i == len(r.rs) {
 		r.rs = append(r.rs, extent{off, end})
-		return
+		return length
 	}
 	// If the new range ends before the next extent starts, there is a real
 	// gap and the range must be inserted before it. Adjacent ranges merge.
@@ -67,23 +66,29 @@ func (r *rangeSet) insert(off, length int64) (added int64) {
 		r.rs = append(r.rs, extent{})
 		copy(r.rs[i+1:], r.rs[i:])
 		r.rs[i] = extent{off, end}
-		return
+		return length
 	}
-	// Overlap or adjacency: expand r.rs[i] to cover the new range.
-	if off < r.rs[i].off {
-		r.rs[i].off = off
-	}
-	if end > r.rs[i].end {
-		r.rs[i].end = end
-	}
-	// Merge any subsequent ranges now covered by the expanded r.rs[i].
-	j := i + 1
-	for j < len(r.rs) && r.rs[j].off <= r.rs[i].end {
-		if r.rs[j].end > r.rs[i].end {
-			r.rs[i].end = r.rs[j].end
+
+	// Overlap or adjacency. Compute newly-covered bytes while merging so the
+	// insert path only searches the range set once.
+	added = length
+	mergedOff := min(off, r.rs[i].off)
+	mergedEnd := end
+	j := i
+	for j < len(r.rs) && r.rs[j].off <= mergedEnd {
+		ext := r.rs[j]
+		overlapLo := max(off, ext.off)
+		overlapHi := min(end, ext.end)
+		if overlapHi > overlapLo {
+			added -= overlapHi - overlapLo
+		}
+		if ext.end > mergedEnd {
+			mergedEnd = ext.end
 		}
 		j++
 	}
+
+	r.rs[i] = extent{off: mergedOff, end: mergedEnd}
 	if j > i+1 {
 		copy(r.rs[i+1:], r.rs[j:])
 		r.rs = r.rs[:len(r.rs)-(j-i-1)]

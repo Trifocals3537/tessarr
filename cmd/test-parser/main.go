@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/nntp"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/parser"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/nntp"
-	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
 
 func main() {
@@ -52,7 +52,10 @@ func main() {
 		Msg("NZB file read successfully")
 
 	// Create NNTP client (10 max connections for test)
-	config.SetConfigPath("data/")
+	if err := config.SetConfigPath("data/"); err != nil {
+		fmt.Fprintln(os.Stderr, "invalid parser data path")
+		os.Exit(1)
+	}
 	cfg := config.Get()
 	nntpClient, err := nntp.NewClient(cfg)
 	if err != nil {

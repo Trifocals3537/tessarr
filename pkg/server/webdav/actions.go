@@ -1,16 +1,14 @@
 package webdav
 
 import (
-	"errors"
 	"fmt"
 	"mime"
 	"net/http"
 	"path"
 	"path/filepath"
 
-	"github.com/sirrobot01/decypharr/internal/customerror"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/manager"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/manager"
 )
 
 func (h *Handler) handlePropfind(current *manager.FileInfo, children []manager.FileInfo, w http.ResponseWriter, r *http.Request) {
@@ -100,26 +98,9 @@ func (h *Handler) handleDownload(info *manager.FileInfo, w http.ResponseWriter, 
 	}
 
 	if err := h.StreamResponse(entry, info, w, r); err != nil {
-		// Use the file path as key for rate limiting - same file error logged once per 30s
+		// Use the file path as key for rate limiting.
 		logKey := fmt.Sprintf("%s/%s", info.Parent(), info.Name())
-
-		var streamErr *customerror.Error
-		if errors.As(err, &streamErr) {
-			if !streamErr.HeadersWritten {
-				http.Error(w, streamErr.Error(), http.StatusInternalServerError)
-			}
-			if !streamErr.IsSilent() {
-				h.logger.Rate(logKey).Error().Err(err).Msgf("Error streaming file: %s", logKey)
-			}
-			return
-		}
-
-		// Generic error - only write if we haven't started the response
-		if !customerror.IsSilentError(err) {
-			h.logger.Rate(logKey).Error().Err(err).Msgf("Error streaming file: %s", logKey)
-		}
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
+		h.writeStreamError(logKey, err, w)
 	}
 
 }

@@ -1,14 +1,19 @@
 package types
 
 import (
+	"errors"
 	"maps"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/arr"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/arr"
 )
+
+// ErrTerminalProviderTorrent identifies an explicit provider-reported transfer
+// failure. Transport/API errors and unknown states must not trigger Arr handoff.
+var ErrTerminalProviderTorrent = errors.New("terminal provider torrent failure")
 
 type Torrent struct {
 	Id               string          `json:"id"`
@@ -21,6 +26,7 @@ type Torrent struct {
 	Magnet           *utils.Magnet   `json:"magnet"`
 	Files            map[string]File `json:"files"`
 	Status           TorrentStatus   `json:"status"`
+	ProviderState    string          `json:"-"` // Raw provider state, for conservative failure and stall decisions.
 	Added            time.Time       `json:"added"`
 	Progress         float64         `json:"progress"`
 	Speed            int64           `json:"speed"`
@@ -63,6 +69,7 @@ func (t *Torrent) Copy() *Torrent {
 		Magnet:           t.Magnet,
 		Files:            newFiles,
 		Status:           t.Status,
+		ProviderState:    t.ProviderState,
 		Added:            t.Added,
 		Progress:         t.Progress,
 		Speed:            t.Speed,
@@ -96,6 +103,7 @@ type File struct {
 	TorrentId    string       `json:"torrent_id"`
 	Id           string       `json:"id"`
 	Name         string       `json:"name"`
+	OutputPath   string       `json:"output_path,omitempty"`
 	Size         int64        `json:"size"`
 	IsRar        bool         `json:"is_rar"`
 	ByteRange    *[2]int64    `json:"byte_range,omitempty"`
@@ -105,6 +113,16 @@ type File struct {
 	Generated    time.Time    `json:"generated"`
 	Deleted      bool         `json:"deleted"`
 	DownloadLink DownloadLink `json:"-"`
+}
+
+// LocalPath returns the validated path Tessarr should expose in its managed
+// output tree. Provider paths remain untouched for link resolution. Legacy
+// records created before OutputPath was introduced retain their old layout.
+func (f File) LocalPath() string {
+	if f.OutputPath != "" {
+		return f.OutputPath
+	}
+	return f.Path
 }
 
 func (t *Torrent) Cleanup(remove bool) {
@@ -157,6 +175,32 @@ type DownloadLink struct {
 	Size         int64     `json:"size"`
 	Id           string    `json:"id"`
 	ExpiresAt    time.Time
+
+	// RecoveryProbeID ties a generated or cached URL to the one account
+	// recovery probe that acquired it. It is deliberately process-local and
+	// must never be serialized or exposed through the API.
+	RecoveryProbeID uint64 `json:"-"`
+}
+
+const maxDownloadLinkRefreshSkew = time.Minute
+
+// NeedsRefresh reports whether a cached download link is expired or close
+// enough to expiry that starting a new stream with it would be risky. The
+// skew is capped at ten percent of a known lifetime so short-lived links do
+// not become immediately unusable.
+func (dl *DownloadLink) NeedsRefresh(now time.Time) bool {
+	if dl == nil || dl.ExpiresAt.IsZero() {
+		return false
+	}
+
+	skew := maxDownloadLinkRefreshSkew
+	if !dl.Generated.IsZero() && dl.ExpiresAt.After(dl.Generated) {
+		if lifetimeSkew := dl.ExpiresAt.Sub(dl.Generated) / 10; lifetimeSkew < skew {
+			skew = lifetimeSkew
+		}
+	}
+
+	return !now.Add(skew).Before(dl.ExpiresAt)
 }
 
 func (dl *DownloadLink) Valid() error {

@@ -3,6 +3,8 @@ package yenc
 import (
 	"bufio"
 	"bytes"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"strconv"
@@ -11,16 +13,17 @@ import (
 
 // Metadata contains yEnc header information and snippet bytes.
 type Metadata struct {
-	Name     string // filename
-	Size     int64  // total file size
-	Part     int64  // part number
-	Total    int64  // total parts
-	Begin    int64  // part start byte
-	End      int64  // part end byte
-	Offset   int64  // part offset within the file
-	PartSize int64  // part size (decoded)
-	LineSize int    // line length
-	Snippet  []byte
+	Name        string // filename
+	Size        int64  // total file size
+	Part        int64  // part number
+	Total       int64  // total parts
+	Begin       int64  // part start byte
+	End         int64  // part end byte
+	Offset      int64  // part offset within the file
+	PartSize    int64  // part size (decoded)
+	DecodedSize int64  // Actual decoded body length, set only after a complete body read.
+	LineSize    int    // line length
+	Snippet     []byte
 }
 
 // UsePureGo forces the pure-Go yEnc decoder even when CGO/rapidyenc is available.
@@ -32,6 +35,18 @@ var UsePureGo = os.Getenv("YENC_PURE_GO") == "true"
 type Decoder struct {
 	io.Reader
 	Meta DecoderMeta
+}
+
+// AcquireNNTPDecoder consumes one dot-terminated article from the connection's
+// shared reader. Standalone yEnc input should use AcquireDecoder instead.
+func AcquireNNTPDecoder(r *bufio.Reader) *Decoder {
+	dec := AcquireDecoder(r)
+	if pure, ok := dec.Reader.(*pureGoYencDecoder); ok {
+		// Do not hide read-ahead for the next response in a private buffer.
+		pure.r = r
+		pure.nntp = true
+	}
+	return dec
 }
 
 // DecoderMeta holds yEnc header metadata, matching the fields from rapidyenc.Meta.
@@ -57,13 +72,18 @@ func (m DecoderMeta) End() int64 {
 // pureGoYencDecoder is a streaming yEnc decoder implemented in pure Go.
 // It consumes yEnc control lines and decodes payload bytes incrementally.
 type pureGoYencDecoder struct {
-	r        *bufio.Reader
-	meta     *DecoderMeta
-	out      []byte
-	outPos   int
-	scratch  []byte // reused buffer for lines longer than the bufio buffer (rare)
-	sawBegin bool
-	done     bool
+	r            *bufio.Reader
+	meta         *DecoderMeta
+	out          []byte
+	outPos       int
+	scratch      []byte // reused buffer for lines longer than the bufio buffer (rare)
+	sawBegin     bool
+	sawEnd       bool
+	nntp         bool
+	done         bool
+	readErr      error
+	decodedBytes int64
+	checksum     uint32
 }
 
 func newPureGoYencDecoder(r io.Reader, meta *DecoderMeta) *pureGoYencDecoder {
@@ -77,6 +97,9 @@ func newPureGoYencDecoder(r io.Reader, meta *DecoderMeta) *pureGoYencDecoder {
 func (d *pureGoYencDecoder) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
+	}
+	if d.readErr != nil {
+		return 0, d.readErr
 	}
 
 	n := 0
@@ -107,6 +130,10 @@ func (d *pureGoYencDecoder) Read(p []byte) (int, error) {
 					return n, nil
 				}
 				return 0, io.EOF
+			}
+			if d.nntp {
+				// A later drain must not read beyond a malformed response.
+				d.readErr = err
 			}
 			if n > 0 {
 				return n, err
@@ -147,6 +174,9 @@ func (d *pureGoYencDecoder) fill() error {
 		if err != nil && err != io.EOF {
 			return err
 		}
+		if d.nntp && err == io.EOF {
+			return io.ErrUnexpectedEOF
+		}
 
 		if len(line) > 0 {
 			done, lineErr := d.processLine(line)
@@ -176,11 +206,17 @@ func (d *pureGoYencDecoder) processLine(line []byte) (bool, error) {
 	// Handle raw NNTP article termination / dot-stuffing when present.
 	if line[0] == '.' {
 		if len(line) == 1 {
+			if d.nntp && !d.sawEnd {
+				return false, io.ErrUnexpectedEOF
+			}
 			return true, nil
 		}
 		if line[1] == '.' {
 			line = line[1:]
 		}
+	}
+	if d.sawEnd {
+		return false, nil
 	}
 
 	switch {
@@ -192,8 +228,29 @@ func (d *pureGoYencDecoder) processLine(line []byte) (bool, error) {
 		parseYPartLine(line, d.meta)
 		return false, nil
 	case bytes.HasPrefix(line, []byte("=yend ")):
-		parseYEndLine(line, d.meta)
-		return true, nil
+		expected := d.meta.PartSize
+		footerSize, err := parseYEndSize(line)
+		if err != nil {
+			return false, err
+		}
+		if footerSize != d.decodedBytes || (expected > 0 && expected != d.decodedBytes) {
+			return false, fmt.Errorf("yEnc decoded size does not match header/footer")
+		}
+		d.meta.PartSize = footerSize
+		for field := range strings.FieldsSeq(string(line)) {
+			key, value, ok := strings.Cut(field, "=")
+			if !ok || (key != "pcrc32" && (key != "crc32" || d.meta.PartNumber > 0)) {
+				continue
+			}
+			want, err := strconv.ParseUint(value, 16, 32)
+			if err != nil || uint32(want) != d.checksum {
+				return false, fmt.Errorf("yEnc CRC32 mismatch")
+			}
+		}
+		d.sawEnd = true
+		// yEnc ends before the NNTP response does. Drain any epilogue and the
+		// terminator before allowing this connection to return to its pool.
+		return !d.nntp, nil
 	}
 
 	if !d.sawBegin {
@@ -215,6 +272,11 @@ func (d *pureGoYencDecoder) processLine(line []byte) (bool, error) {
 		}
 		d.out = append(d.out, b-42)
 	}
+	if escaped {
+		return false, fmt.Errorf("truncated yEnc escape")
+	}
+	d.decodedBytes += int64(len(d.out))
+	d.checksum = crc32.Update(d.checksum, crc32.IEEETable, d.out)
 
 	return false, nil
 }
@@ -287,10 +349,11 @@ func parseYPartLine(line []byte, meta *DecoderMeta) {
 	}
 }
 
-func parseYEndLine(line []byte, meta *DecoderMeta) {
+func parseYEndSize(line []byte) (int64, error) {
 	s := strings.TrimSpace(string(line))
 	rest := strings.TrimSpace(strings.TrimPrefix(s, "=yend "))
-
+	var size int64
+	found := false
 	for field := range strings.FieldsSeq(rest) {
 		k, v, ok := strings.Cut(field, "=")
 		if !ok {
@@ -299,10 +362,19 @@ func parseYEndLine(line []byte, meta *DecoderMeta) {
 		if k != "size" {
 			continue
 		}
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			meta.PartSize = n
+		if found {
+			return 0, fmt.Errorf("duplicate yEnc footer size")
 		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("invalid yEnc footer size")
+		}
+		size, found = n, true
 	}
+	if !found {
+		return 0, fmt.Errorf("missing yEnc footer size")
+	}
+	return size, nil
 }
 
 func acquirePureGoDecoder(r io.Reader) *Decoder {

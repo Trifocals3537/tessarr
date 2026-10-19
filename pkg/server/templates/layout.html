@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Decypharr - {{.Title}}</title>
+    <title>Tessarr - {{.Title}}</title>
 
     <link href="{{.URLBase}}assets/css/styles.css" rel="stylesheet" type="text/css"/>
 
@@ -36,7 +36,7 @@
 <div class="toast-container fixed bottom-4 right-4 z-50 space-y-2">
 </div>
 
-<header class="navbar bg-base-100 shadow-lg sticky top-0 z-40 backdrop-blur-sm">
+<header class="navbar tessarr-navbar bg-base-100/95 sticky top-0 z-40 backdrop-blur-sm">
     <div class="navbar-start">
         <div class="dropdown">
             <div tabindex="0" role="button" class="btn btn-ghost lg:hidden">
@@ -65,9 +65,9 @@
                 </a></li>
             </ul>
         </div>
-        <a class="btn btn-ghost text-xl font-bold text-primary group" href="{{.URLBase}}">
-            <img src="{{.URLBase}}images/logo.png" alt="Decypharr Logo" class="w-8 h-8 inline-block mr-2">
-            <span class="hidden sm:inline bg-clip-text">Decypharr</span>
+        <a class="btn btn-ghost text-xl font-bold group" href="{{.URLBase}}">
+            <img src="{{.URLBase}}images/logo.png" alt="Tessarr Logo" class="w-8 h-8 inline-block mr-2">
+            <span class="tessarr-brand-name hidden sm:inline">Tessarr</span>
         </a>
     </div>
 
@@ -165,21 +165,26 @@
 </main>
 
 <footer class="footer footer-center p-6 bg-base-300 text-base-content border-t border-base-200 md:footer-horizontal">
+	<aside class="text-sm opacity-70">
+		<span class="font-semibold">Tessarr</span>
+		<span>Many sources. One library.</span>
+	</aside>
     <aside class="grid-flow-col gap-4">
-        <a href="https://github.com/sirrobot01/decypharr" target="_blank"
+        <a href="https://github.com/Trifocals3537/decypharr" target="_blank" rel="noopener noreferrer"
            class="link link-hover flex items-center gap-2 hover:text-primary transition-colors">
             <i class="bi bi-github text-lg"></i>
             <span>GitHub</span>
         </a>
-        <a href="https://docs.decypharr.com/" target="_blank" id="docs-link"
+        <a href="https://github.com/Trifocals3537/decypharr/tree/beta/docs/src/content/docs" target="_blank"
+           rel="noopener noreferrer" id="docs-link"
            class="link link-hover flex items-center gap-2 hover:text-primary transition-colors">
             <i class="bi bi-book text-lg"></i>
             <span>Documentation</span>
         </a>
-        <a href="https://sponsor.decypharr.com" target="_blank"
+        <a href="https://github.com/Trifocals3537/decypharr/issues" target="_blank" rel="noopener noreferrer"
            class="link link-hover flex items-center gap-2 hover:text-error transition-colors">
-            <i class="bi bi-heart-fill text-error text-lg"></i>
-            <span>Sponsor</span>
+            <i class="bi bi-bug-fill text-error text-lg"></i>
+            <span>Report Issue</span>
         </a>
     </aside>
 </footer>

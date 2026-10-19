@@ -6,16 +6,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"path"
 	"sort"
 	"strings"
 
+	"github.com/Trifocals3537/tessarr/internal/crypto"
+	"github.com/Trifocals3537/tessarr/internal/nntp"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/types"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/crypto"
-	"github.com/sirrobot01/decypharr/internal/nntp"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/sirrobot01/decypharr/pkg/usenet/types"
 	"github.com/sourcegraph/conc/iter"
 )
 
@@ -33,7 +34,8 @@ const (
 	RAR5HeaderFlagExtraArea     = 0x0001
 	RAR5HeaderFlagDataArea      = 0x0002
 	RAR5HeaderFlagSkipIfUnknown = 0x0004
-	RAR5HeaderFlagDataSector    = 0x0008
+	RAR5HeaderFlagSplitBefore   = 0x0008
+	RAR5HeaderFlagSplitAfter    = 0x0010
 
 	RAR5MainFlagVolume       = 0x0001 // Archive is part of multi-volume set
 	RAR5MainFlagVolumeNumber = 0x0002 // Volume number field is present
@@ -68,6 +70,8 @@ const (
 	RAR4FileFlagSolid       = 0x0010
 	RAR4FileFlagEncrypted   = 0x0004 // File data is encrypted
 	RAR4FileFlagHighSize    = 0x0100 // 64-bit file size (high 4 bytes follow after low 4 bytes)
+	RAR4FileFlagSplitBefore = 0x0001
+	RAR4FileFlagSplitAfter  = 0x0002
 	RAR4ArchiveFlagPassword = 0x0080 // Archive headers are encrypted
 
 	RAR4CompressionMethodStore = 0x30
@@ -106,6 +110,8 @@ type RARFileEntry struct {
 	VolumeParts      []*types.RARVolumePart // Parts across volumes
 	CRC32            uint32
 	VolumeIndex      int // Which volume this file starts in
+	SplitBefore      bool
+	SplitAfter       bool
 }
 
 // RARParser handles parsing RAR archives from usenet segments
@@ -147,8 +153,8 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 	})
 
 	volumes := buildArchiveVolumeDescriptors(group)
-	if len(volumes) == 0 {
-		return nil, fmt.Errorf("no RAR volumes found")
+	if len(volumes) != len(group.Files) {
+		return nil, fmt.Errorf("incomplete RAR archive: invalid volume segment geometry")
 	}
 
 	filename := group.BaseName
@@ -187,6 +193,12 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 			hasNoneStored = true
 			continue
 		}
+		// A valid empty member has no byte range to map. Do not let an empty
+		// sidecar reject the media beside it. Split-chain and declared/packed
+		// size validation has already run; mismatched nonzero sizes still fail.
+		if rarFile.UncompressedSize == 0 && rarFile.PackedSize == 0 {
+			continue
+		}
 
 		name := utils.RemoveInvalidChars(path.Base(rarFile.Name))
 		if name == "" {
@@ -196,7 +208,7 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		// Build segments for this file across all its volume parts
 		fileSegments, err := p.buildSegmentsForFile(rarFile, baseSegments, volumeOffsetMap)
 		if err != nil {
-			continue
+			return nil, err
 		}
 
 		if len(fileSegments) == 0 {
@@ -209,9 +221,9 @@ func (p *RARParser) Process(ctx context.Context, group *FileGroup, password stri
 		}
 
 		size := rarFile.UncompressedSize
-		if size <= 0 || (streamSize > 0 && size > streamSize) {
-			// Clamp to streamable size to avoid advertising bytes we can't serve.
-			size = streamSize
+		expectedSize, sizeErr := storedStreamSize(size, rarFile.IsEncrypted)
+		if sizeErr != nil || size <= 0 || expectedSize != streamSize {
+			return nil, fmt.Errorf("incomplete RAR member %q: declared %d bytes, mapped %d", rarFile.Name, size, streamSize)
 		}
 
 		file := &storage.NZBFile{
@@ -308,6 +320,9 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 		if _, err := io.ReadFull(stream, sigBuf); err != nil {
 			return volumeResult{index: volIdx, files: nil, err: err}
 		}
+		if detectRARVersion(sigBuf) != version {
+			return volumeResult{index: volIdx, err: fmt.Errorf("RAR volume signature mismatch")}
+		}
 
 		// Parse this volume's file entries
 		var volumeFiles []*RARFileEntry
@@ -349,7 +364,7 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 	isHeaderEncrypted := false
 	for _, result := range results {
 		if result.err != nil {
-			continue
+			return nil, fmt.Errorf("RAR volume %d: %w", result.index+1, result.err)
 		}
 		if result.isHeaderEncrypted {
 			isHeaderEncrypted = true
@@ -381,7 +396,10 @@ func (p *RARParser) parseArchive(ctx context.Context, volumes []*types.Volume, p
 
 	// Aggregate file parts across volumes
 	// Files that span multiple volumes will have multiple entries with the same name
-	files := p.aggregateFileParts(allRawFiles)
+	files, err := p.aggregateFileParts(allRawFiles)
+	if err != nil {
+		return nil, err
+	}
 
 	archiveInfo := &RARArchiveInfo{
 		Version:           version,
@@ -448,6 +466,8 @@ func (p *RARParser) parseRAR5Headers(data []byte, volumeIndex int, volumeName st
 		if header.Type == RAR5HeaderTypeFile {
 			file := p.parseRAR5FileHeader(header.Data, volumeIndex, volumeName, dataOffset, dataSize, password)
 			if file != nil {
+				file.SplitBefore = header.Flags&RAR5HeaderFlagSplitBefore != 0
+				file.SplitAfter = header.Flags&RAR5HeaderFlagSplitAfter != 0
 				files = append(files, file)
 			}
 		}
@@ -665,8 +685,8 @@ func (p *RARParser) parseRAR5FileHeader(data []byte, volumeIndex int, volumeName
 	// - Bit 6 (0x0040): Solid flag
 	// - Bits 8-10 (0x0380): Compression method (0-5, where 0 = stored/no compression)
 	// - Bits 11-15 (0x7C00): Dictionary size
-	compressionMethod := (compressionInfo >> 8) & 0x07 // Extract bits 8-10
-	isStored := compressionMethod == 0                 // Method 0 = no compression
+	compressionMethod := (compressionInfo & 0x0380) >> 7
+	isStored := compressionMethod == 0 // Method 0 = no compression
 
 	// Parse extra area if present (remaining bytes after filename)
 	// Extra area contains encryption info, hash, etc.
@@ -910,7 +930,7 @@ func (p *RARParser) readRAR4Header(r *bytes.Reader) (*rar4Header, error) {
 
 // parseRAR4FileHeader parses RAR 4.x file header
 func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, volumeName string, dataOffset int64) *RARFileEntry {
-	if len(header.Data) < 21 { // Minimum file header data size
+	if len(header.Data) < 25 || (header.Flags&RAR4FileFlagHighSize != 0 && len(header.Data) < 33) {
 		return nil
 	}
 
@@ -996,19 +1016,17 @@ func (p *RARParser) parseRAR4FileHeader(header *rar4Header, volumeIndex int, vol
 	// Check if directory
 	isDirectory := (header.Flags & RAR4FileFlagDirectory) == RAR4FileFlagDirectory
 
-	// Check if stored (method 0x30)
-	// User report: Method 0x81 (Compressed) files play as raw streams, suggesting they are effectively stored
-	// or the player handles the compression. To support seeking, we must treat them as stored
-	// and ensure UncompressedSize matches PackedSize so we don't advertise data we can't serve.
-	isStored := method == RAR4CompressionMethodStore || method == 0x81
-
-	if isStored && method != RAR4CompressionMethodStore {
-		unpackedSize = packedSize
+	if packedSize < 0 || unpackedSize < 0 || len(nameBytes) == 0 {
+		return nil
 	}
+	isStored := method == RAR4CompressionMethodStore
 
 	return &RARFileEntry{
 		Name:             strings.ToValidUTF8(string(nameBytes), ""),
 		UncompressedSize: unpackedSize,
+		SplitBefore:      header.Flags&RAR4FileFlagSplitBefore != 0,
+		SplitAfter:       header.Flags&RAR4FileFlagSplitAfter != 0,
+		IsEncrypted:      header.Flags&RAR4FileFlagEncrypted != 0,
 		PackedSize:       packedSize,
 		DataOffset:       dataOffset,
 		IsStored:         isStored,
@@ -1085,17 +1103,14 @@ func (p *RARParser) buildSegmentsForFile(
 		// part.UnpackedSize = how many bytes of the file are in this part (this is what we stream!)
 		partSegments, err := p.buildSegmentsForVolumePart(part, baseSegments, volumeOffsetMap)
 		if err != nil {
-			continue
+			return nil, err
 		}
 
 		if len(partSegments) == 0 {
 			continue
 		}
 
-		// Ensure part segments are ordered by their segment number.
-		sort.Slice(partSegments, func(i, j int) bool {
-			return partSegments[i].Number < partSegments[j].Number
-		})
+		// The range slicer preserves decoded byte order, not subject counters.
 
 		// Append with correct file offsets
 		for i := range partSegments {
@@ -1147,7 +1162,13 @@ func (p *RARParser) buildSegmentsForVolumePart(
 	// volumeStartOffset = cumulative size of all previous volumes
 	// part.DataOffset = offset within THIS volume where the file data starts
 	absoluteStartOffset := volumeStartOffset + part.DataOffset
+	if part.DataOffset < 0 || absoluteStartOffset < volumeStartOffset || part.UnpackedSize <= 0 || part.UnpackedSize > math.MaxInt64-absoluteStartOffset {
+		return nil, fmt.Errorf("invalid RAR member byte range")
+	}
 	absoluteEndOffset := absoluteStartOffset + part.UnpackedSize - 1
+	if next, ok := volumeOffsetMap[part.PartNumber+1]; ok && absoluteEndOffset >= next {
+		return nil, fmt.Errorf("RAR member extends beyond its volume")
+	}
 
 	// Find all segments that overlap with [absoluteStartOffset, absoluteEndOffset]
 	var result []storage.NZBSegment
@@ -1182,6 +1203,7 @@ func (p *RARParser) buildSegmentsForVolumePart(
 		// Create a new segment descriptor
 		// StartOffset/EndOffset will be set by buildSegmentsForFile as file output positions
 		slicedSegment := storage.NZBSegment{
+			Source:           seg.Source,
 			Number:           seg.Number,
 			MessageID:        seg.MessageID,
 			Bytes:            bytesToRead,
@@ -1200,8 +1222,12 @@ func (p *RARParser) buildSegmentsForVolumePart(
 		currentOffset += seg.Bytes
 	}
 
-	if len(result) == 0 {
-		return nil, fmt.Errorf("no segments found for range [%d, %d]", absoluteStartOffset, absoluteEndOffset)
+	var covered int64
+	for _, s := range result {
+		covered += s.Bytes
+	}
+	if covered != part.UnpackedSize {
+		return nil, fmt.Errorf("incomplete RAR member range: mapped %d of %d bytes", covered, part.UnpackedSize)
 	}
 
 	return result, nil
@@ -1259,6 +1285,7 @@ func sliceSegmentsForRangeSimple(
 
 		// Create sliced segment
 		slicedSeg := storage.NZBSegment{
+			Source:           seg.Source,
 			Number:           seg.Number,
 			MessageID:        seg.MessageID,
 			Bytes:            bytesToRead,
@@ -1285,44 +1312,44 @@ func sliceSegmentsForRangeSimple(
 // aggregateFileParts combines file parts across volumes for multi-volume RAR archives
 // When a file spans multiple RAR volumes, each volume contains a file header for the continuation
 // This function merges these into a single RARFileEntry with all volume parts
-func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) []*RARFileEntry {
-	if len(rawFiles) == 0 {
-		return nil
-	}
-
-	// Map of filename -> aggregated file entry
+func (p *RARParser) aggregateFileParts(rawFiles []*RARFileEntry) ([]*RARFileEntry, error) {
 	fileMap := make(map[string]*RARFileEntry)
-
 	for _, file := range rawFiles {
 		if file == nil {
 			continue
 		}
-
 		existing, found := fileMap[file.Name]
 		if !found {
-			// First occurrence of this file
-			fileMap[file.Name] = file
-		} else {
-			// File continuation from another volume - merge the parts
-			if len(file.VolumeParts) > 0 {
-				// Append volume parts (PartNumber already set correctly during parsing)
-				existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
-				// Update total packed size
-				existing.PackedSize += file.PackedSize
+			if file.SplitBefore {
+				return nil, fmt.Errorf("incomplete RAR member %q: first part is a continuation", file.Name)
 			}
+			copied := *file
+			copied.VolumeParts = append([]*types.RARVolumePart(nil), file.VolumeParts...)
+			fileMap[file.Name] = &copied
+			continue
 		}
+		if !existing.SplitAfter || !file.SplitBefore || len(existing.VolumeParts) == 0 ||
+			file.VolumeIndex != existing.VolumeParts[len(existing.VolumeParts)-1].PartNumber+1 {
+			return nil, fmt.Errorf("incomplete RAR member %q: broken volume continuation chain", file.Name)
+		}
+		if file.UncompressedSize != existing.UncompressedSize || file.IsStored != existing.IsStored ||
+			file.IsEncrypted != existing.IsEncrypted || file.PackedSize < 0 || file.PackedSize > math.MaxInt64-existing.PackedSize {
+			return nil, fmt.Errorf("inconsistent RAR member metadata for %q", file.Name)
+		}
+		existing.VolumeParts = append(existing.VolumeParts, file.VolumeParts...)
+		existing.PackedSize += file.PackedSize
+		existing.SplitAfter = file.SplitAfter
 	}
-
-	// Convert map back to slice
 	result := make([]*RARFileEntry, 0, len(fileMap))
 	for _, file := range fileMap {
+		if file.SplitAfter {
+			return nil, fmt.Errorf("incomplete RAR member %q: missing final volume", file.Name)
+		}
+		if file.IsStored && !file.IsDirectory && !file.IsEncrypted && file.PackedSize != file.UncompressedSize {
+			return nil, fmt.Errorf("incomplete RAR member %q: declared %d bytes, available %d", file.Name, file.UncompressedSize, file.PackedSize)
+		}
 		result = append(result, file)
 	}
-
-	// Sort by name for consistent ordering
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Name < result[j].Name
-	})
-
-	return result
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result, nil
 }

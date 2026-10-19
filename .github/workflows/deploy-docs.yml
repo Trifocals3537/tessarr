@@ -1,36 +1,58 @@
-name: Deploy Docs
+name: Docs Build
+
 on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yml"
   push:
     branches:
       - main
+      - beta
+    paths:
+      - "docs/**"
+      - ".github/workflows/deploy-docs.yml"
+
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  deploy:
-    name: Deploy docs
-    runs-on: ubuntu-latest
+  build:
+    name: Build docs
+    runs-on: ubuntu-24.04
     env:
-      DOCS_BASE_PREFIX: /
+      DOCS_BASE_PREFIX: /tessarr/
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: "22"
           cache: npm
           cache-dependency-path: docs/package-lock.json
+
       - name: Install dependencies
         working-directory: docs
         run: npm ci
+
+      - name: Audit docs dependencies
+        working-directory: docs
+        run: npm audit --audit-level=high
+
       - name: Build docs
         working-directory: docs
         env:
           PUBLIC_DOCS_BASE_PATH: ${{ env.DOCS_BASE_PREFIX }}
         run: npm run build
-      - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+
+      - name: Upload docs preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: docs/dist
-          user_name: github-actions[bot]
-          user_email: 41898282+github-actions[bot]@users.noreply.github.com
+          name: docs-${{ github.sha }}
+          path: docs/dist
+          if-no-files-found: error
+          retention-days: 7

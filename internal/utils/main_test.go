@@ -4,11 +4,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/config"
 )
 
 func TestMain(m *testing.M) {
-	configDir, err := os.MkdirTemp("", "decypharr-utils-test-")
+	configDir, err := os.MkdirTemp("", "tessarr-utils-test-")
 	if err != nil {
 		panic(err)
 	}

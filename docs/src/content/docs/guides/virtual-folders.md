@@ -3,9 +3,9 @@ title: Virtual Folders
 description: Organize your mounted media into custom folders.
 ---
 
-Virtual folders let you create extra folders in your Decypharr mount without moving or copying anything.
+Virtual folders let you create extra folders in your Tessarr mount without moving or copying anything.
 
-For example, you can add a folder named `4K Movies`. When you open it, Decypharr only shows items that match the filters
+For example, you can add a folder named `4K Movies`. When you open it, Tessarr only shows items that match the filters
 you chose. The same items still remain available in `__all__`, `torrents`, `nzbs`, and provider folders.
 
 ## When to Use Them
@@ -21,7 +21,7 @@ Virtual folders are only views. Deleting a virtual folder removes the view, not 
 
 ## Add a Virtual Folder
 
-1. Open Decypharr.
+1. Open Tessarr.
 2. Go to **Settings**.
 3. Open the main configuration tab.
 4. Find **Virtual Folders**.
@@ -35,7 +35,7 @@ After saving, open your mount path. The new folder appears at the top level of t
 Example:
 
 ```text
-/mnt/decypharr/
+/mnt/tessarr/
   __all__/
   __bad__/
   torrents/
@@ -62,7 +62,7 @@ Most users should start with `include`, `exclude`, `last_added`, `size_gt`, or `
 
 ## How Filters Work
 
-If you add more than one filter to a folder, Decypharr only shows items that match the filters.
+If you add more than one filter to a folder, Tessarr only shows items that match the filters.
 
 Example `4K Movies` folder:
 
@@ -116,7 +116,7 @@ You can also create virtual folders directly in `config.json`:
 }
 ```
 
-Restart Decypharr after changing the file manually.
+Restart Tessarr after changing the file manually.
 
 ## Things to Know
 
@@ -125,3 +125,6 @@ Restart Decypharr after changing the file manually.
 - An empty virtual folder usually means no current item matches the filters.
 - A virtual folder with no filters will show all items.
 - Filter text is case-sensitive, so `2160p` and `2160P` are different.
+- Folder names and Debrid instance names share one portable, case-insensitive
+  mount namespace. They must be unique and cannot use `__all__`, `__bad__`,
+  `torrents`, `nzbs`, `version.txt`, or `usenet`.

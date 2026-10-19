@@ -5,9 +5,9 @@ import (
 
 	json "github.com/bytedance/sonic"
 
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/manager"
 	"github.com/go-chi/chi/v5"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
 func (s *Server) handleIngests(w http.ResponseWriter, r *http.Request) {

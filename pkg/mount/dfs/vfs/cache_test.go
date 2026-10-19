@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/buffer"
+	fuseconfig "github.com/Trifocals3537/tessarr/pkg/mount/dfs/config"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/buffer"
-	fuseconfig "github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
 )
 
 func newTestCache(cacheDir string) *Cache {
@@ -21,7 +21,14 @@ func newTestCache(cacheDir string) *Cache {
 		},
 		items:  xsync.NewMap[string, *CacheItem](),
 		logger: zerolog.Nop(),
+		quota:  newDiskQuota(0),
 	}
+}
+
+func initializeTestCacheDiskState(c *Cache) {
+	scan := c.scanDiskCandidates()
+	c.quota.initialize(scan.totalSize)
+	c.storeDiskStats(scan.candidates, nil)
 }
 
 func TestScanDiskCandidates_DoesNotDeleteLegacyFiles(t *testing.T) {
@@ -161,6 +168,7 @@ func TestGetStatsReportsDiskItemsSeparatelyFromActiveItems(t *testing.T) {
 	}
 
 	c := newTestCache(cacheDir)
+	initializeTestCacheDiskState(c)
 	c.config.CacheDiskSize = 100
 	c.evict()
 
@@ -173,6 +181,32 @@ func TestGetStatsReportsDiskItemsSeparatelyFromActiveItems(t *testing.T) {
 	}
 	if got := stats["total_size"]; got != int64(50) {
 		t.Fatalf("expected total cache size 50, got %#v", got)
+	}
+}
+
+func TestGetStatsReportsBoundedReadScheduler(t *testing.T) {
+	c := newTestCache(t.TempDir())
+	c.pendingReads.Store(3)
+	c.schedulerPreemptions.Store(4)
+	c.schedulerQueueFull.Store(2)
+	c.recordReadWait(10 * time.Millisecond)
+	c.recordReadWait(30 * time.Millisecond)
+
+	stats := c.GetStats()
+	if got := stats["pending_reads"]; got != int32(3) {
+		t.Fatalf("pending reads = %#v, want 3", got)
+	}
+	if got := stats["scheduler_preemptions"]; got != int64(4) {
+		t.Fatalf("scheduler preemptions = %#v, want 4", got)
+	}
+	if got := stats["scheduler_queue_full"]; got != int64(2) {
+		t.Fatalf("scheduler queue full = %#v, want 2", got)
+	}
+	if got := stats["read_wait_average_ms"]; got != float64(20) {
+		t.Fatalf("average read wait = %#v, want 20ms", got)
+	}
+	if got := stats["read_wait_max_ms"]; got != float64(30) {
+		t.Fatalf("max read wait = %#v, want 30ms", got)
 	}
 }
 
@@ -245,6 +279,7 @@ func TestPurgeCacheRemovesIdleDiskItemsAndSkipsActiveItems(t *testing.T) {
 	}
 
 	c := newTestCache(cacheDir)
+	initializeTestCacheDiskState(c)
 	activeItem := &CacheItem{
 		cache:    c,
 		key:      "entry/active.mkv",

@@ -1,12 +1,14 @@
 package account
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/request"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/puzpuzpuz/xsync/v4"
-	"github.com/sirrobot01/decypharr/internal/request"
-	"github.com/sirrobot01/decypharr/pkg/debrid/types"
 )
 
 type Account struct {
@@ -20,8 +22,11 @@ type Account struct {
 	httpClient  *request.Client
 	Expiration  time.Time `json:"expiration"`
 
-	// Account reactivation tracking
+	// Permanent-disable tracking. Temporary recovery state is protected below.
 	DisableCount atomic.Int32 `json:"disable_count"`
+
+	recoveryMu sync.Mutex
+	recovery   recoveryState
 }
 
 func (a *Account) Equals(other *Account) bool {
@@ -47,12 +52,31 @@ func (a *Account) sliceFileLink(fileLink string) string {
 }
 
 func (a *Account) GetDownloadLink(id string, file *types.File, fetcher LinkFetcher) (types.DownloadLink, error) {
+	return a.GetDownloadLinkContext(context.Background(), id, file, func(_ context.Context, account *Account, id string, file *types.File) (types.DownloadLink, error) {
+		return fetcher(account, id, file)
+	})
+}
+
+func (a *Account) GetDownloadLinkContext(ctx context.Context, id string, file *types.File, fetcher ContextLinkFetcher) (types.DownloadLink, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return types.DownloadLink{}, err
+	}
 	slicedLink := a.sliceFileLink(file.Link)
 	dl, ok := a.links.Load(slicedLink)
+	if ok && dl.NeedsRefresh(time.Now()) {
+		a.links.Delete(slicedLink)
+		ok = false
+	}
 	if !ok {
 		var err error
-		dl, err = fetcher(a, id, file)
+		dl, err = fetcher(ctx, a, id, file)
 		if err != nil {
+			return dl, err
+		}
+		if err := ctx.Err(); err != nil {
 			return dl, err
 		}
 		a.storeLink(dl)
@@ -64,12 +88,22 @@ func (a *Account) GetDownloadLink(id string, file *types.File, fetcher LinkFetch
 }
 
 func (a *Account) storeLink(dl types.DownloadLink) {
+	// Probe ownership is request-scoped and must never leak into the cache.
+	dl.RecoveryProbeID = 0
 	slicedLink := a.sliceFileLink(dl.Link)
 	a.links.Store(slicedLink, dl)
 }
-func (a *Account) DeleteLink(link types.DownloadLink, deleter LinkDeleter) error {
+
+// InvalidateLink evicts only Tessarr's cached URL. It deliberately does not
+// invoke a provider deletion endpoint because link refresh must never remove
+// the user's remote download or download-history record.
+func (a *Account) InvalidateLink(link types.DownloadLink) {
 	slicedLink := a.sliceFileLink(link.Link)
 	a.links.Delete(slicedLink)
+}
+
+func (a *Account) DeleteLink(link types.DownloadLink, deleter LinkDeleter) error {
+	a.InvalidateLink(link)
 	if deleter != nil {
 		return deleter(a, link)
 	}
@@ -107,10 +141,16 @@ func (a *Account) StoreDownloadLinks(dls map[string]*types.DownloadLink) {
 // MarkDisabled marks the account as disabled and increments the disable count
 func (a *Account) MarkDisabled() {
 	a.Disabled.Store(true)
+	a.recoveryMu.Lock()
+	a.recovery = recoveryState{}
+	a.recoveryMu.Unlock()
 	a.DisableCount.Add(1)
 }
 
 func (a *Account) Reset() {
+	a.recoveryMu.Lock()
+	a.recovery = recoveryState{}
+	a.recoveryMu.Unlock()
 	a.DisableCount.Store(0)
 	a.Disabled.Store(false)
 }

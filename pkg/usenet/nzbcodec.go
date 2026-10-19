@@ -7,8 +7,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/Trifocals3537/tessarr/pkg/storage"
 	"github.com/klauspost/compress/zstd"
-	"github.com/sirrobot01/decypharr/pkg/storage"
 )
 
 // On-disk NZB metadata format v2.
@@ -181,6 +181,13 @@ func (r *byteReader) f64() (float64, error) {
 // ---------------------------------------------------------------------------
 
 func encodeNZBV2(nzb *storage.NZB) ([]byte, error) {
+	for _, file := range nzb.Files {
+		for _, seg := range file.Segments {
+			if seg.Source != nil && !seg.Source.Valid() {
+				return nil, fmt.Errorf("nzbcodec: invalid source article geometry")
+			}
+		}
+	}
 	header := encodeHeader(nzb)
 	segMeta, msgIDs := encodeSegments(nzb)
 
@@ -319,6 +326,7 @@ func encodeSegments(nzb *storage.NZB) (segMeta, msgIDs []byte) {
 	for _, idx := range idxCol {
 		sw.uvarint(idx)
 	}
+	encodeSourceGeometry(sw, nzb)
 
 	// Message id region (its own buffer so a full decode retains only these
 	// bytes, not the numeric columns).
@@ -601,6 +609,9 @@ func decodeSegments(nzb *storage.NZB, counts []int, segMeta, msgIDs []byte) erro
 			return fmt.Errorf("nzbcodec: group index %d out of range", idx)
 		}
 		segs[i].Group = groups[idx]
+	}
+	if err := decodeSourceGeometry(r, segs); err != nil {
+		return err
 	}
 
 	// Message ids alias the msgIDs buffer (no per-id allocation).

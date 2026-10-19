@@ -23,13 +23,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/logger"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/logger"
 )
 
 // Common errors
@@ -40,9 +39,15 @@ var (
 	errKeyNotFound          = errors.New("key not found")
 )
 
+// IsNotFound reports whether err means the requested key is authoritatively
+// absent. Callers must not infer absence from other read failures.
+func IsNotFound(err error) bool {
+	return errors.Is(err, errKeyNotFound)
+}
+
 // Config holds store configuration
 type Config struct {
-	// DataPath is the directory for data files
+	// DataPath is the append-log file path.
 	DataPath string
 
 	// CacheSize is the maximum number of entries to cache (default: 1000)
@@ -82,6 +87,14 @@ type Store struct {
 
 	// Metrics
 	stats Stats
+
+	// syncForTest injects final-sync failures without replacing the append-log
+	// file. Production instances leave it nil.
+	syncForTest func() error
+
+	// compactionPhaseForTest lets subprocess tests terminate at durable
+	// replacement boundaries. Production instances leave it nil.
+	compactionPhaseForTest func(compactionPhase)
 }
 
 // Stats holds operational statistics
@@ -110,6 +123,15 @@ func New(config Config) (*Store, error) {
 		return nil, fmt.Errorf("DataPath is required")
 	}
 
+	compactionPaths, err := pathsForCompaction(config.DataPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid append log path: %w", err)
+	}
+	if err := recoverCompactionState(compactionPaths); err != nil {
+		return nil, fmt.Errorf("recover interrupted compaction: %w", err)
+	}
+	config.DataPath = compactionPaths.canonical
+
 	// Apply defaults
 	if config.CacheSize <= 0 {
 		config.CacheSize = 1000
@@ -129,7 +151,6 @@ func New(config Config) (*Store, error) {
 
 	// Initialize components
 	logPath := config.DataPath
-	var err error
 
 	s.log, err = openAppendLog(logPath)
 	if err != nil {
@@ -142,14 +163,21 @@ func New(config Config) (*Store, error) {
 
 	// Recover index from log
 	if err := s.recover(); err != nil {
-		_ = s.log.Close()
+		closeErr := s.log.Close()
 		cancel()
-		return nil, fmt.Errorf("failed to recover from log: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("failed to recover from log: %w", err),
+			wrapCompactionError("close append log after recovery failure", closeErr),
+		)
 	}
 
 	// Auto-compact if log version is outdated (migrates to new format)
 	if s.log.version < logVersion && s.index.Len() > 0 {
 		if err := s.Compact(); err != nil {
+			if s.closed.Load() {
+				cancel()
+				return nil, fmt.Errorf("failed to auto-compact version upgrade safely: %w", err)
+			}
 			s.logger.Warn().Err(err).Msg("Failed to auto-compact for version upgrade")
 		}
 	}
@@ -178,11 +206,31 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err := s.log.Sync(); err != nil {
-		s.logger.Warn().Err(err).Msg("Failed to sync on close")
+	syncErr := s.syncLog()
+	if syncErr != nil {
+		s.logger.Warn().Err(syncErr).Msg("Failed to sync on close")
 	}
+	closeErr := s.log.Close()
+	return errors.Join(syncErr, closeErr)
+}
 
-	return s.log.Close()
+// Sync flushes all append-log writes completed before this call to durable
+// storage. Callers use it at multi-store transaction boundaries; routine
+// progress updates continue to use the configured periodic sync.
+func (s *Store) Sync() error {
+	if s.closed.Load() {
+		return ErrStoreClosed
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncLog()
+}
+
+func (s *Store) syncLog() error {
+	if s.syncForTest != nil {
+		return s.syncForTest()
+	}
+	return s.log.Sync()
 }
 
 // recover rebuilds the index from the append log
@@ -226,7 +274,7 @@ func (s *Store) startSyncTask() {
 				return
 			case <-ticker.C:
 				s.mu.Lock()
-				_ = s.log.Sync()
+				_ = s.syncLog()
 				s.mu.Unlock()
 			}
 		}
@@ -256,12 +304,26 @@ func (s *Store) startCompactionTask() {
 
 // Put stores a key-value pair with optional metadata
 func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
+	return s.put(key, value, meta, false)
+}
+
+// PutExisting updates an existing key without creating it. The existence
+// check and append happen under the same store lock so a concurrent delete
+// cannot turn a stale update into a resurrected row.
+func (s *Store) PutExisting(key string, value []byte, meta *EntryMeta) error {
+	return s.put(key, value, meta, true)
+}
+
+func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting bool) error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if requireExisting && s.index.Get(key) == nil {
+		return fmt.Errorf("key %s: %w", key, errKeyNotFound)
+	}
 
 	// Prepare metadata
 	var category, provider, name, status, protocol string
@@ -302,6 +364,11 @@ func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
 	s.cache.Remove(key)
 
 	s.stats.Writes.Add(1)
+	if s.config.SyncInterval == 0 {
+		if err := s.syncLog(); err != nil {
+			return fmt.Errorf("sync appended record: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -386,6 +453,11 @@ func (s *Store) Delete(key string) error {
 	s.cache.Remove(key)
 
 	s.stats.Deletes.Add(1)
+	if s.config.SyncInterval == 0 {
+		if err := s.syncLog(); err != nil {
+			return fmt.Errorf("sync deletion tombstone: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -448,6 +520,70 @@ func (s *Store) ForEach(fn func(key string, value []byte) error) error {
 			return fmt.Errorf("failed to read from log: %w", err)
 		}
 		scratch = value // keep the (possibly grown) buffer for reuse
+		s.stats.Reads.Add(1)
+
+		if err := fn(key, value); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ForEachGuarded is equivalent to ForEach, but acquires a caller-provided
+// per-key guard before reading each current value. The guard is released after
+// the value has been read and before fn is called. This lets higher layers bind
+// optimistic snapshot tokens without holding their locks across user work.
+//
+// Returning include=false skips a key. A nil guard behaves like ForEach.
+func (s *Store) ForEachGuarded(
+	guard func(key string) (release func(), include bool, err error),
+	fn func(key string, value []byte) error,
+) error {
+	if s.closed.Load() {
+		return ErrStoreClosed
+	}
+
+	s.mu.RLock()
+	keys := s.index.KeysSortedByOffset()
+	s.mu.RUnlock()
+
+	var scratch []byte
+	for _, key := range keys {
+		var release func()
+		if guard != nil {
+			var include bool
+			var err error
+			release, include, err = guard(key)
+			if err != nil {
+				return err
+			}
+			if !include {
+				if release != nil {
+					release()
+				}
+				continue
+			}
+		}
+
+		s.mu.RLock()
+		entry := s.index.Get(key)
+		if entry == nil {
+			s.mu.RUnlock()
+			if release != nil {
+				release()
+			}
+			continue
+		}
+		value, err := s.log.ReadAtInto(entry.Offset, entry.Size, scratch)
+		s.mu.RUnlock()
+		if release != nil {
+			release()
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read from log: %w", err)
+		}
+		scratch = value
 		s.stats.Reads.Add(1)
 
 		if err := fn(key, value); err != nil {
@@ -527,12 +663,31 @@ func (s *Store) Compact() error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrStoreClosed
+	}
 
-	// Create new log file
-	newLogPath := s.log.path + ".compact"
-	newLog, err := createAppendLog(newLogPath)
+	paths, err := pathsForCompaction(s.log.path)
 	if err != nil {
-		return fmt.Errorf("failed to create compaction log: %w", err)
+		return fmt.Errorf("resolve compaction paths: %w", err)
+	}
+	if err := ensureCleanCompactionWorkspace(paths); err != nil {
+		return fmt.Errorf("prepare compaction workspace: %w", err)
+	}
+	if err := ensureCanonicalLogIdentity(s.log, paths.canonical); err != nil {
+		return err
+	}
+
+	// The original canonical log remains the only authority until the compact
+	// candidate has been fully written, flushed, and its directory entry made
+	// durable.
+	if err := s.syncLog(); err != nil {
+		return fmt.Errorf("sync canonical log before compaction: %w", err)
+	}
+
+	newLog, err := createAppendLogExclusive(paths.compact)
+	if err != nil {
+		return fmt.Errorf("create compaction log: %w", err)
 	}
 
 	// Write all live entries to new log
@@ -548,17 +703,21 @@ func (s *Store) Compact() error {
 		// Read value from old log
 		value, err := s.log.ReadAt(entry.Offset, entry.Size)
 		if err != nil {
-			_ = newLog.Close()
-			_ = os.Remove(newLogPath)
-			return fmt.Errorf("failed to read during compaction: %w", err)
+			cleanupErr := cleanupUncommittedCompact(newLog, paths)
+			return errors.Join(
+				fmt.Errorf("read during compaction: %w", err),
+				cleanupErr,
+			)
 		}
 
 		// Write to new log
 		offset, size, err := newLog.Append(key, value, false, entry.Category, entry.Provider, entry.Status, entry.Name, entry.TotalSize, entry.Protocol, entry.Bad, entry.AddedOn)
 		if err != nil {
-			_ = newLog.Close()
-			_ = os.Remove(newLogPath)
-			return fmt.Errorf("failed to write during compaction: %w", err)
+			cleanupErr := cleanupUncommittedCompact(newLog, paths)
+			return errors.Join(
+				fmt.Errorf("write during compaction: %w", err),
+				cleanupErr,
+			)
 		}
 
 		// Update new index
@@ -578,28 +737,45 @@ func (s *Store) Compact() error {
 
 	// Sync new log
 	if err := newLog.Sync(); err != nil {
-		_ = newLog.Close()
-		_ = os.Remove(newLogPath)
-		return fmt.Errorf("failed to sync compaction log: %w", err)
+		cleanupErr := cleanupUncommittedCompact(newLog, paths)
+		return errors.Join(
+			fmt.Errorf("sync compaction log: %w", err),
+			cleanupErr,
+		)
+	}
+	if err := syncParentDirectory(paths.parent); err != nil {
+		cleanupErr := cleanupUncommittedCompact(newLog, paths)
+		return errors.Join(
+			fmt.Errorf("sync staged compaction directory: %w", err),
+			cleanupErr,
+		)
+	}
+	s.reachCompactionPhase(compactionPhaseStaged)
+
+	oldLog := s.log
+	result := s.installCompactedLog(oldLog, newLog, paths)
+	if result.log == nil {
+		// Replacement code could not reopen either authoritative generation.
+		// Fail closed so callers never read with an index that may not match the
+		// bytes currently named by the canonical path.
+		s.closed.Store(true)
+		s.cancel()
+		return errors.Join(
+			result.err,
+			errors.New("compaction left no usable append-log handle; store closed"),
+		)
+	}
+	s.log = result.log
+	if !result.committed {
+		return result.err
 	}
 
-	// Swap logs
-	oldLog := s.log
-	oldPath := oldLog.path
-
-	s.log = newLog
+	// The durable namespace replacement succeeded. Only now expose offsets from
+	// the compacted file to readers.
 	s.index = newIndex
 	s.cache.Clear()
-
-	// Close and remove old log
-	_ = oldLog.Close()
-	_ = os.Remove(oldPath)
-	_ = os.Rename(newLogPath, oldPath)
-	s.log.path = oldPath
-
 	s.stats.Compactions.Add(1)
-
-	return nil
+	return result.err
 }
 
 func (s *Store) GetStats() StatsMeta {

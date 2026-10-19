@@ -31,22 +31,22 @@ const shouldRenderSearch =
 </div>
 
 <script is:inline>
-	function injectSponsorLink() {
-		if (document.querySelector('[data-sponsor]')) return;
+	function injectIssueLink() {
+		if (document.querySelector('[data-report-issue]')) return;
 		var socialIcons = document.querySelector('.social-icons');
 		if (!socialIcons) return;
 		var a = document.createElement('a');
-		a.href = 'https://sponsor.decypharr.com';
+		a.href = 'https://github.com/Trifocals3537/decypharr/issues';
 		a.target = '_blank';
 		a.rel = 'noopener noreferrer';
-		a.setAttribute('data-sponsor', '');
-		a.setAttribute('aria-label', 'Sponsor Decypharr');
+		a.setAttribute('data-report-issue', '');
+		a.setAttribute('aria-label', 'Report a Tessarr issue');
 		a.style.cssText = 'display:inline-flex;align-items:center;gap:0.35rem;color:#e05d5d;text-decoration:none;font-size:0.875rem;font-weight:600;white-space:nowrap;';
-		a.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 1.314C12.438-3.248 23.534 4.735 8 15-7.534 4.736 3.562-3.248 8 1.314"/></svg><span>Sponsor</span>';
+		a.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 16 16" aria-hidden="true"><path d="M4.355.522a.5.5 0 0 1 .623.333l.291.956A4.98 4.98 0 0 1 8 1c.958 0 1.853.27 2.613.737l.285-.884a.5.5 0 1 1 .952.306l-.347 1.074A5.003 5.003 0 0 1 13 5h1.5a.5.5 0 0 1 0 1H13v1h1.5a.5.5 0 0 1 0 1H13c0 .34-.035.672-.1.992l1.25.721a.5.5 0 1 1-.5.866l-1.056-.61A5.002 5.002 0 0 1 8 13a5.002 5.002 0 0 1-4.594-3.03l-1.056.61a.5.5 0 1 1-.5-.866l1.25-.722A5.036 5.036 0 0 1 3 8H1.5a.5.5 0 0 1 0-1H3V6H1.5a.5.5 0 0 1 0-1H3a5.003 5.003 0 0 1 1.363-2.646L4.022 1.145a.5.5 0 0 1 .333-.623ZM8 2a4 4 0 0 0-4 4v2a4 4 0 0 0 8 0V6a4 4 0 0 0-4-4Z"/></svg><span>Report issue</span>';
 		socialIcons.appendChild(a);
 	}
-	document.addEventListener('DOMContentLoaded', injectSponsorLink);
-	document.addEventListener('astro:page-load', injectSponsorLink);
+	document.addEventListener('DOMContentLoaded', injectIssueLink);
+	document.addEventListener('astro:page-load', injectIssueLink);
 </script>
 
 <style>

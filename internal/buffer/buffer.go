@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -54,6 +55,9 @@ const (
 	blockSize         = 1 << 20 // 1 MB
 	blockSizeLog2     = 20      // matches blockSize; used to index the per-block state slot
 	defaultMemorySize = 32 << 20
+	// Keep the logical endpoint low enough that rounding any valid byte offset
+	// up to its containing block cannot overflow int64.
+	maxLogicalSize = math.MaxInt64 - (blockSize - 1)
 
 	// Per-block fast-path states. The states slice lets ReadAt skip mu,
 	// the range tree, and the block-map entirely when every block in the
@@ -71,7 +75,8 @@ var (
 	// ErrClosed is returned by any operation on a Buffer after Close.
 	ErrClosed = errors.New("buffer: closed")
 	// ErrOutOfRange is returned for negative offsets or sizes.
-	ErrOutOfRange = errors.New("buffer: offset/length out of range")
+	ErrOutOfRange       = errors.New("buffer: offset/length out of range")
+	errPoolMemoryBudget = errors.New("buffer: pool memory budget exhausted")
 )
 
 // Range describes a contiguous half-open byte interval [Off, Off+Size).
@@ -225,8 +230,26 @@ func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 		// first allocation unsatisfiable.
 		cfg.MemorySize = blockSize
 	}
-	if cfg.TotalSize < 0 {
+	if cfg.TotalSize < 0 || cfg.TotalSize > maxLogicalSize {
 		return nil, ErrOutOfRange
+	}
+	for _, r := range cfg.InitialRanges {
+		if _, err := checkedRangeEnd(r.Off, r.Size, cfg.TotalSize); err != nil {
+			return nil, err
+		}
+	}
+
+	var stateBlocks int
+	if cfg.TotalSize > 0 {
+		blocks := cfg.TotalSize / blockSize
+		if cfg.TotalSize%blockSize != 0 {
+			blocks++
+		}
+		maxInt := int64(^uint(0) >> 1)
+		if blocks > maxInt {
+			return nil, ErrOutOfRange
+		}
+		stateBlocks = int(blocks)
 	}
 
 	var (
@@ -269,9 +292,8 @@ func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 		maxBytes: cfg.MemorySize,
 		ranges:   newRangeSet(),
 	}
-	if cfg.TotalSize > 0 {
-		n := int((cfg.TotalSize + blockSize - 1) / blockSize)
-		b.states = make([]atomic.Uint32, n)
+	if stateBlocks > 0 {
+		b.states = make([]atomic.Uint32, stateBlocks)
 	}
 	// Size the reuse free list to the working set, capped — a Buffer never
 	// needs to retain more idle blocks than it can hold resident.
@@ -279,6 +301,7 @@ func newBuffer(p *Pool, cfg Config) (*Buffer, error) {
 	if b.alloc.maxFree < 1 {
 		b.alloc.maxFree = 1
 	}
+	b.alloc.pool = p
 	for _, r := range cfg.InitialRanges {
 		if r.Size > 0 {
 			// Seeded ranges are already on disk from a prior run: count them
@@ -328,7 +351,10 @@ func (b *Buffer) WriteAt(p []byte, off int64) (int, error) {
 		return 0, ErrOutOfRange
 	}
 
-	end := off + int64(len(p))
+	end, err := checkedRangeEnd(off, int64(len(p)), b.cfg.TotalSize)
+	if err != nil {
+		return 0, err
+	}
 	for cur := off; cur < end; {
 		blockOff := alignDown(cur)
 		blockEnd := blockOff + blockSize
@@ -377,7 +403,13 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 			var err error
 			if blk, err = b.acquireBlockLocked(blockOff); err != nil {
 				b.mu.Unlock()
-				return err
+				if !errors.Is(err, errPoolMemoryBudget) {
+					return err
+				}
+				// Another Buffer won the last shared-memory slot after our
+				// optimistic check. Preserve progress by using the normal
+				// write-through path below instead of overshooting the budget.
+				goto writeThrough
 			}
 		}
 		err := b.writeIntoBlockLocked(blk, lo, hi, src)
@@ -385,6 +417,7 @@ func (b *Buffer) writeRegion(blockOff int64, lo, hi int, src []byte) error {
 		return err
 	}
 
+writeThrough:
 	// Under cache pressure and not resident → write-through. The range
 	// isn't in b.ranges yet, so no reader can fall back to disk for it
 	// until we publish below; that lets the pwrite run with no lock.
@@ -449,7 +482,10 @@ func (b *Buffer) ReadAt(p []byte, off int64) (int, error) {
 		return 0, ErrOutOfRange
 	}
 
-	end := off + int64(len(p))
+	end, err := checkedRangeEnd(off, int64(len(p)), b.cfg.TotalSize)
+	if err != nil {
+		return 0, err
+	}
 
 	// Fast path: if every block in the read range is stateFastDisk
 	// (fully on disk, no RAM block) we can bypass the lock, the range
@@ -574,6 +610,9 @@ func (b *Buffer) Discard(off, length int64) error {
 			return nil
 		}
 		return ErrOutOfRange
+	}
+	if _, err := checkedRangeEnd(off, length, b.cfg.TotalSize); err != nil {
+		return err
 	}
 	b.discard(off, length)
 	return nil
@@ -707,6 +746,9 @@ func (b *Buffer) HasRange(off, length int64) bool {
 	if b.closed.Load() || length <= 0 {
 		return false
 	}
+	if _, err := checkedRangeEnd(off, length, b.cfg.TotalSize); err != nil {
+		return false
+	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.ranges.present(off, length)
@@ -716,6 +758,9 @@ func (b *Buffer) HasRange(off, length int64) bool {
 // for "what's still missing?" decisions in cache callers.
 func (b *Buffer) Present(off, length int64) []Range {
 	if b.closed.Load() || length <= 0 {
+		return nil
+	}
+	if _, err := checkedRangeEnd(off, length, b.cfg.TotalSize); err != nil {
 		return nil
 	}
 	b.mu.RLock()
@@ -732,6 +777,9 @@ func (b *Buffer) Present(off, length int64) []Range {
 // that lands at this offset and expect a reader moments later.
 func (b *Buffer) WillRead(off, length int64) {
 	if b.closed.Load() || length <= 0 {
+		return
+	}
+	if _, err := checkedRangeEnd(off, length, b.cfg.TotalSize); err != nil {
 		return
 	}
 	adviseWillNeed(b.file, off, length)
@@ -773,6 +821,10 @@ func (b *Buffer) Sync() error {
 		return ErrClosed
 	}
 	b.mu.Lock()
+	if b.closed.Load() {
+		b.mu.Unlock()
+		return ErrClosed
+	}
 	// Flush every dirty block under the exclusive lock — flushBlockLocked
 	// requires it (releasing mu around the pwrite risks a torn write; see
 	// its doc comment).
@@ -809,15 +861,15 @@ func (b *Buffer) Close() error {
 	// writes they hadn't yet Synced, then unmap every resident block.
 	// Holding the lock here excludes readers (RLock), so no goroutine can
 	// be touching a block's memory as we unmap it.
+	var closeErrs []error
 	b.mu.Lock()
 	for off, blk := range b.blocks {
 		if !blk.isClean() {
-			// Best effort: a failed flush here just loses data the
-			// caller never Synced. Surface no error to keep semantics
-			// simple — Close is also the cleanup path.
-			_ = b.flushBlockLocked(blk)
+			if err := b.flushBlockLocked(blk); err != nil {
+				closeErrs = append(closeErrs, err)
+			}
 		}
-		munmapBlock(blk.bufPtr)
+		blockRelease{data: blk.bufPtr, pool: b.pool}.release()
 		delete(b.blocks, off)
 	}
 	b.pool.dropBytes(b.bytesInRAM) // release this Buffer's share of the pool RAM budget
@@ -846,11 +898,16 @@ func (b *Buffer) Close() error {
 	// No-op on non-Linux.
 	adviseDontNeedAll(b.file)
 
-	closeErr := b.file.Close()
-	if b.diskTemp {
-		_ = os.Remove(b.file.Name())
+	fileName := b.file.Name()
+	if err := b.file.Close(); err != nil {
+		closeErrs = append(closeErrs, fmt.Errorf("buffer: close disk file: %w", err))
 	}
-	return closeErr
+	if b.diskTemp {
+		if err := os.Remove(fileName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			closeErrs = append(closeErrs, fmt.Errorf("buffer: remove temp disk file: %w", err))
+		}
+	}
+	return errors.Join(closeErrs...)
 }
 
 // SetReadHead publishes the caller's current read position. It is the frontier
@@ -919,15 +976,15 @@ func (b *Buffer) acquireBlockLocked(blockOff int64) (*block, error) {
 	if blk, ok := b.blocks[blockOff]; ok {
 		return blk, nil
 	}
+	if b.pool.closed.Load() {
+		return nil, ErrClosed
+	}
 
 	// Make room if needed before allocating, for both the per-stream ceiling
-	// and the pool budget. A failure to evict is only fatal when we're over
-	// the per-stream ceiling; if it's purely pool pressure and this Buffer
-	// has nothing left to evict, allocate anyway (bounded overshoot — one block
-	// per actively-allocating Buffer). Breaking on no-progress (not just on
-	// error) is load-bearing: evictOneLocked with an empty LRU evicts nothing
-	// and returns no error, and retrying it while the pool stays over budget
-	// would spin forever under the exclusive lock.
+	// and the pool budget. Breaking on no-progress (not just on error) is
+	// load-bearing: evictOneLocked with an empty LRU evicts nothing and returns
+	// no error, and retrying it while the pool stays over budget would spin
+	// forever under the exclusive lock.
 	for b.bytesInRAM+blockSize > b.maxBytes || b.pool.wouldExceedMemory() {
 		evicted, err := b.evictOneLocked()
 		if evicted {
@@ -941,14 +998,25 @@ func (b *Buffer) acquireBlockLocked(blockOff int64) (*block, error) {
 		}
 		break
 	}
+	if !b.pool.tryReserveBlock() {
+		if b.pool.closed.Load() {
+			return nil, ErrClosed
+		}
+		return nil, errPoolMemoryBudget
+	}
 
-	bufPtr := b.alloc.get()
+	bufPtr, allocated := b.alloc.get()
+	if !allocated {
+		b.pool.dropBytes(int64(blockSize))
+		return nil, errPoolMemoryBudget
+	}
 	buf := (*bufPtr)[:blockSize]
 
 	// Load from disk if any part of this block is known to be present.
 	if b.ranges.anyPresent(blockOff, blockSize) {
 		if _, err := b.file.ReadAt(buf, blockOff); err != nil && !errors.Is(err, io.EOF) {
 			b.alloc.put(bufPtr)
+			b.pool.dropBytes(int64(blockSize))
 			return nil, fmt.Errorf("buffer: load block %d: %w", blockOff, err)
 		}
 	}
@@ -961,7 +1029,6 @@ func (b *Buffer) acquireBlockLocked(blockOff int64) (*block, error) {
 	blk.initDirty()
 	b.blocks[blockOff] = blk
 	b.bytesInRAM += int64(blockSize)
-	b.pool.addBlock()
 	b.pushFrontLocked(blk)
 	// A RAM block now exists for this offset — readers must take the
 	// locked path to see the RAM data, not pread stale disk bytes.
@@ -1088,6 +1155,19 @@ func (b *Buffer) touchLocked(blk *block) {
 
 func alignDown(off int64) int64 { return off &^ (blockSize - 1) }
 
+// checkedRangeEnd validates a half-open logical range and returns its end.
+// maxLogicalSize reserves enough headroom for block alignment arithmetic.
+func checkedRangeEnd(off, length, totalSize int64) (int64, error) {
+	if off < 0 || length < 0 || off > maxLogicalSize || length > maxLogicalSize-off {
+		return 0, ErrOutOfRange
+	}
+	end := off + length
+	if totalSize > 0 && end > totalSize {
+		return 0, ErrOutOfRange
+	}
+	return end, nil
+}
+
 // stateSlot returns the atomic state slot for the block containing off,
 // or nil if the buffer was constructed without a TotalSize (so no slot
 // was allocated). Safe for concurrent use; readers may load lock-free.
@@ -1096,10 +1176,10 @@ func (b *Buffer) stateSlot(blockOff int64) *atomic.Uint32 {
 		return nil
 	}
 	idx := blockOff >> blockSizeLog2
-	if idx < 0 || int(idx) >= len(b.states) {
+	if idx < 0 || idx >= int64(len(b.states)) {
 		return nil
 	}
-	return &b.states[idx]
+	return &b.states[int(idx)]
 }
 
 // markStateForBlockLocked recomputes the fast-path state for blockOff

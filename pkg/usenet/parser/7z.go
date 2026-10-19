@@ -10,12 +10,12 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Trifocals3537/tessarr/internal/nntp"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/fs"
 	"github.com/javi11/sevenzip"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/nntp"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/sirrobot01/decypharr/pkg/usenet/fs"
 )
 
 // SevenZParser parses 7z archives from NNTP segments
@@ -251,7 +251,10 @@ func (p *SevenZParser) processRARFilesFromPositions(
 	}
 
 	// Aggregate file parts across volumes (files spanning multiple volumes will have multiple entries)
-	rarFileEntries := p.rarParser.aggregateFileParts(allRawFiles)
+	rarFileEntries, err := p.rarParser.aggregateFileParts(allRawFiles)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build a map of RAR filename -> offset in 7z
 	rarFileOffsets := make(map[string]int64)
@@ -463,6 +466,7 @@ func sliceSegmentsForRange(
 			relStart := overlapStart - segAbsStart
 
 			slicedSeg := storage.NZBSegment{
+				Source:           seg.Source,
 				Number:           seg.Number,
 				MessageID:        seg.MessageID,
 				Bytes:            overlapEnd - overlapStart + 1,

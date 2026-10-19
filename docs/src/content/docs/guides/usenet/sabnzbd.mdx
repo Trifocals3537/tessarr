@@ -1,15 +1,15 @@
 ---
 title: Sabnzbd API Integration
-description: Configure Arrs to use Decypharr as Sabnzbd.
+description: Configure Arrs to use Tessarr as Sabnzbd.
 ---
 
 import sabnzbdImage from '../../../../assets/images/sabnzbd.png';
 
-Decypharr provides a Sabnzbd-compatible API for Arr applications to submit NZB files.
+Tessarr provides a Sabnzbd-compatible API for Arr applications to submit NZB files.
 
 ## How It Works
 
-Arrs send NZB files to Decypharr's `/sabnzbd/api` endpoint. Decypharr:
+Arrs send NZB files to Tessarr's `/sabnzbd/api` endpoint. Tessarr:
 1. Receives NZB file
 2. Processes with Usenet providers
 3. Streams/downloads content
@@ -31,8 +31,8 @@ Arrs send NZB files to Decypharr's `/sabnzbd/api` endpoint. Decypharr:
 
 | Field | Value |
 |-------|-------|
-| **Name** | Decypharr Usenet |
-| **Host** | `decypharr` (or IP) |
+| **Name** | Tessarr Usenet |
+| **Host** | `tessarr` (or IP) |
 | **Port** | `8282` |
 | **URL Base** | `/sabnzbd` |
 | **Username** | Arr's host(`http://sonarr:8989`) |
@@ -43,7 +43,7 @@ Click **Test** → **Save**
 
 ## API Endpoints
 
-Decypharr implements these Sabnzbd API endpoints:
+Tessarr implements these Sabnzbd API endpoints:
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -58,7 +58,7 @@ Decypharr implements these Sabnzbd API endpoints:
 Categories organize downloads:
 
 ```
-/mnt/decypharr/
+/mnt/tessarr/
 ├── sonarr/
 ├── radarr/
 ├── lidarr/
@@ -69,9 +69,9 @@ Set in Arr's download client config.
 
 ## Status Mapping
 
-Decypharr translates NZB processing status to Sabnzbd equivalents:
+Tessarr translates NZB processing status to Sabnzbd equivalents:
 
-| Decypharr | Sabnzbd | Meaning |
+| Tessarr | Sabnzbd | Meaning |
 |-----------|---------|---------|
 | Processing | Downloading | NZB being processed |
 | Streaming | Downloading | File accessible |
@@ -86,16 +86,16 @@ Decypharr translates NZB processing status to Sabnzbd equivalents:
 
 ### Arr Shows "Unknown" Status
 
-Decypharr may still be processing. Wait 1-2 minutes and refresh.
+Tessarr may still be processing. Wait 1-2 minutes and refresh.
 
 ### Path Not Found
 
-Ensure mount path matches between Decypharr and Arr:
+Ensure mount path matches between Tessarr and Arr:
 
 **Docker Example:**
 ```yaml
 services:
-  decypharr:
+  tessarr:
     volumes:
       - /mnt/media:/mnt/media
   
@@ -108,7 +108,7 @@ Then use `anime` or `4k` as category in Arr.
 
 ## Comparison to Native Sabnzbd
 
-| Feature | Decypharr | Sabnzbd |
+| Feature | Tessarr | Sabnzbd |
 |---------|-----------|---------|
 | NZB Processing | Direct NNTP streaming | Download + Extract |
 | Disk Usage | Minimal (streaming) | Full file size |
@@ -116,11 +116,11 @@ Then use `anime` or `4k` as category in Arr.
 | PAR2 Repair | NA | Built-in |
 | Post-Processing | Via Arr | Built-in scripts |
 
-Decypharr is optimized for streaming; Sabnzbd for complete downloads.
+Tessarr is optimized for streaming; Sabnzbd for complete downloads.
 
 ## Switching from Sabnzbd
 
-1. Add Decypharr as new download client in Arr
+1. Add Tessarr as new download client in Arr
 2. Set higher priority than Sabnzbd
 3. Test with new downloads
 4. Once stable, remove Sabnzbd client

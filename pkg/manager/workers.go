@@ -3,39 +3,146 @@ package manager
 import (
 	"context"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/go-co-op/gocron/v2"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
 )
 
 // runInitialCalls performs any initial calls of worker functions
 // for example, call the processQueuedEntries function once
 func (m *Manager) runInitialCalls(ctx context.Context) {
-	go m.refreshDownloadLinks(ctx)
-	go m.processQueuedEntries()
-	go m.syncAccounts()
+	m.startBackground("initial download-link refresh", func() {
+		m.refreshDownloadLinks(ctx)
+	})
+	m.startBackground("initial queue processing", func() {
+		m.processQueuedEntries(ctx)
+	})
+	m.startBackground("initial account sync", func() {
+		m.syncAccounts(ctx)
+	})
+	m.startBackground("initial migration source cleanup recovery", func() {
+		if err := m.processMigrationCleanups(ctx); err != nil && ctx.Err() == nil {
+			m.logger.Warn().Err(err).Msg("Initial migration source cleanup recovery was incomplete")
+		}
+	})
 }
 
-func (m *Manager) syncAccounts() {
+// awaitProviderCall makes cancellation observable around legacy provider APIs
+// that do not accept a context. The detached goroutine deliberately captures
+// only the provider method and a buffered result channel: it cannot touch
+// manager storage or mount state after its caller has been canceled.
+func awaitProviderCall(ctx context.Context, call func() error) error {
+	result := make(chan error, 1)
+	go func() {
+		result <- call()
+	}()
+
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func submitProviderMagnet(ctx context.Context, client debrid.Client, torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return torrent, err
+	}
+	if contextual, ok := client.(debrid.ContextMagnetSubmitter); ok {
+		return contextual.SubmitMagnetContext(ctx, torrent)
+	}
+	result, err := client.SubmitMagnet(torrent)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, ctxErr
+	}
+	return result, err
+}
+
+func checkProviderStatus(ctx context.Context, client debrid.Client, torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return torrent, err
+	}
+	if contextual, ok := client.(debrid.ContextStatusChecker); ok {
+		return contextual.CheckStatusContext(ctx, torrent)
+	}
+	result, err := client.CheckStatus(torrent)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, ctxErr
+	}
+	return result, err
+}
+
+type freshStatusChecker interface {
+	CheckStatusFreshContext(context.Context, *debridTypes.Torrent) (*debridTypes.Torrent, error)
+}
+
+func checkFreshProviderStatus(ctx context.Context, client debrid.Client, torrent *debridTypes.Torrent) (*debridTypes.Torrent, error) {
+	checker, ok := client.(freshStatusChecker)
+	if !ok {
+		// Other providers perform a direct status request here. TorBox implements
+		// the stronger capability above to bypass its documented list cache.
+		return checkProviderStatus(ctx, client, torrent)
+	}
+	return checker.CheckStatusFreshContext(ctx, torrent)
+}
+
+func syncProviderAccounts(ctx context.Context, client debrid.Client) error {
+	if contextual, ok := client.(debrid.ContextAccountSyncer); ok {
+		return contextual.SyncAccountsContext(ctx)
+	}
+	return awaitProviderCall(ctx, func() error {
+		client.SyncAccounts()
+		return nil
+	})
+}
+
+func refreshProviderDownloadLinks(ctx context.Context, client debrid.Client) error {
+	if contextual, ok := client.(debrid.ContextDownloadLinkRefresher); ok {
+		return contextual.RefreshDownloadLinksContext(ctx)
+	}
+	return awaitProviderCall(ctx, client.RefreshDownloadLinks)
+}
+
+func (m *Manager) syncDebridAccounts(ctx context.Context, debridName string, client debrid.Client) {
+	if err := syncProviderAccounts(ctx, client); err != nil && ctx.Err() == nil {
+		m.logger.Error().Err(err).Str("debrid", debridName).Msg("Failed to sync accounts")
+	}
+}
+
+func (m *Manager) syncAccounts(ctx context.Context) {
 	// Sync accounts for all debrids
 	m.clients.Range(func(debridName string, debridClient debrid.Client) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		if debridClient == nil {
 			return true
 		}
-		debridClient.SyncAccounts()
-		return true
+		m.syncDebridAccounts(ctx, debridName, debridClient)
+		return ctx.Err() == nil
 	})
 }
 
 func (m *Manager) refreshDownloadLinks(ctx context.Context) {
 	// Refresh download links for all debrids
 	m.clients.Range(func(debridName string, debridClient debrid.Client) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		if debridClient == nil {
 			return true
 		}
 		m.refreshDebridDownloadLinks(ctx, debridName, debridClient)
-		return true
+		return ctx.Err() == nil
 	})
 }
 
@@ -47,7 +154,7 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 	} else {
 		// Schedule the job
 		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-			m.processQueuedEntries()
+			m.processQueuedEntries(ctx)
 		}), gocron.WithContext(ctx)); err != nil {
 			m.logger.Error().Err(err).Msg("Failed to create slots tracking job")
 		} else {
@@ -74,6 +181,29 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 		}
 	}
 
+	// Recover source placements whose target migration committed but whose
+	// provider deletion or local checkpoint was interrupted. Singleton mode
+	// keeps a slow provider call from causing overlapping sweeps.
+	if jd, err := utils.ConvertToJobDef(migrationCleanupSweepInterval.String()); err != nil {
+		m.logger.Error().Err(err).Msg("Failed to convert migration cleanup interval to job definition")
+	} else {
+		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
+			if err := m.processMigrationCleanups(ctx); err != nil && ctx.Err() == nil {
+				m.logger.Warn().Err(err).Msg("Migration source cleanup sweep was incomplete")
+			}
+		}),
+			gocron.WithContext(ctx),
+			gocron.WithName("migration-source-cleanup"),
+			gocron.WithSingletonMode(gocron.LimitModeReschedule),
+		); err != nil {
+			m.logger.Error().Err(err).Msg("Failed to create migration source cleanup job")
+		} else {
+			m.logger.Debug().
+				Dur("interval", migrationCleanupSweepInterval).
+				Msg("Migration source cleanup recovery scheduled")
+		}
+	}
+
 	// NZB refresh job for pending archives (every 5 minutes)
 	if m.usenet != nil {
 		if jd, err := utils.ConvertToJobDef("10m"); err != nil {
@@ -95,7 +225,7 @@ func (m *Manager) addQueueProcessorJob(ctx context.Context) error {
 
 func (m *Manager) StartWorker(ctx context.Context) error {
 	// Stop any existing jobs before starting new ones
-	m.scheduler.RemoveByTags("decypharr")
+	m.scheduler.RemoveByTags(managerSchedulerTag)
 
 	// Call the initial calls
 	m.runInitialCalls(ctx)
@@ -148,7 +278,7 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 		} else {
 			jobName := debridName + "-account-syncTorrents"
 			if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-				debridClient.SyncAccounts()
+				m.syncDebridAccounts(ctx, debridName, debridClient)
 			}), gocron.WithContext(ctx), gocron.WithName(jobName)); err != nil {
 				m.logger.Error().Err(err).Str("debrid", debridName).Msg("Failed to create account syncTorrents job")
 			} else {
@@ -183,9 +313,17 @@ func (m *Manager) StartWorker(ctx context.Context) error {
 	} else {
 		// Schedule the job
 		if _, err := m.scheduler.NewJob(jd, gocron.NewTask(func() {
-			// Reset invalid download links map at midnight CET
-			m.arr.Monitor()
-		}), gocron.WithContext(ctx)); err != nil {
+			if err := m.handoffUncachedFailures(ctx); err != nil && ctx.Err() == nil {
+				m.logger.Error().Err(err).Msg("Uncached transfer handoff failed")
+			}
+			if err := m.arr.Monitor(ctx); err != nil && ctx.Err() == nil {
+				m.logger.Error().Err(err).Msg("Arr queue monitoring failed")
+			}
+		}),
+			gocron.WithContext(ctx),
+			gocron.WithName("arr-queue-monitor"),
+			gocron.WithSingletonMode(gocron.LimitModeReschedule),
+		); err != nil {
 			m.logger.Error().Err(err).Msg("Failed to create arr monitoring job")
 		} else {
 			m.logger.Debug().Msgf("Arr monitoring job scheduled for every %s", "10s")

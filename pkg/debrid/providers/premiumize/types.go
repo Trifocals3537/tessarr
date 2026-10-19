@@ -2,13 +2,34 @@ package premiumize
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 )
 
-type apiError struct {
+type apiEnvelope struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 	Code    string `json:"code"`
+}
+
+type premiumizeAPIError struct {
+	Code string
+}
+
+func (e *premiumizeAPIError) Error() string {
+	return fmt.Sprintf("premiumize API error (code %s)", safeAPIErrorCode(e.Code))
+}
+
+func safeAPIErrorCode(code string) string {
+	if code == "" || len(code) > 64 {
+		return "unknown_error"
+	}
+	for _, c := range code {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return "unknown_error"
+		}
+	}
+	return code
 }
 
 type accountInfoResponse struct {
@@ -21,17 +42,19 @@ type accountInfoResponse struct {
 	Code          string          `json:"code"`
 }
 
-func (r accountInfoResponse) customerIDInt64() int64 {
+func (r accountInfoResponse) customerIDInt64() (int64, error) {
 	var id int64
 	if err := json.Unmarshal(r.CustomerID, &id); err == nil {
-		return id
+		return id, nil
 	}
 	var idStr string
 	if err := json.Unmarshal(r.CustomerID, &idStr); err == nil {
-		parsed, _ := strconv.ParseInt(idStr, 10, 64)
-		return parsed
+		parsed, err := strconv.ParseInt(idStr, 10, 64)
+		if err == nil {
+			return parsed, nil
+		}
 	}
-	return 0
+	return 0, fmt.Errorf("premiumize account response contains an invalid customer_id")
 }
 
 type transferCreateResponse struct {
@@ -148,7 +171,7 @@ func (t *flexibleUnixTime) UnmarshalJSON(data []byte) error {
 	}
 	parsed, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return nil
+		return fmt.Errorf("invalid Premiumize timestamp %q", s)
 	}
 	t.Unix = parsed
 	return nil

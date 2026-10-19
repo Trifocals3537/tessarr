@@ -1,6 +1,9 @@
 package arr
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 
 type Movie struct {
 	Title         string `json:"title"`
@@ -31,10 +34,14 @@ type ContentFile struct {
 	Size         int64  `json:"size"`
 }
 
-func (file *ContentFile) Delete() {
-	// This is useful for when sonarr bulk delete fails(this usually happens)
-	// and we need to delete the file manually
-	_ = os.Remove(file.Path) //nolint:nolintlint
+func (file ContentFile) Delete() error {
+	if file.Path == "" {
+		return nil
+	}
+	if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete local content file %q: %w", file.Path, err)
+	}
+	return nil
 }
 
 type Content struct {

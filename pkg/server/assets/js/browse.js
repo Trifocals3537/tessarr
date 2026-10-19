@@ -126,6 +126,12 @@ class FileBrowser {
             this.loadStateFromURL();
             this.refresh();
         });
+
+        this.refs.paginationControls.addEventListener('click', (e) => {
+            const button = e.target.closest('[data-page]');
+            if (!button || button.disabled) return;
+            this.goToPage(Number.parseInt(button.dataset.page, 10));
+        });
     }
 
     loadStateFromURL() {
@@ -289,14 +295,11 @@ class FileBrowser {
     refreshHealthBadges() {
         document.querySelectorAll('[data-health-cell]').forEach((cell) => {
             const name = cell.getAttribute('data-health-cell');
-            cell.innerHTML = this.healthBadge(this.state.health.get(name));
+            this.renderHealthBadge(cell, this.state.health.get(name));
         });
     }
 
-    healthBadge(state) {
-        if (!state) {
-            return '<span class="badge badge-ghost badge-sm">unknown</span>';
-        }
+    renderHealthBadge(container, state) {
         const colors = {
             healthy: 'badge-success',
             broken: 'badge-error',
@@ -305,11 +308,15 @@ class FileBrowser {
             unsupported: 'badge-ghost',
             unknown: 'badge-ghost',
         };
-        const cls = colors[state.status] || 'badge-ghost';
-        const tooltip = state.last_checked_at
+        const status = state?.status || 'unknown';
+        const tooltip = state?.last_checked_at
             ? `last checked ${new Date(state.last_checked_at).toLocaleString()}`
             : 'never checked';
-        return `<span class="badge ${cls} badge-sm" title="${this.escapeAttr(tooltip)}">${this.escapeHtml(state.status || 'unknown')}</span>`;
+        const badge = document.createElement('span');
+        badge.className = `badge ${colors[status] || 'badge-ghost'} badge-sm`;
+        badge.title = tooltip;
+        badge.textContent = status;
+        container.replaceChildren(badge);
     }
 
     async recheckEntry(name) {
@@ -333,27 +340,41 @@ class FileBrowser {
 
     updateBreadcrumbs() {
         const parts = this.state.currentPath.split('/').filter(p => p);
+		this.refs.breadcrumbNav.replaceChildren();
 
-        let html = `<li><a href="${window.urlBase}browse" data-path="/">
-            <i class="bi bi-house-door"></i> Home
-        </a></li>`;
+		const appendBreadcrumb = (path, label, home = false) => {
+			const item = document.createElement('li');
+			const link = document.createElement('a');
+			link.href = path === '/'
+				? `${window.urlBase}browse`
+				: `${window.urlBase}browse?${new URLSearchParams({path})}`;
+			link.dataset.path = path;
+			if (home) {
+				const icon = document.createElement('i');
+				icon.className = 'bi bi-house-door';
+				link.append(icon, document.createTextNode(' Home'));
+			} else {
+				link.textContent = label;
+			}
+			link.addEventListener('click', (e) => {
+				e.preventDefault();
+				this.navigate(path);
+			});
+			item.appendChild(link);
+			this.refs.breadcrumbNav.appendChild(item);
+		};
 
+		appendBreadcrumb('/', 'Home', true);
         let currentPath = '';
         parts.forEach(part => {
             currentPath += '/' + part;
-            const displayName = decodeURIComponent(part);
-            html += `<li><a href="${window.urlBase}browse?path=${encodeURIComponent(currentPath)}" data-path="${currentPath}">${this.escapeHtml(displayName)}</a></li>`;
-        });
-
-        this.refs.breadcrumbNav.innerHTML = html;
-
-        // Add click handlers to override default link behavior
-        this.refs.breadcrumbNav.querySelectorAll('a').forEach(link => {
-            link.addEventListener('click', (e) => {
-                e.preventDefault();
-                const path = e.currentTarget.dataset.path;
-                this.navigate(path);
-            });
+			let displayName = part;
+			try {
+				displayName = decodeURIComponent(part);
+			} catch (_) {
+				// Keep malformed path fragments printable instead of aborting the UI.
+			}
+			appendBreadcrumb(currentPath, displayName);
         });
     }
 
@@ -367,72 +388,103 @@ class FileBrowser {
 
         this.refs.emptyState.classList.add('hidden');
 
-        this.refs.fileBrowserList.innerHTML = this.state.entries.map(entry => {
-            const icon = entry.is_dir ?
-                '<i class="bi bi-folder-fill text-warning text-lg transition-colors group-hover:text-warning-content"></i>' :
-                '<i class="bi bi-file-earmark text-info transition-colors group-hover:text-info-content"></i>';
-
+        this.refs.fileBrowserList.replaceChildren();
+        this.state.entries.forEach(entry => {
             const entryId = entry.info_hash || entry.path;
             const isChecked = this.state.selectedEntries.has(entryId);
+			const row = document.createElement('tr');
+			row.className = 'group hover:bg-base-200 transition-colors';
+			row.dataset.entryId = String(entryId || '');
+			row.addEventListener('contextmenu', (event) => this.showContextMenu(event, entry));
 
-            return `
-                <tr class="group hover:bg-base-200 transition-colors"
-                    data-entry='${JSON.stringify(entry)}'
-                    data-entry-id="${this.escapeAttr(entryId)}"
-                    oncontextmenu="window.fileBrowser.showContextMenu(event, ${this.escapeAttr(JSON.stringify(entry))});">
-                    <td onclick="event.stopPropagation();">
-                        <label class="cursor-pointer">
-                            <input type="checkbox"
-                                   class="checkbox checkbox-sm checkbox-primary entry-checkbox"
-                                   data-entry-id="${this.escapeAttr(entryId)}"
-                                   ${isChecked ? 'checked' : ''}
-                                   onchange="window.fileBrowser.handleEntrySelect('${this.escapeAttr(entryId)}', this.checked, ${this.escapeAttr(JSON.stringify(entry))})">
-                        </label>
-                    </td>
-                    <td>${icon}</td>
-                    <td onclick="window.fileBrowser.handleEntryClick('${this.escapeJs(entry.path)}', ${entry.is_dir}, '${this.escapeJs(entry.name)}');" class="cursor-pointer hover:text-primary transition-colors">
-                        <span class="font-medium">${this.escapeHtml(entry.name)}</span>
-                    </td>
-                    <td>
-                        ${entry.size <= 0 ? '-' : this.formatSize(entry.size)}
-                    </td>
-                    <td class="text-xs text-base-content/70">
-                        ${entry.mod_time || '-'}
-                    </td>
-                    <td>
-                        ${entry.active_debrid ? `<span>${this.escapeHtml(entry.active_debrid)}</span>` : '-'}
-                    </td>
-                    <td data-health-cell="${this.escapeAttr(entry.name)}">
-                        ${this.healthBadge(this.state.health.get(entry.name))}
-                    </td>
-                    <td onclick="event.stopPropagation();">
-                        <div class="dropdown dropdown-end">
-                            <label tabindex="0" class="btn btn-ghost btn-xs">
-                                <i class="bi bi-three-dots-vertical"></i>
-                            </label>
-                            <ul tabindex="0" class="dropdown-content menu p-2 shadow bg-base-200 rounded-box w-52 z-50">
-                                ${!entry.is_dir ? `
-                                    <li><a onclick="window.fileBrowser.downloadFile('${this.escapeJs(entry.path)}', '${this.escapeJs(entry.name)}')">
-                                        <i class="bi bi-download"></i> Download
-                                    </a></li>
-                                ` : ''}
-                                <li><a onclick="window.fileBrowser.recheckEntry('${this.escapeJs(entry.name)}')">
-                                    <i class="bi bi-search-heart"></i> Recheck health
-                                </a></li>
-                                ${entry.can_delete ? `
-                                    <li><a onclick="window.fileBrowser.deleteTorrent('${this.escapeJs(entry.info_hash)}', '${this.escapeJs(entry.name)}')" class="text-error">
-                                        <i class="bi bi-trash"></i> Delete
-                                    </a></li>
-                                ` : ''}
-                            </ul>
-                        </div>
-                    </td>
-                </tr>
-            `;
-        }).join('');
+			const selectionCell = document.createElement('td');
+			selectionCell.addEventListener('click', (event) => event.stopPropagation());
+			const selectionLabel = document.createElement('label');
+			selectionLabel.className = 'cursor-pointer';
+			const checkbox = document.createElement('input');
+			checkbox.type = 'checkbox';
+			checkbox.className = 'checkbox checkbox-sm checkbox-primary entry-checkbox';
+			checkbox.dataset.entryId = String(entryId || '');
+			checkbox.checked = isChecked;
+			checkbox.addEventListener('change', () => this.handleEntrySelect(entryId, checkbox.checked, entry));
+			selectionLabel.appendChild(checkbox);
+			selectionCell.appendChild(selectionLabel);
+
+			const iconCell = document.createElement('td');
+			const icon = document.createElement('i');
+			icon.className = entry.is_dir
+				? 'bi bi-folder-fill text-warning text-lg transition-colors group-hover:text-warning-content'
+				: 'bi bi-file-earmark text-info transition-colors group-hover:text-info-content';
+			iconCell.appendChild(icon);
+
+			const nameCell = document.createElement('td');
+			nameCell.className = 'cursor-pointer hover:text-primary transition-colors';
+			nameCell.addEventListener('click', () => this.handleEntryClick(entry.path, entry.is_dir, entry.name));
+			const name = document.createElement('span');
+			name.className = 'font-medium';
+			name.textContent = entry.name || '';
+			nameCell.appendChild(name);
+
+			const sizeCell = document.createElement('td');
+			sizeCell.textContent = entry.size <= 0 ? '-' : this.formatSize(entry.size);
+			const modifiedCell = document.createElement('td');
+			modifiedCell.className = 'text-xs text-base-content/70';
+			modifiedCell.textContent = entry.mod_time || '-';
+			const providerCell = document.createElement('td');
+			providerCell.textContent = entry.active_debrid || '-';
+
+			const healthCell = document.createElement('td');
+			healthCell.dataset.healthCell = entry.name || '';
+			this.renderHealthBadge(healthCell, this.state.health.get(entry.name));
+
+			const actionsCell = document.createElement('td');
+			actionsCell.addEventListener('click', (event) => event.stopPropagation());
+			actionsCell.appendChild(this.createEntryActions(entry));
+
+			row.append(selectionCell, iconCell, nameCell, sizeCell, modifiedCell, providerCell, healthCell, actionsCell);
+			this.refs.fileBrowserList.appendChild(row);
+		});
 
         this.updateSelectionUI();
     }
+
+	createEntryActions(entry) {
+		const dropdown = document.createElement('div');
+		dropdown.className = 'dropdown dropdown-end';
+		const trigger = document.createElement('button');
+		trigger.type = 'button';
+		trigger.className = 'btn btn-ghost btn-xs';
+		trigger.setAttribute('aria-label', `Actions for ${entry.name || 'entry'}`);
+		const triggerIcon = document.createElement('i');
+		triggerIcon.className = 'bi bi-three-dots-vertical';
+		trigger.appendChild(triggerIcon);
+
+		const menu = document.createElement('ul');
+		menu.className = 'dropdown-content menu p-2 shadow bg-base-200 rounded-box w-52 z-50';
+		menu.tabIndex = 0;
+		const appendAction = (label, iconClass, action, className = '') => {
+			const item = document.createElement('li');
+			const link = document.createElement('button');
+			link.type = 'button';
+			link.className = className;
+			const icon = document.createElement('i');
+			icon.className = iconClass;
+			link.append(icon, document.createTextNode(` ${label}`));
+			link.addEventListener('click', action);
+			item.appendChild(link);
+			menu.appendChild(item);
+		};
+
+		if (!entry.is_dir) {
+			appendAction('Download', 'bi bi-download', () => this.downloadFile(entry.path, entry.name));
+		}
+		appendAction('Recheck health', 'bi bi-search-heart', () => this.recheckEntry(entry.name));
+		if (entry.can_delete) {
+			appendAction('Delete', 'bi bi-trash', () => this.deleteTorrent(entry.info_hash, entry.name), 'text-error');
+		}
+		dropdown.append(trigger, menu);
+		return dropdown;
+	}
 
     renderPagination() {
         const start = (this.state.currentPage - 1) * this.state.itemsPerPage + 1;
@@ -447,40 +499,46 @@ class FileBrowser {
             return;
         }
 
-        let html = `
-            <button class="join-item btn btn-sm ${this.state.currentPage === 1 ? 'btn-disabled' : ''}"
-                    onclick="window.fileBrowser.goToPage(${this.state.currentPage - 1})"
-                    ${this.state.currentPage === 1 ? 'disabled' : ''}>
-                <i class="bi bi-chevron-left"></i>
-            </button>
-        `;
+		this.refs.paginationControls.replaceChildren();
+		const appendPageButton = (page, label, options = {}) => {
+			const button = document.createElement('button');
+			button.type = 'button';
+			button.className = `join-item btn btn-sm${options.active ? ' btn-active' : ''}${options.disabled ? ' btn-disabled' : ''}`;
+			button.disabled = Boolean(options.disabled);
+			if (!options.disabled) button.dataset.page = String(page);
+			if (options.icon) {
+				const icon = document.createElement('i');
+				icon.className = options.icon;
+				button.appendChild(icon);
+			} else {
+				button.textContent = label;
+			}
+			this.refs.paginationControls.appendChild(button);
+		};
+
+		appendPageButton(this.state.currentPage - 1, '', {
+			disabled: this.state.currentPage === 1,
+			icon: 'bi bi-chevron-left'
+		});
 
         // Smart pagination: show first, last, current, and nearby pages
         for (let i = 1; i <= this.state.totalPages; i++) {
             if (i === 1 || i === this.state.totalPages ||
                 (i >= this.state.currentPage - 2 && i <= this.state.currentPage + 2)) {
-                html += `
-                    <button class="join-item btn btn-sm ${i === this.state.currentPage ? 'btn-active' : ''}"
-                            onclick="window.fileBrowser.goToPage(${i})">${i}</button>
-                `;
+				appendPageButton(i, String(i), {active: i === this.state.currentPage});
             } else if (i === this.state.currentPage - 3 || i === this.state.currentPage + 3) {
-                html += `<button class="join-item btn btn-sm btn-disabled" disabled>...</button>`;
+				appendPageButton(0, '...', {disabled: true});
             }
         }
 
-        html += `
-            <button class="join-item btn btn-sm ${this.state.currentPage === this.state.totalPages ? 'btn-disabled' : ''}"
-                    onclick="window.fileBrowser.goToPage(${this.state.currentPage + 1})"
-                    ${this.state.currentPage === this.state.totalPages ? 'disabled' : ''}>
-                <i class="bi bi-chevron-right"></i>
-            </button>
-        `;
-
-        this.refs.paginationControls.innerHTML = html;
+		appendPageButton(this.state.currentPage + 1, '', {
+			disabled: this.state.currentPage === this.state.totalPages,
+			icon: 'bi bi-chevron-right'
+		});
     }
 
     goToPage(page) {
-        if (page < 1 || page > this.state.totalPages) return;
+        if (!Number.isInteger(page) || page < 1 || page > this.state.totalPages) return;
         this.state.currentPage = page;
         this.updateURL();
         this.refresh();
@@ -584,7 +642,7 @@ class FileBrowser {
         }
 
         try {
-            const response = await fetch(`${window.urlBase}api/browse/torrents/${infoHash}`, {
+			const response = await fetch(`${window.urlBase}api/browse/torrents/${encodeURIComponent(infoHash)}`, {
                 method: 'DELETE'
             });
 

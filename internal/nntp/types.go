@@ -1,7 +1,7 @@
 package nntp
 
 import (
-	nntpyenc "github.com/sirrobot01/decypharr/internal/nntp/yenc"
+	nntpyenc "github.com/Trifocals3537/tessarr/internal/nntp/yenc"
 )
 
 type YencMetadata = nntpyenc.Metadata

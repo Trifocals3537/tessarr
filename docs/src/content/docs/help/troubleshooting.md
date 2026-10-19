@@ -10,7 +10,7 @@ description: Solutions to common issues.
 **Check logs:**
 
 ```bash
-docker logs decypharr
+docker logs tessarr
 ```
 
 **Common causes:**
@@ -24,7 +24,7 @@ docker logs decypharr
 ```yaml
 # docker-compose.yml
 services:
-  decypharr:
+  tessarr:
     ports:
       - "8283:8282"  # Use different external port
     volumes:
@@ -37,21 +37,23 @@ services:
 Make executable:
 
 ```bash
-chmod +x decypharr
-./decypharr
+chmod +x tessarr
+./tessarr
 ```
 
 ## Authentication Issues
 
 ### API token not working
 
-1. Regenerate token:
+1. While logged in, regenerate the token from **Settings** → **Auth**, or use
+   the old token once to rotate it:
    ```bash
    curl -X POST -H "Authorization: Bearer OLD_TOKEN" \
      http://localhost:8282/api/refresh-token
    ```
-2. Check token in `/config/config.json` (`api_token` field)
-3. Ensure Authorization header format: `Bearer YOUR_TOKEN`
+2. Save the returned `token` value; configuration reads intentionally do not
+   reveal it.
+3. Ensure the Authorization header format is `Bearer YOUR_TOKEN`.
 
 ## Mount Issues
 
@@ -60,8 +62,8 @@ chmod +x decypharr
 **Check mount status:**
 
 ```bash
-ls -la /mnt/decypharr
-mount | grep decypharr
+ls -la /mnt/tessarr
+mount | grep tessarr
 ```
 
 **Common causes:**
@@ -74,7 +76,7 @@ mount | grep decypharr
 
 ```yaml
 services:
-  decypharr:
+  tessarr:
     devices:
       - /dev/fuse
     cap_add:
@@ -96,16 +98,49 @@ sudo usermod -a -G fuse $USER
 
 ### "Transport endpoint is not connected"
 
-Mount crashed. Unmount and restart:
+First determine whether the Tessarr mount itself failed or only a Docker
+consumer retained an old private bind:
+
+```bash
+# Host view
+stat /mnt/tessarr
+
+# Media-container view
+docker exec jellyfin stat /mnt/tessarr
+docker inspect jellyfin --format '{{range .Mounts}}{{.Destination}} {{.Propagation}}{{println}}{{end}}'
+```
+
+If the host succeeds but the container reports `Transport endpoint is not
+connected`, restart the media container so it attaches to the current mount,
+then configure its bind as read-only `rslave` to prevent recurrence:
+
+```bash
+docker restart jellyfin
+```
+
+```yaml
+services:
+  jellyfin:
+    volumes:
+      - type: bind
+        source: /mnt/tessarr
+        target: /mnt/tessarr
+        read_only: true
+        bind:
+          propagation: rslave
+```
+
+If the host check also fails, unmount the disconnected FUSE mount and restart
+Tessarr:
 
 ```bash
 # Force unmount
-sudo fusermount -u /mnt/decypharr
+sudo fusermount -u /mnt/tessarr
 # or
-sudo umount -l /mnt/decypharr
+sudo umount -l /mnt/tessarr
 
-# Restart Decypharr
-docker restart decypharr
+# Restart Tessarr
+docker restart tessarr
 ```
 
 ### "Permission denied" accessing files
@@ -263,7 +298,7 @@ And per-provider:
 
 1. **Check accessibility:**
    ```bash
-   curl http://decypharr:8282/version
+   curl http://tessarr:8282/version
    ```
 2. **Verify credentials in Arr match config**
 3. **Check firewall rules**
@@ -271,16 +306,16 @@ And per-provider:
 
 ### Downloads stuck "Queued" in Arr
 
-1. Check Decypharr logs for errors
+1. Check Tessarr logs for errors
 2. Verify Debrid provider has free slots
 3. Check `download_uncached` setting in Arr config
-4. Manually test adding torrent via Decypharr UI
+4. Manually test adding torrent via Tessarr UI
 
 ### Files not importing
 
 **Path mapping issue:**
 
-Arr and Decypharr must see files at identical paths:
+Arr and Tessarr must see files at identical paths:
 
 ```yaml
 # Both services
@@ -312,7 +347,7 @@ Arr sync delay. Wait 1-2 minutes or trigger manual import in Arr.
 **Check:**
 
 ```bash
-docker stats decypharr
+docker stats tessarr
 ```
 
 **Causes:**
@@ -391,6 +426,18 @@ For Rclone:
 - Try different Usenet provider
 - Check network bandwidth
 
+### Repeated playback errors after a Debrid link expires
+
+Tessarr validates a generated download URL and replaces it once when the CDN
+rejects it. If the replacement is also rejected, Tessarr continues probing
+that cached URL for recovery but temporarily defers another provider API
+refresh. The delay increases from 30 seconds to a maximum of 5 minutes for a
+file that keeps failing, and clears immediately when the URL works again.
+
+If logs report `link_refresh_cooldown`, check the provider status and the host's
+clock. No configuration change is required; the cooldown is isolated to that
+provider placement and file, so other playback remains unaffected.
+
 ### Database growing large
 
 Config stored in `config.json` (text). No separate database.
@@ -425,13 +472,35 @@ Clear browser cache or saved credentials.
 For apps, provide full URL with auth:
 
 ```
-http://username:password@decypharr:8282/webdav/
+http://username:password@tessarr:8282/webdav/
 ```
 
 ### Files won't play in WebDAV client
 
 WebDAV has no local cache - streaming depends on Debrid/Usenet speed. For better performance, use DFS mount instead of
 WebDAV.
+
+### Debrid streams return 429 or stall under concurrent load
+
+Tessarr automatically shares a concurrency budget across playback, seeks,
+link probes, and background downloads for each Debrid download account.
+Playback keeps a reserved slot whenever the current budget has at least two
+slots and is admitted ahead of queued bulk work. A
+`429 Too Many Requests` response temporarily reduces that account's budget,
+honors `Retry-After`, and then restores capacity gradually after healthy
+responses.
+
+Inspect the secret-free governor snapshot without enabling debug logging:
+
+```bash
+curl -H "Authorization: Bearer TOKEN" \
+  http://localhost:8282/debug/stats | jq .cdn_traffic
+```
+
+The `throttles`, `current_limit`, `waiting_interactive`, and
+`waiting_background` fields show whether provider-side CDN pressure is the
+cause. `rate_limit` and `download_rate_limit` govern provider API calls; they
+do not control CDN response bodies.
 
 ## Repair Worker Issues
 
@@ -442,9 +511,9 @@ WebDAV.
    {"repair": {"workers": 10}}
    ```
 2. **Check provider rate limits** (probes may be throttled by `repair_rate_limit` or `nntp_connection_percent`).
-3. **Restart Decypharr:**
+3. **Restart Tessarr:**
    ```bash
-   docker restart decypharr
+   docker restart tessarr
    ```
 
 ### False positives in repair
@@ -498,13 +567,13 @@ Brokens then sit in the Browse UI with their reason; you can fire **Recheck heal
 **Docker:**
 
 ```bash
-docker logs -f decypharr
+docker logs -f tessarr
 ```
 
 **Binary:**
 
 ```bash
-./decypharr 2>&1 | tee decypharr.log
+./tessarr 2>&1 | tee tessarr.log
 ```
 
 ### Check configuration
@@ -535,27 +604,30 @@ curl -H "Authorization: Bearer TOKEN" \
 
 ### Reset to defaults
 
-**Backup current config:**
+Stop Tessarr first, then move the configuration aside so it can be restored
+if needed. For a native install:
 
 ```bash
-cp /config/config.json /config/config.json.backup
+mv ~/.tessarr/config.json \
+  ~/.tessarr/config.json.backup-$(date +%Y%m%d-%H%M%S)
 ```
 
-**Delete config:**
+For the documented container image, use the mounted `/app` directory instead:
 
 ```bash
-rm /config/config.json
+mv /app/config.json /app/config.json.backup-$(date +%Y%m%d-%H%M%S)
 ```
 
-**Restart - setup wizard will run**
+Restart Tessarr and the setup wizard will run. Keep the backup until the new
+configuration is verified.
 
 ## Getting Help
 
 If you can't resolve the issue:
 
-1. **Check GitHub Issues:** https://github.com/sirrobot01/decypharr/issues
+1. **Report a reproducible issue in this fork:** https://github.com/Trifocals3537/decypharr/issues
 2. **Provide:**
-    - Decypharr version (`/version`)
+    - Tessarr version (`/version`)
     - Relevant logs (with `log_level: debug`)
     - Config (sensitive values redacted)
     - Steps to reproduce

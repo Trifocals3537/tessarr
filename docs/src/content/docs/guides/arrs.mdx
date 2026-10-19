@@ -1,12 +1,12 @@
 ---
 title: Connecting Sonarr & Radarr
-description: Configure Arrs to use Decypharr.
+description: Configure Arrs to use Tessarr.
 ---
 
 import sabnzbdImage from '../../../assets/images/sabnzbd.png';
 import qbitImage from '../../../assets/images/qbittorent.png';
 
-Decypharr provides both QBitTorrent and Sabnzbd-compatible APIs for Sonarr, Radarr, and other *Arr applications.
+Tessarr provides both QBitTorrent and Sabnzbd-compatible APIs for Sonarr, Radarr, and other *Arr applications.
 
 ## For Torrents/Debrid: QBitTorrent Client
 
@@ -27,8 +27,8 @@ In Sonarr/Radarr:
 
 | Field | Value |
 |-------|-------|
-| **Name** | Decypharr (Torrents) |
-| **Host** | `decypharr` (or IP) |
+| **Name** | Tessarr (Torrents) |
+| **Host** | `tessarr` (or IP) |
 | **Port** | `8282` |
 | **Username** | Arr's host(`http://sonarr:8989`) |
 | **Password** | Arr's token(gotten from Arr's General -> Token) |
@@ -63,8 +63,8 @@ If you've configured [Usenet providers](../usenet/overview/), add a Sabnzbd clie
 
 | Field | Value |
 |-------|-------|
-| **Name** | Decypharr (Usenet) |
-| **Host** | `decypharr` (or IP) |
+| **Name** | Tessarr (Usenet) |
+| **Host** | `tessarr` (or IP) |
 | **Port** | `8282` |
 | **URL Base** | `/sabnzbd` |
 | **Username** | Arr's host(`http://sonarr:8989`) |
@@ -84,29 +84,29 @@ Add both clients with different priorities to prioritize one source over the oth
 
 You can add **both** download clients to the same Arr:
 
-- **Decypharr (Torrents)** - QBitTorrent client
-- **Decypharr (Usenet)** - Sabnzbd client
+- **Tessarr (Torrents)** - QBitTorrent client
+- **Tessarr (Usenet)** - Sabnzbd client
 
 Set different priorities if you prefer one over the other. Arrs will use the higher-priority client first.
 
 ## Path Mapping
 
-If your Arr and Decypharr are on different systems, configure path mappings.
+If your Arr and Tessarr are on different systems, configure path mappings.
 
 ### Example Setup
 
-- **Decypharr** mount: `/mnt/decypharr`
+- **Tessarr** mount: `/mnt/tessarr`
 - **Sonarr** sees: `/media/tv`
 
 **Path Mapping:**
 ```
-Remote Path: /mnt/decypharr
+Remote Path: /mnt/tessarr
 Local Path: /media/tv
 ```
 
 ## Download Actions
 
-Decypharr supports multiple download actions configured per-Arr or globally:
+Tessarr supports multiple download actions configured per-Arr or globally:
 
 | Action | Description |
 |--------|-------------|
@@ -130,10 +130,21 @@ Set in `config.json`:
 }
 ```
 
+### Relative symlinks
+
+Enable **Settings → Downloader → Relative Symlinks** when the mount and download
+trees keep the same relative layout in every environment that needs to follow the
+links. New Torrent and Usenet links will then store relative targets, which can make
+the library portable between a container and its host or across mount-root changes.
+Absolute links remain the default, and existing links that already resolve to the
+correct file are left unchanged.
+
+The equivalent environment setting is `TESSARR_RELATIVE_SYMLINKS=true`.
+
 ## Queue Cleanup
 
 Sonarr/Radarr queues often get stuck on releases that can't import automatically — failed
-grabs, title mismatches, empty files, and so on. Decypharr watches every connected Arr's
+grabs, title mismatches, empty files, and so on. Tessarr watches every connected Arr's
 **Activity → Queue** and resolves these for you, so they don't pile up and block your library.
 
 You configure this **once, globally** (it is not per-Arr) under
@@ -181,7 +192,7 @@ The raw `queue_cleanup` config shape and the full list of catalog rule IDs are d
 
 ## Auto-Detection
 
-Decypharr can auto-detect Arrs that connect to it:
+Tessarr can auto-detect Arrs that connect to it:
 
 ```json
 {
@@ -202,7 +213,7 @@ Check **Settings** → **Arrs** in the Web UI to see detected instances.
 
 ### Test Connection Fails
 
-1. Verify Decypharr is accessible: `curl http://decypharr:8282/version`
+1. Verify Tessarr is accessible: `curl http://tessarr:8282/version`
 2. Check username/password match config
 3. Ensure no firewall blocking port 8282
 
@@ -215,7 +226,7 @@ Check **Settings** → **Arrs** in the Web UI to see detected instances.
 ```yaml
 # docker-compose.yml
 services:
-  decypharr:
+  tessarr:
     volumes:
       - /mnt/storage:/mnt/storage  # Same path!
   
@@ -226,7 +237,16 @@ services:
 
 ### Uncached Torrents
 
-Enable `download_uncached` per-Arr:
+Uncached policy is resolved per grab in three levels:
+
+1. **Provider policy** — each debrid's own `download_uncached` setting (`realdebrid: false`, `torbox: true` is a common split).
+2. **Per-Arr override (tri-state)** — an Arr's `download_uncached` wins over provider policy when set:
+   - omitted or `null` → inherit provider policy (recommended)
+   - `true` → allow an uncached pass on every provider, after all cached attempts miss
+   - `false` → strictly cached-only for this Arr
+3. **Runtime request flag** — the qBittorrent/API `downloadUncached` parameter, when explicitly `true`, allows uncached for that single grab.
+
+To force an Arr to allow uncached downloads:
 
 ```json
 {
@@ -241,4 +261,8 @@ Enable `download_uncached` per-Arr:
 
 :::caution
 Uncached downloads use Debrid provider's cache slots and may take time to download.
+
+Do not set `download_uncached: false` on an Arr merely to "keep the default" —
+an explicit `false` overrides every provider's own uncached setting, including
+providers configured with `download_uncached: true`. Omit the key to inherit.
 :::

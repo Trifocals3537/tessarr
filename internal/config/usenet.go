@@ -7,6 +7,11 @@ import (
 	"strconv"
 )
 
+// UsenetConnectionLimit bounds every configured concurrency value before it
+// reaches channel or slice allocation. A few hundred concurrent NNTP sockets
+// already exceeds what a single Tessarr process can use responsibly.
+const UsenetConnectionLimit = 256
+
 type UsenetProvider struct {
 	Host           string `json:"host,omitempty"` // Host of the usenet server
 	Port           int    `json:"port,omitempty"` // Port of the usenet server
@@ -46,6 +51,10 @@ type Usenet struct {
 	SocketWriteBuffer string `json:"socket_write_buffer,omitempty"`
 	// Processing timeout
 	ProcessingTimeout string `json:"processing_timeout,omitempty"` // Timeout for NZB processing e.g. "5m", "10m" (default: 10m). Mark as bad if exceeded.
+	// ConnIdleTimeout controls how long an unused pooled NNTP connection stays
+	// warm before it is closed. Idle connections are keepalive-pinged so bursty
+	// playback does not pay for a TCP+TLS+AUTH reconnect on every resume.
+	ConnIdleTimeout string `json:"conn_idle_timeout,omitempty"` // Default: 5m
 	// Availability check sampling
 	AvailabilitySamplePercent       int    `json:"availability_sample_percent,omitempty"`        // Percentage of segments to check during repair (1-100, default: 10)
 	ImportAvailabilitySamplePercent int    `json:"import_availability_sample_percent,omitempty"` // Percentage of segments to check when adding an NZB (1-100, default: 1)
@@ -75,7 +84,7 @@ func (u Usenet) IsZero() bool {
 	return len(u.Providers) == 0 && u.MaxConnections == 0 && u.ProcessingMaxConnections == 0 && u.ReadAhead == "" && u.ProcessingTimeout == ""
 }
 
-func (c *Config) updateUsenetConfig() {
+func (c *Config) updateUsenetConfig(configRoot string) {
 	// Per-stream configuration defaults
 	if c.Usenet.MaxConnections == 0 {
 		c.Usenet.MaxConnections = 15 // Default: 15 connections per file
@@ -118,7 +127,7 @@ func (c *Config) updateUsenetConfig() {
 	}
 
 	if c.Usenet.DiskBufferPath == "" {
-		c.Usenet.DiskBufferPath = filepath.Join(GetMainPath(), "usenet", "streams")
+		c.Usenet.DiskBufferPath = filepath.Join(configRoot, "usenet", "streams")
 	}
 
 	for i, provider := range c.Usenet.Providers {
@@ -136,23 +145,42 @@ func (c *Config) updateUsenetProvider(index int, u UsenetProvider) UsenetProvide
 	if u.Priority == 0 {
 		u.Priority = index + 1 // Default priority based on order
 	}
+	// Auto-enable TLS for ports that only speak implicit TLS.
+	// Users who set port 563 (NNTPS) or 443 without ssl:true get a
+	// plain-TCP connection; the server waits for a TLS ClientHello and
+	// never sends the greeting, causing a 10-second i/o timeout.
+	if !u.SSL && (u.Port == 563 || u.Port == 443) {
+		u.SSL = true
+	}
 	return u
 }
 
-func validateUsenet(providers []UsenetProvider) error {
-	if len(providers) == 0 {
+func validateUsenet(usenet Usenet) error {
+	if len(usenet.Providers) == 0 {
 		return nil
 	}
-	for _, usenet := range providers {
+	if usenet.MaxConnections < 1 || usenet.MaxConnections > UsenetConnectionLimit {
+		return fmt.Errorf("usenet max_connections must be between 1 and %d", UsenetConnectionLimit)
+	}
+	if usenet.ProcessingMaxConnections < 1 || usenet.ProcessingMaxConnections > UsenetConnectionLimit {
+		return fmt.Errorf("usenet processing_max_connections must be between 1 and %d", UsenetConnectionLimit)
+	}
+	for _, provider := range usenet.Providers {
 		// Basic field validation
-		if usenet.Host == "" {
+		if provider.Host == "" {
 			return errors.New("usenet provider host is required")
 		}
-		if usenet.Username == "" {
+		if provider.Username == "" {
 			return errors.New("usenet provider username is required")
 		}
-		if usenet.Password == "" {
+		if provider.Password == "" {
 			return errors.New("usenet provider password is required")
+		}
+		if provider.Port < 1 || provider.Port > 65535 {
+			return fmt.Errorf("usenet provider port must be between 1 and 65535")
+		}
+		if provider.MaxConnections < 1 || provider.MaxConnections > UsenetConnectionLimit {
+			return fmt.Errorf("usenet provider max_connections must be between 1 and %d", UsenetConnectionLimit)
 		}
 	}
 
@@ -190,6 +218,9 @@ func (c *Config) applyUsenetEnvVars() {
 
 	if processingTimeout := getEnv("USENET__PROCESSING_TIMEOUT"); processingTimeout != "" {
 		c.Usenet.ProcessingTimeout = processingTimeout
+	}
+	if idleTimeout := getEnv("USENET__CONN_IDLE_TIMEOUT"); idleTimeout != "" {
+		c.Usenet.ConnIdleTimeout = idleTimeout
 	}
 
 	if availabilitySample := getEnv("USENET__AVAILABILITY_SAMPLE_PERCENT"); availabilitySample != "" {

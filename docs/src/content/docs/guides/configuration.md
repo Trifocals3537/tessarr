@@ -9,48 +9,145 @@ Configuration is stored in `config.json`. Most settings can be managed via the W
 
 ```json
 {
-  "bind_address": "0.0.0.0",
+  "bind_address": "127.0.0.1",
   "port": "8282",
   "url_base": "",
   "app_url": "http://localhost:8282",
+  "allowed_client_cidrs": [],
   "log_level": "info"
 }
 ```
 
-| Field          | Type   | Description                                      | Default       |
-|----------------|--------|--------------------------------------------------|---------------|
-| `bind_address` | string | IP to bind to                                    | `0.0.0.0`     |
-| `port`         | string | Port to listen on                                | `8282`        |
-| `url_base`     | string | Base path for reverse proxy                      | `""`          |
-| `app_url`      | string | External URL for callbacks                       | Auto-detected |
-| `log_level`    | string | Logging level (`debug`, `info`, `warn`, `error`) | `info`        |
+| Field                  | Type   | Description                                                   | Default       |
+|------------------------|--------|---------------------------------------------------------------|---------------|
+| `bind_address`         | string | IP to bind to                                                 | `127.0.0.1`   |
+| `port`                 | string | Port to listen on                                             | `8282`        |
+| `url_base`             | string | Base path for reverse proxy                                   | `""`          |
+| `app_url`              | string | External URL for callbacks                                    | Auto-detected |
+| `allowed_client_cidrs` | array  | TCP peer IP addresses or CIDRs allowed to use the listener     | Allow all     |
+| `log_level`            | string | Logging level (`debug`, `info`, `warn`, `error`)              | `info`        |
+
+`allowed_client_cidrs` applies to every route on the listener, including the
+UI, qBittorrent-compatible API, SABnzbd-compatible API, and WebDAV. It checks
+the actual TCP peer and deliberately ignores `X-Forwarded-For` and similar
+headers. An empty list keeps the backward-compatible allow-all behavior.
+Changing the list requires a restart.
+
+On a shared host, bind directly to the private address assigned to the account
+instead of listening on every interface. Point local automation applications
+and any private HTTPS proxy backend at that same address:
+
+```json
+{
+  "bind_address": "192.0.2.10",
+  "allowed_client_cidrs": [
+    "192.0.2.10/32"
+  ]
+}
+```
+
+`192.0.2.10` is a documentation-only address. Replace it with the private
+address assigned to your account. Test both the proxy and automation
+integrations before removing a working configuration. The single-address
+allowlist remains useful defense in depth if the listener address is changed
+accidentally later.
 
 ## Authentication
 
 ```json
 {
   "use_auth": true,
-  "username": "admin",
-  "password": "$2a$10$...",
-  "api_token": "..."
+  "secure_session_cookie": false
 }
 ```
 
-Password is bcrypt-hashed. API token is auto-generated.
+The username, bcrypt password hash, API token, and session secret are stored
+separately in the private `auth.json` file. Use `--set-auth USERNAME` to set
+credentials without placing a password in shell history.
+
+Set `secure_session_cookie` to `true` when the UI is available only through an
+HTTPS proxy such as Tailscale Serve. Browsers will then refuse to send the UI
+session cookie over plain HTTP. Leave it `false` only when the UI itself must
+be used over a trusted plain-HTTP connection. This setting does not change the
+separate qBittorrent-compatible login cookie used by local Arr clients.
+
+Native installations use the loopback-only bind default so the first-run setup
+wizard is not exposed to the network. The official container image explicitly
+overrides this to `0.0.0.0`; control container access with published ports,
+firewall rules, and a reverse proxy.
+
+After upgrading, an older native configuration that omitted `bind_address`
+also uses `127.0.0.1`. If the service intentionally needs to accept remote
+connections, set a specific trusted interface address (or `0.0.0.0`) in
+`config.json` or with `TESSARR_BIND_ADDRESS`. A non-loopback Tessarr
+listener is plain HTTP; application authentication controls access but does
+not encrypt credentials. Use a trusted network or TLS proxy, and use
+`allowed_client_cidrs` when the underlying port could otherwise be reached
+directly. Normal startup and API configuration updates reject a non-loopback
+listener without application authentication, an invalid client allowlist, or
+an unprotected WebDAV endpoint.
 
 ## Downloads
 
 ```json
 {
-  "max_active_downloads": 5
+  "max_active_downloads": 5,
+  "job_queue_capacity": 256,
+  "refresh_interval": "30s",
+  "remove_stalled_after": "10m",
+  "uncached_stall_timeout": "",
+  "allowed_file_types": ["mkv", "mp4"],
+  "allow_samples": false,
+  "min_file_size": "10MB",
+  "max_file_size": ""
 }
 ```
 
 `max_active_downloads` is the shared active-processing limit for torrent and NZB downloads. Additional imports remain queued until an active download completes.
 
+`job_queue_capacity` bounds all reserved, waiting, active, and delayed-retry
+imports. New qBittorrent and SABnzbd requests receive a retryable overload
+response when the bound is reached. Values above `4096` are clamped.
+
+| Field                    | Type   | Description                                                                        | Default       |
+|--------------------------|--------|------------------------------------------------------------------------------------|---------------|
+| `max_active_downloads`   | int    | Shared active-processing limit                                                     | `5`           |
+| `job_queue_capacity`     | int    | Total admitted import limit (maximum `4096`)                                       | `256`         |
+| `refresh_interval`       | string | Provider status polling interval                                                   | `30s`         |
+| `remove_stalled_after`   | string | Legacy cleanup interval for inactive zero-progress queue items                     | `10m`         |
+| `uncached_stall_timeout` | string | Maximum no-progress wait for uncached Arr replacement; empty disables it           | `""`          |
+| `allowed_file_types`     | array  | Extensions eligible for import                                                     | Media formats |
+| `allow_samples`          | bool   | Include files identified as samples                                                | `false`       |
+| `min_file_size`          | string | Minimum eligible file size                                                         | `""`          |
+| `max_file_size`          | string | Maximum eligible file size; empty is unlimited                                     | `""`          |
+
+`uncached_stall_timeout` applies only to transfers that Tessarr knowingly
+started through an uncached provider pass. A successful provider poll must
+first establish a progress baseline. Tessarr then requires both no progress
+for the configured duration and zero provider-reported transfer speed before it
+considers an ordinary transfer stalled. An explicit no-seeds state can use a
+shorter `10m` wait; a metadata-download (`metaDL`) state can use `20m`. The
+configured timeout remains a maximum for these states. Every handoff needs two
+matching fresh provider checks at least 30 seconds apart, so a resumed transfer
+or a changed state is retained. The minimum configured timeout is `10m`;
+invalid or shorter values disable the watchdog instead of risking premature
+removal. A restart discards a pending confirmation, not the progress baseline.
+
+For a configured Arr category, Tessarr resolves the exact torrent hash to one
+Sonarr/Radarr queue row, asks the Arr to remove and blocklist that release, and
+allows its normal failed-download handling to search for a replacement. An
+ambiguous hash or a category without an Arr owner is left untouched for manual
+review. Provider/API errors are never interpreted as stalls, and cached
+transfers are never eligible.
+
 ## Debrid Providers
 
-Array of Debrid services:
+Array of Debrid services. When an Arr does not set `selected_debrid`, providers
+are tried in this array order. Tessarr makes one cached-only pass over every
+eligible provider before it permits any uncached transfer. If every cached pass
+misses, only providers with `download_uncached: true` enter a second pass, in
+the same configured order. Provider/API failures remain errors and do not count
+as cache misses.
 
 ```json
 {
@@ -79,10 +176,10 @@ Array of Debrid services:
 | Field                             | Type   | Description                                                                    | Default                         |
 |-----------------------------------|--------|--------------------------------------------------------------------------------|---------------------------------|
 | `provider`                        | string | Provider type: `realdebrid`, `alldebrid`, `debridlink`, `torbox`, `premiumize` | **Required**                    |
-| `name`                            | string | Display name                                                                   | Provider type                   |
+| `name`                            | string | Unique provider instance key and mount-folder name                             | Provider type                   |
 | `api_key`                         | string | API key from provider dashboard                                                | **Required**                    |
 | `download_api_keys`               | array  | Additional keys for download rotation                                          | `[api_key]`                     |
-| `download_uncached`               | bool   | Download torrents not in provider cache                                        | `false`                         |
+| `download_uncached`               | bool   | Permit this provider in the uncached pass after all eligible providers miss     | `false`                         |
 | `rate_limit`                      | string | API rate limit (`200/minute`, `10/second`)                                     | `200/minute`                    |
 | `repair_rate_limit`               | string | Separate limit for repair operations                                           | Same as `rate_limit`            |
 | `download_rate_limit`             | string | Separate limit for downloads                                                   | Same as `rate_limit`            |
@@ -160,7 +257,7 @@ Mount configuration determines how files are exposed on the filesystem.
 {
   "mount": {
     "type": "dfs",
-    "mount_path": "/mnt/decypharr"
+    "mount_path": "/mnt/tessarr"
   }
 }
 ```
@@ -178,7 +275,7 @@ Mount configuration determines how files are exposed on the filesystem.
 {
   "mount": {
     "type": "dfs",
-    "mount_path": "/mnt/decypharr",
+    "mount_path": "/mnt/tessarr",
     "dfs": {
       "cache_dir": "/cache/dfs",
       "chunk_size": "10MB",
@@ -214,7 +311,7 @@ Mount configuration determines how files are exposed on the filesystem.
 {
   "mount": {
     "type": "rclone",
-    "mount_path": "/mnt/decypharr",
+    "mount_path": "/mnt/tessarr",
     "rclone": {
       "cache_dir": "/cache/rclone",
       "vfs_cache_mode": "writes",
@@ -259,6 +356,44 @@ Mount configuration determines how files are exposed on the filesystem.
 
 Connect to an existing Rclone instance's RC API.
 
+## STRM Library
+
+The optional STRM library exposes completed debrid and Usenet entries without a
+filesystem mount. It can run with any mount setting, including `mount.type:
+"none"`.
+
+```json
+{
+  "app_url": "https://tessarr.example.net",
+  "strm": {
+    "enabled": true,
+    "path": "/srv/media-strm",
+    "delivery_mode": "proxy",
+    "keep_media_extension": false
+  }
+}
+```
+
+| Field                  | Description                                                       | Default |
+|------------------------|-------------------------------------------------------------------|---------|
+| `enabled`              | Maintain the mountless export                                     | `false` |
+| `path`                 | Dedicated directory containing generated `.strm` files            | —       |
+| `delivery_mode`        | `proxy`, or `redirect` for eligible debrid streams                | `proxy` |
+| `keep_media_extension` | Write `Movie.mkv.strm` instead of `Movie.strm`                    | `false` |
+
+`app_url` must be reachable by the media server. When it is empty,
+Tessarr writes its configured listener address and substitutes loopback for
+an unspecified listener. That fallback is appropriate only when the player
+runs on the same host.
+
+Tessarr generates and persists a 256-bit signing key when STRM is first
+configured. The key is redacted from the configuration API and is never shown
+in the Web UI. Changing it invalidates existing `.strm` URLs; use a new empty
+export directory if deliberate key rotation is required.
+
+See the [STRM Library guide](../mounting/strm/) for media-server setup,
+delivery choices, and ownership safeguards.
+
 ## Health Checker
 
 ```json
@@ -290,7 +425,7 @@ Connect to an existing Rclone instance's RC API.
 | `skip_nzb_repair`         | Skip NZB / Usenet entries during scheduled repair sweeps                   | `false`     |
 | `nntp_connection_percent` | Share of NNTP connections probes may use, to avoid starving downloads      | `20`        |
 
-See the [Health Checker & Repair guide](/guides/repair/) for the full model, API, and Browse-page integration.
+See the [Health Checker & Repair guide](../repair/) for the full model, API, and Browse-page integration.
 
 ## Arr Configuration
 
@@ -302,7 +437,6 @@ See the [Health Checker & Repair guide](/guides/repair/) for the full model, API
       "host": "http://sonarr:8989",
       "token": "API_TOKEN",
       "skip_repair": false,
-      "download_uncached": false,
       "selected_debrid": ""
     }
   ]
@@ -315,13 +449,21 @@ See the [Health Checker & Repair guide](/guides/repair/) for the full model, API
 | `host`              | Arr URL                          | Required    |
 | `token`             | Arr API key                      | Required    |
 | `skip_repair`       | Skip repair for this Arr         | `false`     |
-| `download_uncached` | Download uncached torrents       | `false`     |
-| `selected_debrid`   | Force specific Debrid provider   | `""` (auto) |
+| `download_uncached` | Tri-state per-Arr override of provider uncached policy. Omitted/null = inherit each provider's own `download_uncached` setting; `true` = allow an uncached pass for every provider after all cached attempts miss; `false` = strictly cached-only for this Arr | omitted (inherit) |
+| `selected_debrid`   | Exact `name` of a Debrid instance | `""` (auto) |
 | `source`            | Config source (`auto`, `config`) | `config`    |
+
+:::tip
+Leave `download_uncached` unset on the Arr unless you deliberately want to
+override provider policy. The most common misconfiguration is setting it to
+`false` on an Arr whose TorBox provider allows uncached fallback — an explicit
+`false` wins over the provider setting and silently disables the fallback for
+every grab from that Arr.
+:::
 
 ## Queue Cleanup
 
-Decypharr periodically scans each connected Arr's **Activity → Queue** and acts on stuck or
+Tessarr periodically scans each connected Arr's **Activity → Queue** and acts on stuck or
 failed downloads based on a global, rules-driven policy. This is configured once (not per-Arr)
 under **Settings → Arrs → Queue Cleanup Actions** in the Web UI, and stored in the
 `queue_cleanup` block of `config.json`. See the [Arrs guide](../arrs/#queue-cleanup) for a
@@ -379,6 +521,7 @@ All config options support environment variable overrides using double underscor
 # Server
 PORT=8282
 LOG_LEVEL=debug
+TESSARR_JOB_QUEUE_CAPACITY=256
 
 # Debrid
 DEBRIDS__0__PROVIDER=realdebrid
@@ -399,4 +542,4 @@ REPAIR__ENABLED=true
 REPAIR__INTERVAL=30m
 ```
 
-See [defaults.go](https://github.com/sirrobot01/decypharr/blob/main/internal/config/defaults.go) for all defaults.
+See [defaults.go](https://github.com/Trifocals3537/decypharr/blob/beta/internal/config/defaults.go) for all defaults.

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package storage;
 
-option go_package = "github.com/sirrobot01/decypharr/pkg/storage";
+option go_package = "github.com/Trifocals3537/tessarr/pkg/storage";
 
 // ============================================================================
 // File and Provider Types
@@ -18,6 +18,7 @@ message FileProto {
   bool has_byte_range = 7;
   bool deleted = 8;
   string info_hash = 9;
+  string id = 10;
 }
 
 message ProviderFileProto {
@@ -91,6 +92,25 @@ message EntryProto {
   int32 error_count = 37;
   int64 last_error_time_unix = 38;
   bool has_last_error_time = 39;
+
+  // Opaque durable identity for one queue-row incarnation. Main-entry
+  // lifecycle authorization remains transient and is never serialized.
+  string queue_incarnation = 40;
+  // Local torrent output component. Empty preserves the legacy title layout.
+  string output_name = 41;
+  // Last successful provider observation. This is separate from updated_at,
+  // which advances on every durable queue write.
+  int64 last_observed_at_unix = 42;
+  bool has_last_observed_at = 43;
+  // Last time provider progress changed. A successful poll with unchanged
+  // progress must not refresh this timestamp.
+  int64 last_progress_at_unix = 44;
+  bool has_last_progress_at = 45;
+  // Originating qBittorrent endpoint and durable failure evidence. Field
+  // numbers are append-only so existing queue records remain readable.
+  string client_endpoint = 46;
+  int32 terminal_checks = 47;
+  string handoff_reason = 48;
 }
 
 // ============================================================================

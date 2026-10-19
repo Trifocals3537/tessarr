@@ -1,7 +1,12 @@
 {{ define "login" }}
 <div class="flex min-h-screen items-center justify-center bg-base-200">
-    <div class="card w-full max-w-sm bg-base-100 shadow-xl">
+    <div class="card tessarr-card w-full max-w-sm bg-base-100">
         <div class="card-body">
+			<div class="mb-2 flex flex-col items-center gap-2 text-center">
+				<img src="{{.URLBase}}images/logo.png" alt="Tessarr" class="h-20 w-20">
+				<p class="tessarr-kicker">Tessarr</p>
+				<p class="text-sm opacity-70">Many sources. One library.</p>
+			</div>
             <h2 class="card-title justify-center mb-6">Login</h2>
             <form id="loginForm" class="space-y-4">
                 <div>
@@ -35,7 +40,7 @@
         };
 
         try {
-            const response = await window.decypharrUtils.fetcher('/login', {
+            const response = await window.tessarrUtils.fetcher('/login', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -44,7 +49,7 @@
             });
 
             if (response.ok) {
-                window.decypharrUtils.createToast('Login successful! Redirecting...', 'success');
+                window.tessarrUtils.createToast('Login successful! Redirecting...', 'success');
 
                 // Redirect after a short delay
                 setTimeout(() => {
@@ -56,9 +61,9 @@
             }
         } catch (error) {
             console.error('Login error:', error);
-            window.decypharrUtils.createToast(error.message || 'Login failed. Please try again.', 'error');
+            window.tessarrUtils.createToast(error.message || 'Login failed. Please try again.', 'error');
         } finally {
-            window.decypharrUtils.setButtonLoading(loginBtn, false);
+            window.tessarrUtils.setButtonLoading(loginBtn, false);
         }
     });
 </script>

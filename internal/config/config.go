@@ -6,15 +6,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
-	"sync"
+	"unicode"
 
 	json "github.com/bytedance/sonic"
+
+	"github.com/Trifocals3537/tessarr/internal/safepath"
 )
+
+const maxConfigurationFileBytes = 4 << 20
 
 type (
 	WebDavFolderNaming string
@@ -51,11 +56,12 @@ const (
 	WebdavUseHash              WebDavFolderNaming = "infohash"
 )
 
-var (
-	instance   *Config
-	once       sync.Once
-	configPath string
+const (
+	DefaultJobQueueCapacity = 256
+	MaxJobQueueCapacity     = 4096
 )
+
+var configPath string
 
 // QBitTorrent is deprecated. Use Manager instead.
 // Kept for backward compatibility with existing configs.
@@ -174,9 +180,11 @@ type CustomFolders struct {
 }
 
 type Auth struct {
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	APIToken string `json:"api_token,omitempty"`
+	Username       string `json:"username,omitempty"`
+	Password       string `json:"password,omitempty"`
+	APIToken       string `json:"api_token,omitempty"`
+	SessionSecret  string `json:"session_secret,omitempty"`
+	SessionVersion uint64 `json:"session_version,omitempty"`
 }
 
 // RepairSource selects where the health checker enumerates entries from.
@@ -201,12 +209,21 @@ type RepairConfig struct {
 	Arrs                  []string     `json:"arrs,omitempty"`
 	AutoRepair            bool         `json:"auto_repair,omitempty"`
 	SkipNZBRepair         bool         `json:"skip_nzb_repair,omitempty"`
+
+	// StopSchedule, when set, stops an in-progress repair sweep at this time/interval
+	// (same formats as Schedule: clock time, cron expression, or duration).
+	// A repair sweep still running when StopSchedule fires is cancelled before it
+	// finishes enumerating/probing every candidate. Empty disables the stop
+	// schedule entirely - the repair sweep always runs to completion. When a stop
+	// fires mid-repair-sweep, AutoRepair decides what happens to whatever was
+	// already found broken: repaired if true, left alone if false.
+	StopSchedule string `json:"stop_schedule,omitempty"`
 }
 
 func (r RepairConfig) IsZero() bool {
 	return !r.Enabled && r.Source == "" && r.Schedule == "" && r.Workers == 0 &&
 		r.NNTPConnectionPercent == 0 && r.Strategy == "" && r.RecheckInterval == "" && len(r.Arrs) == 0 &&
-		!r.AutoRepair && !r.SkipNZBRepair
+		!r.AutoRepair && !r.SkipNZBRepair && r.StopSchedule == ""
 }
 
 type Config struct {
@@ -215,6 +232,10 @@ type Config struct {
 	URLBase     string `json:"url_base,omitempty"`
 	AppURL      string `json:"app_url,omitempty"`
 	Port        string `json:"port,omitempty"`
+	// AllowedClientCIDRs restricts the single HTTP listener by the TCP peer
+	// address. An empty list preserves the historical allow-all behavior.
+	// Reverse-proxy headers are intentionally ignored.
+	AllowedClientCIDRs []string `json:"allowed_client_cidrs,omitempty"`
 
 	LogLevel string   `json:"log_level,omitempty"`
 	Debrids  []Debrid `json:"debrids,omitzero"`
@@ -224,16 +245,19 @@ type Config struct {
 	QBitTorrent QBitTorrent `json:"qbittorrent,omitzero"` // Deprecated: use Manager instead
 	Rclone      Rclone      `json:"rclone,omitzero"`      // Deprecated: use Mounts instead
 	Mount       Mount       `json:"mount,omitzero"`
+	Strm        Strm        `json:"strm,omitzero"`
 
-	AllowedExt         []string `json:"allowed_file_types,omitempty"`
-	AllowSamples       bool     `json:"allow_samples,omitempty"`
-	MinFileSize        string   `json:"min_file_size,omitempty"`
-	MaxFileSize        string   `json:"max_file_size,omitempty"`
-	RemoveStalledAfter string   `json:"remove_stalled_after,omitzero"`
-	EnableWebdavAuth   bool     `json:"enable_webdav_auth,omitempty"`
-	UseAuth            bool     `json:"use_auth,omitempty"`
-	NZBUserAgent       string   `json:"nzb_user_agent,omitempty"` // User agent for downloading NZBs
-	Auth               *Auth    `json:"-"`
+	AllowedExt           []string `json:"allowed_file_types,omitempty"`
+	AllowSamples         bool     `json:"allow_samples,omitempty"`
+	MinFileSize          string   `json:"min_file_size,omitempty"`
+	MaxFileSize          string   `json:"max_file_size,omitempty"`
+	RemoveStalledAfter   string   `json:"remove_stalled_after,omitzero"`
+	UncachedStallTimeout string   `json:"uncached_stall_timeout,omitempty"`
+	EnableWebdavAuth     bool     `json:"enable_webdav_auth,omitempty"`
+	UseAuth              bool     `json:"use_auth,omitempty"`
+	SecureSessionCookie  bool     `json:"secure_session_cookie,omitempty"`
+	NZBUserAgent         string   `json:"nzb_user_agent,omitempty"` // User agent for downloading NZBs
+	Auth                 *Auth    `json:"-"`
 
 	DisableWebDav bool `json:"disable_webdav,omitempty"`
 
@@ -249,9 +273,11 @@ type Config struct {
 	DownloadFolder        string                   `json:"download_folder,omitempty"`
 	RefreshInterval       string                   `json:"refresh_interval,omitempty"`
 	MaxActiveDownloads    int                      `json:"max_active_downloads,omitempty"`
+	JobQueueCapacity      int                      `json:"job_queue_capacity,omitempty"`
 	SkipPreCache          bool                     `json:"skip_pre_cache,omitempty"`
 	SkipMultiSeason       bool                     `json:"skip_multi_season,omitempty"`
 	AlwaysRmTrackerUrls   bool                     `json:"always_rm_tracker_urls,omitempty"`
+	RelativeSymlinks      bool                     `json:"relative_symlinks,omitempty"`
 	Categories            []string                 `json:"categories,omitempty"`
 	FolderNaming          WebDavFolderNaming       `json:"folder_naming,omitempty"`
 	CustomFolders         map[string]CustomFolders `json:"custom_folders,omitempty"`
@@ -282,40 +308,109 @@ func (c *Config) loadConfig() error {
 	// Load the config file
 	// Read the JSON config file directly
 	configFile := c.JsonFile()
-	fmt.Printf("Loading config from %s\n", configFile)
-	data, err := os.ReadFile(configFile)
+	fmt.Println("Loading configuration")
+	data, err := safepath.ReadRegularFile(configFile, maxConfigurationFileBytes)
 	if err != nil {
-		if os.IsNotExist(err) {
-			fmt.Printf("Config file not found, creating a new one at %s\n", configFile)
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Println("Configuration file not found; creating a default configuration")
 			// Create a default config file if it doesn't exist
 			if err := c.createConfig(); err != nil {
 				return fmt.Errorf("failed to create config file: %w", err)
 			}
-			return c.Save()
+			if err := c.Save(); err != nil {
+				return err
+			}
+			// Environment overrides are runtime settings and should take effect
+			// on the first launch as well as subsequent launches. This is
+			// especially important for the container image, which deliberately
+			// opts into listening beyond the native loopback-only default.
+			c.applyEnvOverrides()
+			return nil
 		}
 		return fmt.Errorf("error reading config file: %w", err)
+	}
+	if err := safepath.ChmodRegularFile(configFile, privateFileMode); err != nil {
+		return fmt.Errorf("secure config file permissions: %w", err)
 	}
 
 	// Parse JSON
 	if err := json.Unmarshal(data, &c); err != nil {
 		return fmt.Errorf("error parsing config JSON: %w", err)
 	}
+	hadStrmSecret := c.Strm.Secret != ""
 
 	// Set defaults for any missing values
-	c.setDefaults()
+	if err := c.setDefaults(); err != nil {
+		return err
+	}
 
 	// Apply environment variable overrides
 	c.applyEnvOverrides()
+	if !hadStrmSecret && c.Strm.Secret != "" {
+		// Persist the generated key immediately. Otherwise a restart would
+		// invalidate every signed URL already written to the STRM library.
+		if err := c.Save(); err != nil {
+			return fmt.Errorf("persist STRM signing secret: %w", err)
+		}
+	}
 
 	return nil
 }
 
+// LoadForValidation reads and normalizes an existing configuration without
+// creating files, generating credentials, or updating the process-wide
+// configuration singleton.
+func LoadForValidation(path string) (*Config, error) {
+	var err error
+	path, err = safepath.ValidateRoot(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid configuration root: %w", err)
+	}
+	configFile := filepath.Join(path, "config.json")
+	data, err := safepath.ReadRegularFile(configFile, maxConfigurationFileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read config file %s: %w", configFile, err)
+	}
+
+	cfg := &Config{}
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config file %s: %w", configFile, err)
+	}
+
+	if err := cfg.setDefaultsForPath(path, false); err != nil {
+		return nil, err
+	}
+	auth, err := readAuthFile(filepath.Join(path, "auth.json"), false)
+	if err == nil {
+		cfg.Auth = auth
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	cfg.applyEnvOverrides()
+	return cfg, nil
+}
+
 func (c *Config) Validate() error {
-	if err := validateDebrids(c.Debrids); err != nil {
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "", "trace", "debug", "info", "warn", "warning", "error":
+	default:
+		return fmt.Errorf("unsupported log level %q", c.LogLevel)
+	}
+	if err := validateURLBase(c.URLBase); err != nil {
 		return err
 	}
 
-	if err := validateUsenet(c.Usenet.Providers); err != nil {
+	if err := validateDebrids(c.Debrids); err != nil {
+		return err
+	}
+	if err := validateMountNamespace(c.Debrids, c.CustomFolders); err != nil {
+		return err
+	}
+	if err := validateArrDebridSelections(c.Arrs, c.Debrids); err != nil {
+		return err
+	}
+
+	if err := validateUsenet(c.Usenet); err != nil {
 		return err
 	}
 
@@ -327,7 +422,35 @@ func (c *Config) Validate() error {
 	if len(c.Debrids) == 0 && len(c.Usenet.Providers) == 0 {
 		return errors.New("at least one debrid provider or usenet provider must be configured")
 	}
+	if err := c.Strm.Validate(c.AppURL); err != nil {
+		return err
+	}
 
+	return nil
+}
+
+func validateURLBase(value string) error {
+	if value == "" {
+		return nil
+	}
+	if !strings.HasPrefix(value, "/") || strings.HasPrefix(value, "//") {
+		return errors.New("url_base must be a root-relative path")
+	}
+	if strings.ContainsAny(value, "\\?#") || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return errors.New("url_base contains an unsafe character")
+	}
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("url_base must contain only a local path")
+	}
+	if strings.ContainsRune(parsed.Path, '\\') || strings.IndexFunc(parsed.Path, unicode.IsControl) >= 0 {
+		return errors.New("url_base contains an unsafe escaped character")
+	}
+	for _, component := range strings.Split(parsed.Path, "/") {
+		if component == "." || component == ".." {
+			return errors.New("url_base contains a traversal component")
+		}
+	}
 	return nil
 }
 
@@ -338,25 +461,6 @@ func generateAPIToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(bytes), nil
-}
-
-func SetConfigPath(path string) {
-	configPath = path
-}
-
-func GetMainPath() string {
-	return configPath
-}
-
-func Get() *Config {
-	once.Do(func() {
-		instance = &Config{} // Initialize instance first
-		if err := instance.loadConfig(); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "configuration Error: %v\n", err)
-			os.Exit(1)
-		}
-	})
-	return instance
 }
 
 func (c *Config) GetMinFileSize() int64 {
@@ -384,7 +488,65 @@ func (c *Config) GetMaxFileSize() int64 {
 }
 
 func (c *Config) SecretKey() string {
-	return cmp.Or(getEnv("SECRET_KEY"), "\"wqj(v%lj*!-+kf@4&i95rhh_!5_px5qnuwqbr%cjrvrozz_r*(\"")
+	if secret := getEnv("SECRET_KEY"); secret != "" {
+		return secret
+	}
+
+	auth, err := c.loadAuth()
+	if err != nil {
+		panic(err)
+	}
+	if auth.SessionSecret == "" {
+		secret, err := generateAPIToken()
+		if err != nil {
+			panic(fmt.Errorf("generate session secret: %w", err))
+		}
+		auth.SessionSecret = secret
+		if err := c.saveAuth(auth); err != nil {
+			panic(fmt.Errorf("persist session secret: %w", err))
+		}
+	}
+	return auth.SessionSecret
+}
+
+func (c *Config) loadAuth() (*Auth, error) {
+	if c.Auth != nil {
+		return c.Auth, nil
+	}
+
+	authFile := c.AuthFile()
+	auth, err := readAuthFile(authFile, true)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			c.Auth = &Auth{}
+			return c.Auth, nil
+		}
+		return nil, err
+	}
+	c.Auth = auth
+	return c.Auth, nil
+}
+
+func readAuthFile(authFile string, securePermissions bool) (*Auth, error) {
+	data, err := safepath.ReadRegularFile(authFile, maxConfigurationFileBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read auth config %s: %w", authFile, err)
+	}
+	if securePermissions {
+		if err := safepath.ChmodRegularFile(authFile, privateFileMode); err != nil {
+			return nil, fmt.Errorf("secure auth config permissions: %w", err)
+		}
+	}
+
+	trimmed := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, fmt.Errorf("parse auth config %s: expected a JSON object", authFile)
+	}
+	auth := &Auth{}
+	if err := json.Unmarshal(data, auth); err != nil {
+		return nil, fmt.Errorf("parse auth config %s: %w", authFile, err)
+	}
+	return auth, nil
 }
 
 func (c *Config) GetAuth() *Auth {
@@ -392,24 +554,22 @@ func (c *Config) GetAuth() *Auth {
 		return nil
 	}
 	if c.Auth == nil {
-		c.Auth = &Auth{}
-		if _, err := os.Stat(c.AuthFile()); err == nil {
-			file, err := os.ReadFile(c.AuthFile())
-			if err == nil {
-				_ = json.Unmarshal(file, c.Auth)
-			}
-		}
+		return nil
 	}
-	return c.Auth
+	// Never expose the auth object owned by an active snapshot. Returning a
+	// defensive copy prevents token refresh or request handlers from racing
+	// with readers by mutating credentials in place.
+	auth := *c.Auth
+	return &auth
 }
 
-func (c *Config) SaveAuth(auth *Auth) error {
+func (c *Config) saveAuth(auth *Auth) error {
 	c.Auth = auth
 	data, err := json.Marshal(auth)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(c.AuthFile(), data, 0644)
+	return persistAuth(c.AuthFile(), data)
 }
 
 func (c *Config) NeedsAuth() bool {
@@ -418,7 +578,7 @@ func (c *Config) NeedsAuth() bool {
 
 // migrateQBitTorrentToManager migrates deprecated QBitTorrent config to Manager
 // This ensures backward compatibility with existing configs
-func (c *Config) migrateQBitTorrentToManager() {
+func (c *Config) migrateQBitTorrentToManager(configRoot string) {
 	// If Manager fields are not set but QBitTorrent fields are, migrate them
 	if c.DownloadFolder == "" && c.QBitTorrent.DownloadFolder != "" {
 		c.DownloadFolder = c.QBitTorrent.DownloadFolder
@@ -442,7 +602,7 @@ func (c *Config) migrateQBitTorrentToManager() {
 
 	// Set default download folder if not set
 	if c.DownloadFolder == "" {
-		c.DownloadFolder = filepath.Join(GetMainPath(), "downloads")
+		c.DownloadFolder = filepath.Join(configRoot, "downloads")
 	}
 
 	// Set default categories if not set
@@ -477,10 +637,24 @@ func (c *Config) migrateNotifications() {
 	}
 }
 
-func (c *Config) setDefaults() {
+func (c *Config) setDefaults() error {
+	return c.setDefaultsForPath(GetMainPath(), true)
+}
+
+func (c *Config) setDefaultsForPath(configRoot string, initializeAuth bool) error {
 	// Migrate deprecated fields to Manager (backward compatibility)
-	c.migrateQBitTorrentToManager()
+	c.migrateQBitTorrentToManager(configRoot)
 	c.migrateNotifications()
+
+	if c.BindAddress == "" {
+		c.BindAddress = DefaultBindAddress
+	}
+	if c.Port == "" {
+		c.Port = DefaultPort
+	}
+	if c.LogLevel == "" {
+		c.LogLevel = DefaultLogLevel
+	}
 
 	if c.DefaultDownloadAction == "" {
 		c.DefaultDownloadAction = DownloadActionSymlink
@@ -488,13 +662,20 @@ func (c *Config) setDefaults() {
 	if c.MaxActiveDownloads <= 0 {
 		c.MaxActiveDownloads = 5
 	}
+	switch {
+	case c.JobQueueCapacity <= 0:
+		c.JobQueueCapacity = DefaultJobQueueCapacity
+	case c.JobQueueCapacity > MaxJobQueueCapacity:
+		c.JobQueueCapacity = MaxJobQueueCapacity
+	}
 
 	for i, debrid := range c.Debrids {
 		c.Debrids[i] = c.updateDebrid(debrid)
 	}
+	normalizeArrDebridSelections(c.Arrs, c.Debrids)
 
 	// Set usenet defaults
-	c.updateUsenetConfig()
+	c.updateUsenetConfig(configRoot)
 
 	firstDebrid := Debrid{}
 	if len(c.Debrids) > 0 {
@@ -543,6 +724,9 @@ func (c *Config) setDefaults() {
 	}
 
 	c.QueueCleanup.Rules = mergeQueueCleanupRules(c.QueueCleanup.Rules)
+	if err := c.setStrmDefaults(initializeAuth); err != nil {
+		return err
+	}
 
 	// Basic defaults
 	if c.URLBase == "" {
@@ -620,19 +804,14 @@ func (c *Config) setDefaults() {
 			}
 		}
 	}
-	// Load the auth file
-	c.Auth = c.GetAuth()
-
-	// Generate API token if auth is enabled and no token exists
-	if c.UseAuth {
-		if c.Auth == nil {
-			c.Auth = &Auth{}
+	if initializeAuth {
+		authChanged, err := c.materializeAuthDefaults()
+		if err != nil {
+			return err
 		}
-		if c.Auth.APIToken == "" {
-			if token, err := generateAPIToken(); err == nil {
-				c.Auth.APIToken = token
-				// Save the updated auth config
-				_ = c.SaveAuth(c.Auth)
+		if authChanged {
+			if err := c.saveAuth(c.Auth); err != nil {
+				return fmt.Errorf("persist auth defaults: %w", err)
 			}
 		}
 	}
@@ -643,6 +822,36 @@ func (c *Config) setDefaults() {
 	}
 
 	c.applyRepairDefaults()
+	return nil
+}
+
+// materializeAuthDefaults generates credentials in memory. Update calls this
+// before hashing its restart transaction; Save persists the same values later.
+func (c *Config) materializeAuthDefaults() (bool, error) {
+	// Always initialize a private signing key, even while auth is disabled.
+	// Read-only validation deliberately does not call this helper.
+	auth, err := c.loadAuth()
+	if err != nil {
+		return false, err
+	}
+	changed := false
+	if auth.SessionSecret == "" {
+		secret, err := generateAPIToken()
+		if err != nil {
+			return false, fmt.Errorf("generate session secret: %w", err)
+		}
+		auth.SessionSecret = secret
+		changed = true
+	}
+	if c.UseAuth && auth.APIToken == "" {
+		token, err := generateAPIToken()
+		if err != nil {
+			return false, fmt.Errorf("generate API token: %w", err)
+		}
+		auth.APIToken = token
+		changed = true
+	}
+	return changed, nil
 }
 
 func (c *Config) applyRepairDefaults() {
@@ -665,21 +874,17 @@ func (c *Config) applyRepairDefaults() {
 }
 
 func (c *Config) Save() error {
-	c.setDefaults()
+	if err := c.setDefaults(); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(c.JsonFile(), data, 0644); err != nil {
-		fmt.Printf("Failed to write config file: %v\n", err)
+	if err := persistConfig(c.JsonFile(), data); err != nil {
 		return err
 	}
 	return nil
-}
-
-func Reset() {
-	once = sync.Once{}
-	instance = nil
 }
 
 // clearHotFields zeroes every field that can be applied at runtime without a
@@ -693,48 +898,29 @@ func clearHotFields(c *Config) {
 	// Auth lives in auth.json and is preserved separately by the caller.
 	c.Auth = nil
 
-	// AppURL is only read live (e.g. STRM URL generation in the downloader);
-	// it is never cached in a service struct, so it applies without a restart.
-	c.AppURL = ""
-
 	// Auth toggles are evaluated live per-request by every auth middleware
 	// (main app, qbit, sabnzbd, and webdav), so they apply without a restart.
 	c.UseAuth = false
 	c.EnableWebdavAuth = false
 
-	// Manager / processing settings — read live via config.Get() on the
-	// relevant code paths, or applied lazily on the next natural restart.
+	// The logger core owns a process-wide atomic level filter, so existing
+	// component loggers observe changes without being rebuilt.
+	c.LogLevel = ""
+
+	// Arr state has an explicit post-publish synchronization hook in the HTTP
+	// configuration handler.
 	c.Arrs = nil
-	c.AllowedExt = nil
-	c.AllowSamples = false
-	c.MinFileSize = ""
-	c.MaxFileSize = ""
-	c.RemoveStalledAfter = ""
-	c.NZBUserAgent = ""
-	c.Notifications = Notifications{}
-	c.DiscordWebhook = ""
-	c.CallbackURL = ""
-	c.DownloadFolder = ""
-	c.RefreshInterval = ""
-	c.MaxActiveDownloads = 0
-	c.SkipPreCache = false
-	c.SkipMultiSeason = false
-	c.AlwaysRmTrackerUrls = false
-	c.Categories = nil
-	c.FolderNaming = ""
-	c.CustomFolders = nil
-	c.DefaultDownloadAction = ""
-	c.RefreshDirs = ""
-	c.Retries = 0
-	c.SkipAutoMove = false
+
+	// RelativeSymlinks is consulted when each new link is created and does not
+	// alter existing links or a long-lived worker.
+	c.RelativeSymlinks = false
+
+	// Repair owns an explicit ApplyConfig hook after publication.
 	c.Repair = RepairConfig{}
 
 	// Queue cleanup rules are read live via config.Get() inside CleanupQueue,
 	// so changes apply on the next cleanup cycle without a restart.
 	c.QueueCleanup = QueueCleanup{}
-
-	// Deprecated, migrated into Manager fields above.
-	c.QBitTorrent = QBitTorrent{}
 
 	// Usenet is mostly cold (providers, connection pool sizing, socket buffers,
 	// and the streaming buffer pool are all established at startup). But the
@@ -743,13 +929,31 @@ func clearHotFields(c *Config) {
 	// a restart. Everything else in Usenet stays restart-required.
 	c.Usenet.AvailabilitySamplePercent = 0
 	c.Usenet.ImportAvailabilitySamplePercent = 0
+
+	// Settings for an inactive mount backend do not affect the running
+	// process. The settings form preserves all backend sections so users can
+	// switch later, but edits/defaults in those dormant sections must not turn
+	// an otherwise live or no-op update into a disruptive restart.
+	switch c.Mount.Type {
+	case MountTypeDFS:
+		c.Mount.Rclone = Rclone{}
+		c.Mount.ExternalRclone = ExternalRclone{}
+	case MountTypeRclone:
+		c.Mount.DFS = DFS{}
+		c.Mount.ExternalRclone = ExternalRclone{}
+	case MountTypeExternalRclone:
+		c.Mount.DFS = DFS{}
+		c.Mount.Rclone = Rclone{}
+	case MountTypeNone, "":
+		c.Mount = Mount{Type: MountTypeNone}
+	}
 }
 
 // RequiresRestart reports whether applying n on top of c needs a full service
 // restart (re-binding the HTTP listener, recreating debrid/usenet clients, or
 // re-mounting the filesystem). It returns false when only runtime-applicable
-// ("hot") fields changed, in which case the caller can use ApplyRuntime to
-// update the live config in place without tearing anything down.
+// ("hot") fields changed, in which case Update publishes a new immutable
+// snapshot without tearing anything down.
 //
 // Both configs are compared after their defaults have been applied (see
 // setDefaults / Save), so callers should persist n before calling this.
@@ -760,24 +964,12 @@ func (c *Config) RequiresRestart(n *Config) bool {
 	return !reflect.DeepEqual(a, b)
 }
 
-// ApplyRuntime copies n into the live config in place, preserving the in-memory
-// Auth pointer. Because every holder of the *Config singleton shares this
-// struct, the updated values become visible everywhere without a restart.
-//
-// Only call this when RequiresRestart(n) is false: the cold fields are then
-// identical between c and n, so this effectively updates just the hot fields.
-func (c *Config) ApplyRuntime(n *Config) {
-	auth := c.Auth
-	*c = *n
-	c.Auth = auth
-}
-
 func (c *Config) createConfig() error {
-	// Create the directory if it doesn't exist
-	if err := os.MkdirAll(GetMainPath(), 0755); err != nil {
+	if _, err := safepath.EnsureRoot(GetMainPath(), 0o700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 	c.URLBase = "/"
+	c.BindAddress = DefaultBindAddress
 	c.Port = DefaultPort
 	c.LogLevel = DefaultLogLevel
 	c.UseAuth = true
@@ -785,6 +977,16 @@ func (c *Config) createConfig() error {
 }
 
 func (c *Config) SetupComplete() error {
+	return c.Validate()
+}
+
+// ValidateNormalized applies non-secret defaults to a private draft before
+// validating it. It does not write either configuration file or generate new
+// credentials, so callers can reject a bad draft before Update commits it.
+func (c *Config) ValidateNormalized() error {
+	if err := c.setDefaultsForPath(GetMainPath(), false); err != nil {
+		return err
+	}
 	return c.Validate()
 }
 

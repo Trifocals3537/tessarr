@@ -2,6 +2,7 @@ package arr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -188,6 +189,7 @@ func (a *Arr) searchSonarr(ctx context.Context, files []ContentFile) error {
 			if err != nil {
 				return fmt.Errorf("failed to automatic search: %v", err)
 			}
+			defer closeArrResponse(resp)
 			if resp.StatusCode >= 300 || resp.StatusCode < 200 {
 				return fmt.Errorf("failed to automatic search. Status Code: %s", resp.Status)
 			}
@@ -213,6 +215,7 @@ func (a *Arr) searchRadarr(ctx context.Context, files []ContentFile) error {
 	if err != nil {
 		return fmt.Errorf("failed to automatic search: %v", err)
 	}
+	defer closeArrResponse(resp)
 	if statusOk := strconv.Itoa(resp.StatusCode)[0] == '2'; !statusOk {
 		return fmt.Errorf("failed to automatic search. Status Code: %s", resp.Status)
 	}
@@ -232,16 +235,18 @@ func (a *Arr) batchSearchMissing(ctx context.Context, files []ContentFile) error
 	}
 	BatchSize := 50
 	if len(files) > BatchSize {
+		var batchErr error
 		for i := 0; i < len(files); i += BatchSize {
 			if ctx != nil && ctx.Err() != nil {
-				return ctx.Err()
+				return errors.Join(batchErr, ctx.Err())
 			}
 			end := min(i+BatchSize, len(files))
 			if err := a.searchMissing(ctx, files[i:end]); err != nil {
+				batchErr = errors.Join(batchErr, err)
 				continue
 			}
 		}
-		return nil
+		return batchErr
 	}
 	return a.searchMissing(ctx, files)
 }
@@ -263,27 +268,23 @@ func (a *Arr) DeleteFiles(ctx context.Context, files []ContentFile) error {
 	}
 	BatchSize := 50
 	if len(files) > BatchSize {
+		var batchErr error
 		for i := 0; i < len(files); i += BatchSize {
 			if ctx != nil && ctx.Err() != nil {
-				return ctx.Err()
+				return errors.Join(batchErr, ctx.Err())
 			}
 			end := min(i+BatchSize, len(files))
 			if err := a.batchDeleteFiles(ctx, files[i:end]); err != nil {
+				batchErr = errors.Join(batchErr, err)
 				continue
 			}
 		}
-		return nil
+		return batchErr
 	}
 	return a.batchDeleteFiles(ctx, files)
 }
 
 func (a *Arr) batchDeleteFiles(ctx context.Context, files []ContentFile) error {
-	defer func() {
-		for _, f := range files {
-			f.Delete()
-		}
-	}()
-
 	// Dedup FileIds: duplicates across BrokenFiles trip Sonarr's
 	// BasicRepository.Get strict count check ("Expected query to return N rows
 	// but returned M") and fail the whole batch.
@@ -304,25 +305,35 @@ func (a *Arr) batchDeleteFiles(ctx context.Context, files []ContentFile) error {
 	}
 
 	var payload any
+	var endpoint string
 	switch a.Type {
 	case Sonarr:
 		payload = struct {
 			EpisodeFileIds []int `json:"episodeFileIds"`
 		}{EpisodeFileIds: ids}
-		_, err := a.RequestCtx(ctx, http.MethodDelete, "api/v3/episodefile/bulk", payload, nil)
-		if err != nil {
-			return err
-		}
+		endpoint = "api/v3/episodefile/bulk"
 	case Radarr:
 		payload = struct {
 			MovieFileIds []int `json:"movieFileIds"`
 		}{MovieFileIds: ids}
-		_, err := a.RequestCtx(ctx, http.MethodDelete, "api/v3/moviefile/bulk", payload, nil)
-		if err != nil {
-			return err
-		}
+		endpoint = "api/v3/moviefile/bulk"
 	default:
 		return fmt.Errorf("unknown arr type: %s", a.Type)
 	}
-	return nil
+	resp, err := a.RequestCtx(ctx, http.MethodDelete, endpoint, payload, nil)
+	if err != nil {
+		return err
+	}
+	defer closeArrResponse(resp)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("bulk file delete failed: %s", resp.Status)
+	}
+
+	var deleteErr error
+	for _, f := range files {
+		if err := f.Delete(); err != nil {
+			deleteErr = errors.Join(deleteErr, err)
+		}
+	}
+	return deleteErr
 }

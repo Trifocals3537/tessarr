@@ -7,21 +7,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/utils"
-	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
-	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/sirrobot01/decypharr/pkg/version"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/version"
 )
 
 const (
-	EntryAllFolder     string = "__all__"
-	EntryBadFolder     string = "__bad__"
-	EntryTorrentFolder string = "torrents"
-	EntryNZBFolder     string = "nzbs"
+	EntryAllFolder     string = config.MountAllFolderName
+	EntryBadFolder     string = config.MountBadFolderName
+	EntryTorrentFolder string = config.MountTorrentFolderName
+	EntryNZBFolder     string = config.MountNZBFolderName
 )
 
 // FileInfo implements os.FileInfo
 type FileInfo struct {
+	fileID       string
 	name         string
 	size         int64
 	mode         os.FileMode
@@ -50,6 +51,7 @@ func (f *FileInfo) CanDelete() bool      { return f.canDelete }
 func (f *FileInfo) IsRemote() bool       { return len(f.content) == 0 }
 func (f *FileInfo) ByteRange() *[2]int64 { return f.byteRange }
 func (f *FileInfo) InfoHash() string     { return f.infohash }
+func (f *FileInfo) FileID() string       { return f.fileID }
 
 // GetTorrentMountPath returns the full mount path for a torrent
 // Returns the path based on the new unified mount structure
@@ -93,16 +95,17 @@ func (m *Manager) GetEntries() []FileInfo {
 		})
 	}
 
-	// Per-provider folders (one per configured debrid client)
-	m.clients.Range(func(name string, _ debrid.Client) bool {
+	// Per-provider folders follow configuration order rather than the
+	// intentionally undefined iteration order of the concurrent client map.
+	for _, client := range m.FilterDebrid(nil) {
+		name := client.Config().Name
 		subDirs = append(subDirs, FileInfo{
 			name:    name,
 			isDir:   true,
 			modTime: now,
 			size:    0,
 		})
-		return true
-	})
+	}
 
 	// AddOrUpdate custom folders
 	if m.customFolders != nil {
@@ -181,6 +184,7 @@ func (m *Manager) GetTorrentFile(torrentName, fileName string) (*FileInfo, error
 		return nil, fmt.Errorf("file %s not found in torrent %s", fileName, torrentName)
 	}
 	return &FileInfo{
+		fileID:    file.ID,
 		infohash:  file.InfoHash,
 		name:      file.Name,
 		size:      file.Size,
@@ -355,6 +359,7 @@ func (m *Manager) getTorrentChildren(name string) (*FileInfo, []FileInfo) {
 	size := int64(0)
 	for _, file := range entry.Files {
 		infos = append(infos, FileInfo{
+			fileID:    file.ID,
 			name:      file.Name,
 			size:      file.Size,
 			modTime:   file.AddedOn,

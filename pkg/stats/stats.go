@@ -8,13 +8,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
+	"github.com/Trifocals3537/tessarr/pkg/manager"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
-	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
-	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
 // Collector owns the cached stats snapshot and the HTTP handler.
@@ -31,32 +31,86 @@ type Collector struct {
 	profileFetched time.Time
 	profileTTL     time.Duration
 
-	cancel context.CancelFunc
+	refreshGate chan struct{}
+	refreshReq  chan struct{}
+	collectFn   func(context.Context) (*Snapshot, error)
+
+	lifecycleMu sync.Mutex
+	cancel      context.CancelFunc
+	done        chan struct{}
 }
 
-// New creates a Collector and starts the background refresh goroutine.
+const (
+	refreshInterval = 5 * time.Second
+	refreshTimeout  = 10 * time.Second
+)
+
+// New creates an idle Collector. Start owns all background work.
 func New(mgr *manager.Manager) *Collector {
 	c := &Collector{
 		mgr:          mgr,
 		logger:       logger.New("stats"),
 		profileCache: make(map[string]*debridTypes.Profile),
 		profileTTL:   60 * time.Second,
+		refreshGate:  make(chan struct{}, 1),
+		refreshReq:   make(chan struct{}, 1),
+		snapshot:     &Snapshot{},
 	}
-	// Build an initial snapshot synchronously so the first request is served immediately.
-	c.snapshot = c.collect()
+	c.collectFn = c.collect
 	return c
+}
+
+// RequestRefresh asks the background loop to refresh soon without delaying the
+// caller. Repeated requests are coalesced.
+func (c *Collector) RequestRefresh() {
+	select {
+	case c.refreshReq <- struct{}{}:
+	default:
+	}
 }
 
 // Start begins the background refresh loop. Call from server startup.
 func (c *Collector) Start(ctx context.Context) {
-	ctx, c.cancel = context.WithCancel(ctx)
-	go c.loop(ctx)
+	c.lifecycleMu.Lock()
+	if c.cancel != nil {
+		c.lifecycleMu.Unlock()
+		return
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	c.cancel = cancel
+	c.done = done
+	c.lifecycleMu.Unlock()
+
+	go func() {
+		defer close(done)
+		c.loop(runCtx)
+	}()
 }
 
-// Stop cancels the background loop.
-func (c *Collector) Stop() {
-	if c.cancel != nil {
-		c.cancel()
+// Stop cancels the background loop and waits for its in-flight refresh.
+func (c *Collector) Stop(ctx context.Context) error {
+	c.lifecycleMu.Lock()
+	cancel := c.cancel
+	done := c.done
+	c.lifecycleMu.Unlock()
+
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+
+	select {
+	case <-done:
+		c.lifecycleMu.Lock()
+		if c.done == done {
+			c.cancel = nil
+			c.done = nil
+		}
+		c.lifecycleMu.Unlock()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("stop stats collector: %w", ctx.Err())
 	}
 }
 
@@ -67,13 +121,30 @@ func (c *Collector) Snapshot() *Snapshot {
 	return c.snapshot
 }
 
-// Refresh rebuilds and stores a fresh snapshot immediately.
-func (c *Collector) Refresh() *Snapshot {
-	snap := c.collect()
+// Refresh rebuilds and stores a fresh snapshot immediately. Only one refresh
+// runs at a time, and every refresh has a bounded lifetime.
+func (c *Collector) Refresh(ctx context.Context) (*Snapshot, error) {
+	if ctx == nil {
+		return c.Snapshot(), fmt.Errorf("stats refresh context is required")
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
+
+	select {
+	case c.refreshGate <- struct{}{}:
+		defer func() { <-c.refreshGate }()
+	case <-refreshCtx.Done():
+		return c.Snapshot(), refreshCtx.Err()
+	}
+
+	snap, err := c.collectFn(refreshCtx)
+	if err != nil {
+		return c.Snapshot(), err
+	}
 	c.mu.Lock()
 	c.snapshot = snap
 	c.mu.Unlock()
-	return snap
+	return snap, nil
 }
 
 // Handler returns an http.HandlerFunc that serves the cached snapshot as JSON.
@@ -86,23 +157,33 @@ func (c *Collector) Handler() http.HandlerFunc {
 
 // loop refreshes the snapshot on a timer.
 func (c *Collector) loop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	c.refreshAndLog(ctx)
+
+	ticker := time.NewTicker(refreshInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-c.refreshReq:
+			c.refreshAndLog(ctx)
 		case <-ticker.C:
-			snap := c.collect()
-			c.mu.Lock()
-			c.snapshot = snap
-			c.mu.Unlock()
+			c.refreshAndLog(ctx)
 		}
 	}
 }
 
+func (c *Collector) refreshAndLog(ctx context.Context) {
+	if _, err := c.Refresh(ctx); err != nil && ctx.Err() == nil {
+		c.logger.Warn().Err(err).Msg("Failed to refresh statistics")
+	}
+}
+
 // collect builds a full Snapshot from all subsystems.
-func (c *Collector) collect() *Snapshot {
+func (c *Collector) collect(ctx context.Context) (*Snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 
@@ -115,8 +196,7 @@ func (c *Collector) collect() *Snapshot {
 	// --- System ---
 	mb := func(b uint64) string { return fmt.Sprintf("%.2fMB", float64(b)/1024/1024) }
 	snap.System = SystemStats{
-		// Sys - HeapReleased is the heap actually held from the OS; HeapReleased
-		// has been handed back (MADV_DONTNEED on Linux) so it does not count.
+		// This is Go runtime memory. Direct mmap allocations are excluded.
 		MemoryUsed:     mb(memStats.Sys - memStats.HeapReleased),
 		HeapAllocMB:    mb(memStats.HeapAlloc),
 		HeapInuseMB:    mb(memStats.HeapInuse),
@@ -132,12 +212,27 @@ func (c *Collector) collect() *Snapshot {
 		Uptime:         uptime.String(),
 		StartTime:      startTime.Format("2006-01-02 15:04:05"),
 	}
+	if rss, err := processRSS(); err == nil {
+		snap.System.ProcessRSSMB = mb(rss)
+	}
 
 	// --- Debrids ---
-	snap.Debrids = c.collectDebrids(cfg)
+	debrids, err := c.collectDebrids(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	snap.Debrids = debrids
 
 	// --- Mount ---
-	snap.Mount = c.collectMount(cfg)
+	mountStats, err := c.collectMount(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	snap.Mount = mountStats
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// --- Usenet ---
 	if c.mgr.HasUsenet() {
@@ -150,6 +245,10 @@ func (c *Collector) collect() *Snapshot {
 		Count:   len(streams),
 		Streams: streams,
 	}
+	snap.CDNTraffic = c.mgr.CDNTrafficStats()
+	snap.StreamFailover = c.mgr.StreamFailoverStats()
+	snap.StreamSessions = c.mgr.StreamSessionStats()
+	snap.TorrentAdmission = c.mgr.TorrentAdmissionStats()
 
 	// --- Storage ---
 	torrentCount, err := c.mgr.GetTorrentsCount()
@@ -194,18 +293,24 @@ func (c *Collector) collect() *Snapshot {
 		}
 	}
 
-	return snap
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return snap, nil
 }
 
 // collectDebrids gathers debrid stats with cached profiles.
-func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
+func (c *Collector) collectDebrids(ctx context.Context, cfg *config.Config) ([]debridTypes.Stats, error) {
 	torrentCount, err := c.mgr.GetTorrentsCount()
 	if err != nil {
 		c.logger.Error().Err(err).Msg("Failed to get torrents count for debrid stats")
 		torrentCount = 0
 	}
 
-	profiles := c.getProfiles()
+	profiles, err := c.getProfiles(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	result := make([]debridTypes.Stats, 0)
 	c.mgr.Clients().Range(func(debridName string, client debrid.Client) bool {
@@ -216,7 +321,7 @@ func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
 		ds := debridTypes.Stats{}
 		ls := debridTypes.LibraryStats{}
 
-		profile := profiles[debridName]
+		profile := cloneProfile(profiles[debridName])
 		if profile == nil {
 			profile = &debridTypes.Profile{Name: debridName}
 		}
@@ -246,49 +351,78 @@ func (c *Collector) collectDebrids(cfg *config.Config) []debridTypes.Stats {
 			}
 		}
 	}
-	return ordered
+	return ordered, nil
 }
 
 // getProfiles returns cached debrid profiles, refreshing if stale.
-func (c *Collector) getProfiles() map[string]*debridTypes.Profile {
+func (c *Collector) getProfiles(ctx context.Context) (map[string]*debridTypes.Profile, error) {
 	c.profileMu.RLock()
-	if time.Since(c.profileFetched) < c.profileTTL && len(c.profileCache) > 0 {
-		defer c.profileMu.RUnlock()
-		return c.profileCache
+	if !c.profileFetched.IsZero() && time.Since(c.profileFetched) < c.profileTTL {
+		profiles := cloneProfiles(c.profileCache)
+		c.profileMu.RUnlock()
+		return profiles, nil
 	}
 	c.profileMu.RUnlock()
 
-	// Fetch fresh profiles
-	fresh := make(map[string]*debridTypes.Profile)
+	// Fetch independent providers concurrently so one slow service does not
+	// delay every other account behind it.
+	type namedClient struct {
+		name   string
+		client debrid.Client
+	}
+	clients := make([]namedClient, 0)
 	c.mgr.Clients().Range(func(name string, client debrid.Client) bool {
-		if client == nil {
-			return true
+		if client != nil {
+			clients = append(clients, namedClient{name: name, client: client})
 		}
-		profile, err := client.GetProfile()
-		if err != nil {
-			c.logger.Error().Err(err).Str("debrid", name).Msg("Failed to get debrid profile")
-			// Use stale cache entry if available
-			c.profileMu.RLock()
-			if cached, ok := c.profileCache[name]; ok {
-				fresh[name] = cached
-			}
-			c.profileMu.RUnlock()
-			return true
-		}
-		fresh[name] = profile
 		return true
 	})
+	type profileResult struct {
+		name    string
+		profile *debridTypes.Profile
+		err     error
+	}
+	results := make(chan profileResult, len(clients))
+	for _, item := range clients {
+		go func() {
+			profile, err := getProfile(ctx, item.client)
+			results <- profileResult{name: item.name, profile: profile, err: err}
+		}()
+	}
+
+	fresh := make(map[string]*debridTypes.Profile)
+	for range clients {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-results:
+			if result.err == nil {
+				fresh[result.name] = cloneProfile(result.profile)
+				continue
+			}
+			c.logger.Error().Err(result.err).Str("debrid", result.name).Msg("Failed to get debrid profile")
+			// Use stale cache entry if available
+			c.profileMu.RLock()
+			if cached, ok := c.profileCache[result.name]; ok {
+				fresh[result.name] = cloneProfile(cached)
+			}
+			c.profileMu.RUnlock()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	c.profileMu.Lock()
-	c.profileCache = fresh
+	c.profileCache = cloneProfiles(fresh)
 	c.profileFetched = time.Now()
 	c.profileMu.Unlock()
 
-	return fresh
+	return fresh, nil
 }
 
 // collectMount gathers mount stats.
-func (c *Collector) collectMount(cfg *config.Config) MountStats {
+func (c *Collector) collectMount(ctx context.Context, cfg *config.Config) (MountStats, error) {
 	mountMgr := c.mgr.MountManager()
 	enabled := cfg.Mount.Type != config.MountTypeNone
 
@@ -296,17 +430,27 @@ func (c *Collector) collectMount(cfg *config.Config) MountStats {
 		return MountStats{
 			Ready:   false,
 			Enabled: enabled,
-		}
+		}, nil
 	}
 
-	mountStats := mountMgr.Stats()
+	var mountStats map[string]any
+	if contextual, ok := mountMgr.(interface {
+		StatsContext(context.Context) map[string]any
+	}); ok {
+		mountStats = contextual.StatsContext(ctx)
+	} else {
+		mountStats = mountMgr.Stats()
+	}
+	if err := ctx.Err(); err != nil {
+		return MountStats{}, err
+	}
 	if mountStats == nil {
 		return MountStats{
 			Ready:   true,
 			Enabled: enabled,
 			Type:    mountMgr.Type(),
 			Error:   "failed to get mount stats",
-		}
+		}, nil
 	}
 
 	return MountStats{
@@ -314,5 +458,32 @@ func (c *Collector) collectMount(cfg *config.Config) MountStats {
 		Enabled: enabled,
 		Type:    mountMgr.Type(),
 		Detail:  mountStats,
+	}, nil
+}
+
+type contextualProfileClient interface {
+	GetProfileContext(context.Context) (*debridTypes.Profile, error)
+}
+
+func getProfile(ctx context.Context, client debrid.Client) (*debridTypes.Profile, error) {
+	if contextual, ok := client.(contextualProfileClient); ok {
+		return contextual.GetProfileContext(ctx)
 	}
+	return client.GetProfile()
+}
+
+func cloneProfile(profile *debridTypes.Profile) *debridTypes.Profile {
+	if profile == nil {
+		return nil
+	}
+	cloned := *profile
+	return &cloned
+}
+
+func cloneProfiles(profiles map[string]*debridTypes.Profile) map[string]*debridTypes.Profile {
+	cloned := make(map[string]*debridTypes.Profile, len(profiles))
+	for name, profile := range profiles {
+		cloned[name] = cloneProfile(profile)
+	}
+	return cloned
 }

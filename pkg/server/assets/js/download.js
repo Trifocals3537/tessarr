@@ -86,7 +86,7 @@ class DownloadManager {
             history.replaceState({}, document.title, window.location.pathname);
 
             // Show notification
-            window.decypharrUtils.createToast('Magnet link loaded from URL', 'info');
+            window.tessarrUtils.createToast('Magnet link loaded from URL', 'info');
         }
     }
 
@@ -128,12 +128,12 @@ class DownloadManager {
         // Validation
         const totalItems = urls.length + this.refs.torrentFiles.files.length + nzbURLs.length + this.refs.nzbFile.files.length;
         if (totalItems === 0) {
-            window.decypharrUtils.createToast('Please provide at least one torrent or NZB', 'warning');
+            window.tessarrUtils.createToast('Please provide at least one torrent or NZB', 'warning');
             return;
         }
 
         if (totalItems > 100) {
-            window.decypharrUtils.createToast('Please submit up to 100 items at a time', 'warning');
+            window.tessarrUtils.createToast('Please submit up to 100 items at a time', 'warning');
             return;
         }
 
@@ -150,9 +150,9 @@ class DownloadManager {
 
         try {
             // Set loading state
-            window.decypharrUtils.setButtonLoading(this.refs.submitBtn, true);
+            window.tessarrUtils.setButtonLoading(this.refs.submitBtn, true);
 
-            const response = await window.decypharrUtils.fetcher('/api/add', {
+            const response = await window.tessarrUtils.fetcher('/api/add', {
                 method: 'POST',
                 body: formData,
                 headers: {} // Remove Content-Type to let browser set it for FormData
@@ -171,7 +171,7 @@ class DownloadManager {
             // Handle partial success
             if (failures.length > 0) {
                 if (successes.length > 0) {
-                    window.decypharrUtils.createToast(
+                    window.tessarrUtils.createToast(
                         `Added ${successes.length} item(s) with ${failures.length} error(s)`,
                         'warning'
                     );
@@ -180,19 +180,19 @@ class DownloadManager {
                     this.showErrorDetails(failures);
                 }
             } else if (successes.length > 0) {
-                window.decypharrUtils.createToast(
+                window.tessarrUtils.createToast(
                     `Successfully added ${successes.length} item${successes.length > 1 ? 's' : ''}!`
                 );
                 this.clearForm();
             } else {
-                window.decypharrUtils.createToast('No items were added', 'warning');
+                window.tessarrUtils.createToast('No items were added', 'warning');
             }
 
         } catch (error) {
             console.error('Error adding downloads:', error);
-            window.decypharrUtils.createToast(`Error adding downloads: ${error.message}`, 'error');
+            window.tessarrUtils.createToast(`Error adding downloads: ${error.message}`, 'error');
         } finally {
-            window.decypharrUtils.setButtonLoading(this.refs.submitBtn, false);
+            window.tessarrUtils.setButtonLoading(this.refs.submitBtn, false);
         }
     }
 
@@ -200,7 +200,7 @@ class DownloadManager {
         // Extract error messages from the failed results
         const errorList = failures.map(f => `• ${f.error || 'Unknown error'}`).join('\n');
         console.error('Download errors:', errorList);
-        window.decypharrUtils.createToast(
+        window.tessarrUtils.createToast(
             `Errors occurred while adding items:\n${errorList}`,
             'error'
         );
@@ -218,7 +218,7 @@ class DownloadManager {
         if (files.length > 0) {
             const fileNames = Array.from(files).map(f => f.name).join(', ');
             const fileType = type === 'nzb' ? 'NZB' : 'torrent';
-            window.decypharrUtils.createToast(
+            window.tessarrUtils.createToast(
                 `Selected ${files.length} ${fileType} file${files.length > 1 ? 's' : ''}: ${fileNames}`,
                 'info'
             );
@@ -285,7 +285,7 @@ class DownloadManager {
         }
 
         if (torrentFiles.length === 0 && nzbFiles.length === 0) {
-            window.decypharrUtils.createToast('Please drop .torrent or .nzb files only', 'warning');
+            window.tessarrUtils.createToast('Please drop .torrent or .nzb files only', 'warning');
         }
     }
 }

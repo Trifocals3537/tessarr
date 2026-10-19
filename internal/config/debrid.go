@@ -4,14 +4,23 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 )
+
+var supportedDebridProviders = map[string]struct{}{
+	"realdebrid": {},
+	"alldebrid":  {},
+	"debridlink": {},
+	"torbox":     {},
+	"premiumize": {},
+}
 
 type Debrid struct {
 	Provider                     string   `json:"provider,omitempty"` // realdebrid, alldebrid, debridlink, torbox, premiumize
 	Name                         string   `json:"name,omitempty"`
 	APIKey                       string   `json:"api_key,omitempty"`
 	DownloadAPIKeys              []string `json:"download_api_keys,omitempty"`
-	DownloadUncached             bool     `json:"download_uncached,omitempty"`
+	DownloadUncached             bool     `json:"download_uncached"`
 	RateLimit                    string   `json:"rate_limit,omitempty"` // 200/minute or 10/second
 	RepairRateLimit              string   `json:"repair_rate_limit,omitempty"`
 	DownloadRateLimit            string   `json:"download_rate_limit,omitempty"`
@@ -41,8 +50,15 @@ func (c *Config) updateDebrid(d Debrid) Debrid {
 	workers := runtime.NumCPU() * 50
 	perDebrid := workers / len(c.Debrids)
 
+	d.Name = strings.TrimSpace(d.Name)
+	d.Provider = strings.ToLower(strings.TrimSpace(d.Provider))
 	if d.Provider == "" {
-		d.Provider = d.Name
+		// Backward compatibility: older configurations used name as both the
+		// provider type and instance key.
+		d.Provider = strings.ToLower(d.Name)
+	}
+	if d.Name == "" {
+		d.Name = d.Provider
 	}
 
 	var downloadKeys []string
@@ -77,13 +93,26 @@ func validateDebrids(debrids []Debrid) error {
 	}
 
 	for _, debrid := range debrids {
-		// Basic field validation
+		provider := strings.ToLower(strings.TrimSpace(debrid.Provider))
+		if provider == "" {
+			provider = strings.ToLower(strings.TrimSpace(debrid.Name))
+		}
+		if _, ok := supportedDebridProviders[provider]; !ok {
+			return fmt.Errorf("unsupported debrid provider %q", provider)
+		}
 		if debrid.APIKey == "" {
 			return errors.New("debrid api key is required")
 		}
 	}
 
 	return nil
+}
+
+// IsSupportedDebridProvider reports whether provider is a built-in provider
+// type. Provider instance names are intentionally separate and may be custom.
+func IsSupportedDebridProvider(provider string) bool {
+	_, ok := supportedDebridProviders[strings.ToLower(strings.TrimSpace(provider))]
+	return ok
 }
 
 func (c *Config) applyDebridEnvVars() {

@@ -3,8 +3,9 @@ package config
 import "time"
 
 var (
-	DefaultPort     = "8282"
-	DefaultLogLevel = "info"
+	DefaultBindAddress = "127.0.0.1"
+	DefaultPort        = "8282"
+	DefaultLogLevel    = "info"
 
 	DefaultRateLimit                = "250/minute"
 	DefaultTorrentsRefreshInterval  = "10m"

@@ -48,6 +48,7 @@ func (q *QBit) Routes() http.Handler {
 		})
 
 		r.Route("/app", func(r chi.Router) {
+			r.Use(q.authContext)
 			r.Get("/version", q.handleVersion)
 			r.Get("/webapiVersion", q.handleWebAPIVersion)
 			r.Get("/preferences", q.handlePreferences)

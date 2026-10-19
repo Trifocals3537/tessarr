@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/textproto"
 	"sort"
@@ -15,13 +16,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/customerror"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/retry"
+	"github.com/Trifocals3537/tessarr/internal/tlsconfig"
+	"github.com/Trifocals3537/tessarr/internal/utils"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/customerror"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/internal/retry"
-	"github.com/sirrobot01/decypharr/internal/utils"
 )
 
 // ProviderPool manages connections for a single provider using a LIFO stack
@@ -61,6 +63,17 @@ type Client struct {
 	// (≈ buffer ÷ RTT), so it must cover the bandwidth-delay product.
 	sockReadBuf  int
 	sockWriteBuf int
+
+	// Pool lifecycle settings are resolved per client so a config reload can
+	// replace the client without racing connections owned by the old one.
+	idleTimeout    time.Duration
+	staleThreshold time.Duration
+	pingInterval   time.Duration
+
+	// tlsConfig is an optional base configuration used by internal callers and
+	// tests. Every use is cloned and hardened before dialing; nil uses the
+	// platform trust store.
+	tlsConfig *tls.Config
 }
 
 // SpeedTestResult holds the result of a provider speed test
@@ -78,6 +91,16 @@ type connectionEntry struct {
 	conn     *Connection
 	provider config.UsenetProvider
 	lastUsed time.Time
+	// lastPing is separate from lastUsed: keepalives prove the session is alive
+	// without postponing expiry based on real application use.
+	lastPing time.Time
+}
+
+func (e *connectionEntry) lastActivity() time.Time {
+	if e.lastPing.After(e.lastUsed) {
+		return e.lastPing
+	}
+	return e.lastUsed
 }
 
 var connectionEntryPool = sync.Pool{
@@ -119,26 +142,34 @@ type TimeoutConfig struct {
 	StaleThreshold time.Duration
 	// Close connections idle longer than this
 	IdleTimeout time.Duration
+	// Keepalive-ping pooled connections after this much inactivity
+	PingInterval time.Duration
 	// How often to check for idle connections
 	ReaperInterval time.Duration
 }
 
 // DefaultTimeouts returns production-tuned timeout values.
-// These are aggressive to prevent "connection reset by peer" errors
-// from long-idle connections.
+// Players commonly read in bursts. Keep pooled sessions warm across those
+// quiet periods and use DATE pings to detect stale connections before reuse.
 var DefaultTimeouts = TimeoutConfig{
 	DialTimeout:       10 * time.Second,
 	KeepAlive:         30 * time.Second,
 	HandshakeTimeout:  10 * time.Second,
 	StreamBodyTimeout: 60 * time.Second,
 	PingTimeout:       1500 * time.Millisecond,
-	StaleThreshold:    10 * time.Second,
-	IdleTimeout:       20 * time.Second,
+	StaleThreshold:    60 * time.Second,
+	IdleTimeout:       5 * time.Minute,
+	PingInterval:      30 * time.Second,
 	ReaperInterval:    5 * time.Second,
 }
 
 // Package-level timeouts used by all clients
 var timeouts = normalizeTimeouts(DefaultTimeouts)
+
+// Keepalive work is deliberately bounded per provider and sweep. Reserving
+// every idle connection at once would make an otherwise healthy pool briefly
+// unavailable to playback while the pings complete.
+const maxKeepAliveBatch = 4
 
 func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 	if in.DialTimeout <= 0 {
@@ -157,7 +188,7 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 		in.PingTimeout = 1500 * time.Millisecond
 	}
 	if in.IdleTimeout <= 0 {
-		in.IdleTimeout = 20 * time.Second
+		in.IdleTimeout = 5 * time.Minute
 	}
 	// Keep stale checks meaningful: stale must be >0 and below idle timeout.
 	if in.StaleThreshold <= 0 || in.StaleThreshold >= in.IdleTimeout {
@@ -165,6 +196,9 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 		if in.StaleThreshold <= 0 {
 			in.StaleThreshold = 10 * time.Second
 		}
+	}
+	if in.PingInterval <= 0 || in.PingInterval >= in.IdleTimeout {
+		in.PingInterval = min(30*time.Second, in.IdleTimeout/2)
 	}
 	if in.ReaperInterval <= 0 {
 		in.ReaperInterval = 5 * time.Second
@@ -179,7 +213,9 @@ func normalizeTimeouts(in TimeoutConfig) TimeoutConfig {
 
 // NewClient creates a new connection manager
 func NewClient(cfg *config.Config) (*Client, error) {
-	providers := cfg.Usenet.Providers
+	// Provider ordering and backbone normalization are client-local runtime
+	// concerns. Never mutate the slice owned by the immutable active config.
+	providers := append([]config.UsenetProvider(nil), cfg.Usenet.Providers...)
 	if len(providers) == 0 {
 		return nil, errors.New("no NNTP providers configured")
 	}
@@ -200,6 +236,13 @@ func NewClient(cfg *config.Config) (*Client, error) {
 
 	pools := make(map[string]*ProviderPool)
 	for _, p := range providers {
+		if p.MaxConnections < 1 || p.MaxConnections > config.UsenetConnectionLimit {
+			return nil, fmt.Errorf(
+				"provider %q max_connections must be between 1 and %d",
+				p.Host,
+				config.UsenetConnectionLimit,
+			)
+		}
 		pp := &ProviderPool{
 			conns:  make([]*connectionEntry, 0, p.MaxConnections),
 			slots:  make(chan struct{}, p.MaxConnections),
@@ -217,12 +260,39 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		speedTestResults: xsync.NewMap[string, SpeedTestResult](),
 		sockReadBuf:      parseSockBuf(cfg.Usenet.SocketReadBuffer),
 		sockWriteBuf:     parseSockBuf(cfg.Usenet.SocketWriteBuffer),
+		idleTimeout:      timeouts.IdleTimeout,
+		staleThreshold:   timeouts.StaleThreshold,
+		pingInterval:     timeouts.PingInterval,
+	}
+	if cfg.Usenet.ConnIdleTimeout != "" {
+		if err := cm.setIdleTimeout(cfg.Usenet.ConnIdleTimeout); err != nil {
+			cm.logger.Warn().Str("conn_idle_timeout", cfg.Usenet.ConnIdleTimeout).
+				Msg("invalid conn_idle_timeout, using default")
+		}
 	}
 	cm.repairPool = cm.newRepairPool(cfg.Repair.NNTPConnectionPercent)
 
 	// Start background reaper
 	go cm.reaper()
 	return cm, nil
+}
+
+func (c *Client) setIdleTimeout(value string) error {
+	d, err := utils.ParseDuration(value)
+	if err != nil {
+		return err
+	}
+	if d <= 0 {
+		return fmt.Errorf("connection idle timeout must be positive")
+	}
+	c.idleTimeout = d
+	if c.staleThreshold >= c.idleTimeout {
+		c.staleThreshold = c.idleTimeout / 2
+	}
+	if c.pingInterval >= c.idleTimeout {
+		c.pingInterval = c.idleTimeout / 2
+	}
+	return nil
 }
 
 // put returns a connection to the pool and releases the slot.
@@ -288,9 +358,9 @@ func (c *Client) isHealthy(entry *connectionEntry) bool {
 	if entry.conn.IsClosed() {
 		return false
 	}
-	// Check if already closed/expired (though normally caught by reaper)
-	// Or check stale threshold
-	if time.Since(entry.lastUsed) > timeouts.StaleThreshold {
+	// A successful keepalive counts as recent proof of life and avoids an
+	// unnecessary second round-trip when this entry is checked out.
+	if time.Since(entry.lastActivity()) > c.staleThreshold {
 		if err := entry.conn.ping(); err != nil {
 			return false
 		}
@@ -298,20 +368,24 @@ func (c *Client) isHealthy(entry *connectionEntry) bool {
 	return true
 }
 
-func isIdleExpired(lastUsed time.Time, now time.Time) bool {
+func (c *Client) isIdleExpired(lastUsed time.Time, now time.Time) bool {
 	if lastUsed.IsZero() {
 		return false
 	}
-	return now.Sub(lastUsed) > timeouts.IdleTimeout
+	return now.Sub(lastUsed) > c.idleTimeout
 }
 
 // ExecuteWithFailover executes an operation with automatic provider failover and retry logic.
 // Uses exclusion-based connection acquisition: gets ANY available connection,
 // and on retryable errors, retries with exponential backoff before excluding the provider.
-// Uses avast/retry-go for retry handling.
+// Article absence is conclusive only after every configured provider/backbone
+// has returned not-found; exhausted or unreachable providers are not evidence.
 func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connection) error) error {
 	var lastErr error
+	var lastTransientErr error
+	var lastMissingErr error
 	var exclusions providerExclusions
+	var missing providerExclusions
 
 	for providerAttempts := 0; providerAttempts < len(c.providers); providerAttempts++ {
 		if ctx.Err() != nil {
@@ -329,6 +403,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// returnOrReleaseConn always releases the right semaphore slot.
 		var currentConn = conn
 		var currentProvider = connProvider
+		var acquisitionFailed bool
 		// Healthy streaming is the overwhelmingly common case. Avoid building
 		// retry configuration and invoking retry.Do unless the first execution
 		// actually fails. When it does fail, pendingErr lets the retry closure
@@ -339,12 +414,32 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 			c.returnOrReleaseConn(currentConn, currentProvider)
 			return nil
 		}
+		// Remember transiently failed hosts throughout this retry sequence so
+		// an untried provider is preferred over cycling between failed hosts.
+		retryExclusions := exclusions.clone()
 		err = retry.Do(
 			func() error {
 				execErr := pendingErr
 				if execErr != nil {
 					pendingErr = nil
 				} else {
+					// Acquire only when another attempt will actually execute, after
+					// backoff. Never hold a connection slot while sleeping, or reset
+					// exclusions accumulated by earlier provider attempts.
+					retryExclusions.excludeHost(currentProvider.Host)
+					newConn, newProvider, connErr := c.getAnyAvailableConnection(ctx, retryExclusions)
+					if connErr != nil && ctx.Err() == nil {
+						// No usable untried alternative: retry only the last failed
+						// host, which was eligible under the outer exclusions. Do
+						// not reopen exhausted hosts or missing backbones.
+						newConn, newProvider, connErr = c.getConnectionFromProvider(ctx, currentProvider)
+					}
+					if connErr != nil {
+						acquisitionFailed = true
+						return retry.Unrecoverable(connErr)
+					}
+					currentConn = newConn
+					currentProvider = newProvider
 					execErr = c.safeExecute(currentConn, fn)
 				}
 				if execErr == nil {
@@ -355,30 +450,12 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 				if errors.As(execErr, &nntpErr) {
 					switch nntpErr.Type {
 					case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
+						lastTransientErr = execErr
 						// Retriable error - release the potentially dead connection.
 						// Nil currentConn first to prevent double slot-release if new connection acquisition fails.
 						releasedConn := currentConn
-						failedProvider := currentProvider
 						currentConn = nil
 						c.release(releasedConn)
-
-						// Get a fresh connection for retry. Prefer a different
-						// provider after a connection/timeout/server-busy error;
-						// otherwise one slow provider can consume the whole DFS
-						// no-progress window before failover gets a chance. If
-						// there is no alternative provider, fall back to retrying
-						// the same one.
-						retryExclusions := providerExclusions{}
-						retryExclusions.excludeHost(failedProvider.Host)
-						newConn, newProvider, connErr := c.getAnyAvailableConnection(ctx, retryExclusions)
-						if connErr != nil {
-							newConn, newProvider, connErr = c.getAnyAvailableConnection(ctx, providerExclusions{})
-						}
-						if connErr != nil {
-							return retry.Unrecoverable(connErr)
-						}
-						currentConn = newConn
-						currentProvider = newProvider
 						return execErr // Retriable
 
 					case ErrorTypeArticleNotFound:
@@ -390,6 +467,7 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 						return retry.Unrecoverable(execErr)
 					}
 				} else if customerror.IsPanicError(execErr) {
+					lastTransientErr = execErr
 					// Panic error - release connection.
 					// Nil currentConn first to prevent double slot-release after retry loop.
 					releasedConn := currentConn
@@ -417,27 +495,66 @@ func (c *Client) ExecuteWithFailover(ctx context.Context, fn func(conn *Connecti
 		// Handle failure
 		c.returnOrReleaseConn(currentConn, currentProvider)
 		lastErr = err
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if acquisitionFailed {
+			// Acquisition can fail on a different host from the last callback;
+			// do not attribute that error to the callback's provider or start
+			// another outer retry cycle after acquisition already exhausted
+			// both the alternative and original provider selections.
+			if IsArticleNotFoundError(err) {
+				return NewConnectionError(fmt.Errorf("acquire retry connection: %w", err))
+			}
+			return err
+		}
 
 		// Check if we should exclude this provider
 		var nntpErr *Error
 		if errors.As(err, &nntpErr) {
 			switch nntpErr.Type {
 			case ErrorTypeArticleNotFound:
-				excludeForArticleNotFound(&exclusions, connProvider)
+				excludeForArticleNotFound(&exclusions, currentProvider)
+				excludeForArticleNotFound(&missing, currentProvider)
+				lastMissingErr = err
 			case ErrorTypeConnection, ErrorTypeTimeout, ErrorTypeServerBusy:
-				exclusions.excludeHost(connProvider.Host)
+				exclusions.excludeHost(currentProvider.Host)
 			default:
 				// Non-retriable error, return immediately
 				return err
 			}
 		} else if customerror.IsPanicError(err) {
-			exclusions.excludeHost(connProvider.Host)
+			exclusions.excludeHost(currentProvider.Host)
 		} else {
 			// Unknown error type - return immediately
 			return err
 		}
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if lastMissingErr != nil {
+		allMissing := true
+		for _, provider := range c.providers {
+			if !missing.excludes(provider) {
+				allMissing = false
+				break
+			}
+		}
+		if allMissing {
+			return lastMissingErr
+		}
+	}
+	if lastTransientErr != nil {
+		return lastTransientErr
+	}
+	if IsArticleNotFoundError(lastErr) {
+		// An acquisition failure may have been hidden by a later successful
+		// acquisition on another host. Missing evidence must cover every group,
+		// not merely the last callback that happened to run.
+		return NewConnectionError(errors.New("article availability could not be verified on all providers"))
+	}
 	if lastErr != nil {
 		return lastErr
 	}
@@ -694,7 +811,7 @@ func (c *Client) getOrCreateFromPool(ctx context.Context, pp *ProviderPool, prov
 			pp.mu.Unlock()
 
 			now := utils.Now()
-			if isIdleExpired(entry.lastUsed, now) {
+			if c.isIdleExpired(entry.lastUsed, now) {
 				conn := entry.conn
 				releaseConnectionEntry(entry)
 				_ = conn.Close()
@@ -775,12 +892,39 @@ func (c *Client) tuneTCP(tcpConn *net.TCPConn) {
 	}
 }
 
+func verifiedNNTPConfig(serverName string) *tls.Config {
+	return hardenedNNTPConfig(nil, serverName)
+}
+
+func hardenedNNTPConfig(base *tls.Config, serverName string) *tls.Config {
+	config := tlsconfig.Harden(base)
+	config.ServerName = serverName
+	return config
+}
+
+func completeTLSHandshake(ctx context.Context, conn *tls.Conn) error {
+	handshakeCtx, cancel := context.WithTimeout(ctx, timeouts.HandshakeTimeout)
+	defer cancel()
+
+	deadline, ok := handshakeCtx.Deadline()
+	if !ok {
+		return errors.New("TLS handshake context has no deadline")
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set TLS handshake deadline: %w", err)
+	}
+	if err := conn.HandshakeContext(handshakeCtx); err != nil {
+		return err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear TLS handshake deadline: %w", err)
+	}
+	return nil
+}
+
 // createConnection creates a new NNTP connection to a provider
 func (c *Client) createConnection(ctx context.Context, provider config.UsenetProvider) (*Connection, error) {
 	address := fmt.Sprintf("%s:%d", provider.Host, provider.Port)
-
-	var netConn net.Conn
-	var err error
 
 	dialer := &net.Dialer{
 		Timeout:   timeouts.DialTimeout,
@@ -788,26 +932,19 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		Control:   c.socketControl(),
 	}
 
-	// TLS if enabled
-	if provider.SSL {
-		// Dial with TLS directly if possible, or Dial then Wrap
-		tlsConfig := &tls.Config{
-			ServerName:         provider.Host,
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-		}
-		// Use tls.Dialer for simpler timeout handling
-		tlsDialer := &tls.Dialer{
-			NetDialer: dialer,
-			Config:    tlsConfig,
-		}
-		netConn, err = tlsDialer.DialContext(ctx, "tcp", address)
-	} else {
-		netConn, err = dialer.DialContext(ctx, "tcp", address)
-	}
-
+	netConn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, NewConnectionError(fmt.Errorf("dial %s: %w", address, err))
+	}
+
+	providerTLSConfig := hardenedNNTPConfig(c.tlsConfig, provider.Host)
+	if provider.SSL {
+		tlsConn := tls.Client(netConn, providerTLSConfig)
+		if err := completeTLSHandshake(ctx, tlsConn); err != nil {
+			_ = tlsConn.Close()
+			return nil, NewConnectionError(fmt.Errorf("TLS handshake with %s: %w", address, err))
+		}
+		netConn = tlsConn
 	}
 
 	// Optimize TCP socket (buffer sizing already applied pre-connect via
@@ -825,20 +962,23 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 	writer := bufio.NewWriterSize(netConn, 64*1024)
 
 	conn := &Connection{
-		conn:     netConn,
-		reader:   reader,
-		text:     textproto.NewReader(reader),
-		writer:   writer,
-		address:  provider.Host,
-		port:     provider.Port,
-		username: provider.Username,
-		password: provider.Password,
-		logger:   c.logger.With().Str("host", provider.Host).Logger(),
+		conn:      netConn,
+		reader:    reader,
+		text:      textproto.NewReader(reader),
+		writer:    writer,
+		address:   provider.Host,
+		port:      provider.Port,
+		username:  provider.Username,
+		password:  provider.Password,
+		logger:    c.logger.With().Str("host", provider.Host).Logger(),
+		tlsConfig: providerTLSConfig,
 	}
 
-	// Set deadline for handshake (greeting + auth)
-	// If the server doesn't respond quickly during setup, we should abort.
-	_ = netConn.SetDeadline(utils.Now().Add(timeouts.HandshakeTimeout))
+	// Bound each setup phase so a server cannot hold a connection indefinitely.
+	if err := conn.conn.SetDeadline(utils.Now().Add(timeouts.HandshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, NewConnectionError(fmt.Errorf("set greeting deadline: %w", err))
+	}
 
 	// Read greeting
 	line, err := reader.ReadString('\n')
@@ -847,20 +987,37 @@ func (c *Client) createConnection(ctx context.Context, provider config.UsenetPro
 		return nil, NewConnectionError(fmt.Errorf("read greeting: %w", err))
 	}
 	if !strings.HasPrefix(line, "200") && !strings.HasPrefix(line, "201") {
-		_ = netConn.Close()
+		_ = conn.Close()
 		return nil, NewConnectionError(fmt.Errorf("unexpected greeting: %s", line))
+	}
+
+	// Port 119 is plaintext until STARTTLS succeeds. Require a verified upgrade
+	// before authentication so provider credentials are never sent in clear.
+	if !provider.SSL {
+		if err := conn.startTLS(ctx); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("STARTTLS: %w", err)
+		}
+	}
+
+	if err := conn.conn.SetDeadline(utils.Now().Add(timeouts.HandshakeTimeout)); err != nil {
+		_ = conn.Close()
+		return nil, NewConnectionError(fmt.Errorf("set authentication deadline: %w", err))
 	}
 
 	// Authenticate
 	if provider.Username != "" {
 		if err := conn.authenticate(); err != nil {
-			_ = netConn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("auth: %w", err)
 		}
 	}
 
 	// Clear deadline for normal operation
-	_ = netConn.SetDeadline(time.Time{})
+	if err := conn.conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		return nil, NewConnectionError(fmt.Errorf("clear connection setup deadline: %w", err))
+	}
 
 	return conn, nil
 }
@@ -881,38 +1038,102 @@ func (c *Client) reaper() {
 func (c *Client) reapIdleConnections() {
 	now := utils.Now()
 	for _, pp := range c.pools {
+		var toClose, toPing []*connectionEntry
+
 		pp.mu.Lock()
-
-		// LIFO Stack: Oldest (least recently used) items are at index 0.
-		// Find first non-expired connection; all after it are newer and valid.
-		expiredCount := 0
+		pingBudget := keepAliveBatchSize(len(pp.conns), pp.max)
+		kept := pp.conns[:0]
 		for _, entry := range pp.conns {
-			if isIdleExpired(entry.lastUsed, now) {
-				_ = entry.conn.Close()
-				expiredCount++
-			} else {
-				// Found a valid one - stop here
-				break
+			switch {
+			case c.isIdleExpired(entry.lastUsed, now):
+				toClose = append(toClose, entry)
+			case len(toPing) < pingBudget && now.Sub(entry.lastActivity()) > c.pingInterval:
+				// Reserve a provider slot while the entry is temporarily outside
+				// the pool. This prevents a checkout burst from dialing a
+				// replacement and exceeding max_connections.
+				select {
+				case pp.slots <- struct{}{}:
+					toPing = append(toPing, entry)
+				default:
+					kept = append(kept, entry)
+				}
+			default:
+				kept = append(kept, entry)
 			}
 		}
-
-		// Remove expired connections from the front of the slice
-		if expiredCount > 0 {
-			for i := 0; i < expiredCount; i++ {
-				releaseConnectionEntry(pp.conns[i])
-			}
-			// Shift remaining items to front
-			remaining := len(pp.conns) - expiredCount
-			copy(pp.conns, pp.conns[expiredCount:])
-			// Nil out trailing pointers to help GC
-			for i := remaining; i < len(pp.conns); i++ {
-				pp.conns[i] = nil
-			}
-			pp.conns = pp.conns[:remaining]
+		for i := len(kept); i < len(pp.conns); i++ {
+			pp.conns[i] = nil
 		}
-
+		pp.conns = kept
 		pp.mu.Unlock()
+
+		for _, entry := range toClose {
+			conn := entry.conn
+			releaseConnectionEntry(entry)
+			_ = conn.Close()
+		}
+		// DATE is a network round-trip, so never hold the pool lock while
+		// pinging. Run the bounded batch concurrently so one slow session does
+		// not delay every other keepalive or the next reaper sweep.
+		var pingWG sync.WaitGroup
+		for _, entry := range toPing {
+			pingWG.Add(1)
+			go func() {
+				defer pingWG.Done()
+				c.keepAlive(pp, entry, now)
+			}()
+		}
+		pingWG.Wait()
 	}
+}
+
+func keepAliveBatchSize(pooled, capacity int) int {
+	if pooled <= 0 || capacity <= 0 {
+		return 0
+	}
+	batch := capacity / 4
+	if batch < 1 {
+		batch = 1
+	}
+	if batch > maxKeepAliveBatch {
+		batch = maxKeepAliveBatch
+	}
+	// Preserve at least one immediately available pooled connection whenever
+	// possible. A single-connection pool has no spare capacity to preserve.
+	if pooled > 1 && batch >= pooled {
+		batch = pooled - 1
+	}
+	return batch
+}
+
+// keepAlive pings an idle connection that was removed from its pool while a
+// provider slot is reserved. Healthy sessions return to the pool; stale ones
+// are closed so they can never be handed to a reader.
+func (c *Client) keepAlive(pp *ProviderPool, entry *connectionEntry, now time.Time) {
+	discard := func() {
+		conn := entry.conn
+		releaseConnectionEntry(entry)
+		_ = conn.Close()
+		<-pp.slots
+	}
+
+	if err := entry.conn.ping(); err != nil {
+		c.logger.Debug().Err(err).Str("provider", entry.provider.Host).
+			Msg("keepalive ping failed, closing idle connection")
+		discard()
+		return
+	}
+	entry.lastPing = now
+
+	pp.mu.Lock()
+	if c.closed.Load() || len(pp.conns) >= pp.max {
+		pp.mu.Unlock()
+		discard()
+		return
+	}
+	pp.conns = append(pp.conns, entry)
+	pp.mu.Unlock()
+	<-pp.slots
 }
 
 // Stats returns current pool statistics
@@ -1013,6 +1234,10 @@ type providerExclusions struct {
 	backbones map[string]struct{}
 }
 
+func (e providerExclusions) clone() providerExclusions {
+	return providerExclusions{hosts: maps.Clone(e.hosts), backbones: maps.Clone(e.backbones)}
+}
+
 func (e *providerExclusions) excludeHost(host string) {
 	if host == "" {
 		return
@@ -1069,13 +1294,27 @@ func excludeForArticleNotFound(exclusions *providerExclusions, provider config.U
 	exclusions.excludeHost(provider.Host)
 }
 
-// BatchStat checks the availability of many message IDs using NNTP STAT. Each
-// worker holds one repair-bank token for its lifetime, so the total number of
-// concurrent NNTP connections used by all in-flight BatchStat calls never
-// exceeds the bank's capacity. When the client has no bank configured, a small
-// default worker count is used. Does NOT fail-fast: every chunk is processed so
-// the caller sees complete per-segment visibility.
+// BatchStat checks message IDs using NNTP STAT and stops remaining chunks after
+// the first article proven missing from every provider. This is the efficient
+// path for availability gates where any missing sample is terminal.
 func (c *Client) BatchStat(ctx context.Context, messageIDs []string) (*BatchStatResult, error) {
+	return c.batchStat(ctx, messageIDs, true)
+}
+
+// BatchStatAll checks every message ID and returns complete per-article
+// visibility. It shares the same bounded repair bank as BatchStat, but does not
+// cancel remaining chunks when one article is missing. Admission parsers use
+// this to distinguish an entirely unavailable NZB from one containing a mix of
+// available and unavailable files.
+func (c *Client) BatchStatAll(ctx context.Context, messageIDs []string) (*BatchStatResult, error) {
+	return c.batchStat(ctx, messageIDs, false)
+}
+
+func (c *Client) batchStat(
+	ctx context.Context,
+	messageIDs []string,
+	stopOnMissing bool,
+) (*BatchStatResult, error) {
 	if c.closed.Load() {
 		return nil, errors.New("nntp client is closed")
 	}
@@ -1154,11 +1393,8 @@ func (c *Client) BatchStat(ctx context.Context, messageIDs []string) (*BatchStat
 			// Per-segment provider failover has already completed inside
 			// this chunk before we get here, so this never short-circuits
 			// failover.
-			for _, r := range results {
-				if !r.Available && IsArticleNotFoundError(r.Error) {
-					bailOnce.Do(cancel)
-					break
-				}
+			if shouldStopBatchStat(stopOnMissing, results) {
+				bailOnce.Do(cancel)
 			}
 		})
 		if err != nil {
@@ -1192,6 +1428,18 @@ func (c *Client) BatchStat(ctx context.Context, messageIDs []string) (*BatchStat
 		result.ErrorCount++
 	}
 	return result, nil
+}
+
+func shouldStopBatchStat(stopOnMissing bool, results []StatResult) bool {
+	if !stopOnMissing {
+		return false
+	}
+	for _, result := range results {
+		if !result.Available && IsArticleNotFoundError(result.Error) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) batchStatAcrossProviders(ctx context.Context, messageIDs []string) ([]StatResult, error) {

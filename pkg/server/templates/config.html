@@ -61,6 +61,12 @@
                         </button>
                         <button type="button"
                                 class="tab-button flex items-center gap-2 py-3 px-1 border-b-2 border-transparent text-base-content/70 hover:text-base-content hover:border-base-300 font-medium text-sm transition-colors"
+                                data-tab="strm">
+                            <i class="bi bi-play-btn text-lg"></i>
+                            <span class="hidden sm:inline">STRM Library</span>
+                        </button>
+                        <button type="button"
+                                class="tab-button flex items-center gap-2 py-3 px-1 border-b-2 border-transparent text-base-content/70 hover:text-base-content hover:border-base-300 font-medium text-sm transition-colors"
                                 data-tab="repair">
                             <i class="bi bi-heart-pulse text-lg"></i>
                             <span class="hidden sm:inline">Repair</span>
@@ -169,6 +175,17 @@
                                     <span class="text-sm opacity-70">Comma-separated list of allowed file
                                         extensions</span>
                                 </div>
+                            </div>
+
+                            <div>
+                                <label class="label cursor-pointer justify-start gap-3">
+                                    <input type="checkbox" class="checkbox checkbox-primary"
+                                           name="allow_samples" id="allow_samples">
+                                    <div>
+                                        <span class="font-medium">Include Sample Files</span>
+                                        <div class="label-text-alt">Allow files whose names are identified as samples</div>
+                                    </div>
+                                </label>
                             </div>
 
                             <div class="divider">
@@ -281,6 +298,14 @@
                                 <span class="text-sm opacity-70">Duration before stalled active downloads are removed</span>
                             </div>
                             <div>
+                                <label class="label" for="uncachedStallTimeout">
+                                    <span class="font-medium">Uncached Stall Timeout</span>
+                                </label>
+                                <input type="text" class="input w-full" id="uncachedStallTimeout"
+                                       name="uncached_stall_timeout" placeholder="2h">
+                                <span class="text-sm opacity-70">Optional maximum no-progress wait for uncached releases (minimum 10m). No-seeds and metadata states may be checked after 10m and 20m; two fresh checks are required before Arr replacement.</span>
+                            </div>
+                            <div>
                                 <label class="label" for="nzbUserAgent">
                                     <span class="font-medium">NZB User Agent</span>
                                 </label>
@@ -334,6 +359,16 @@
                                 <input type="number" class="input w-full" name="max_active_downloads"
                                        id="max_active_downloads" min="1" placeholder="5">
                                 <span class="text-sm opacity-70">Shared active limit for torrent and NZB downloads</span>
+                            </div>
+                            <div>
+                                <label class="label cursor-pointer justify-start gap-3">
+                                    <input type="checkbox" class="checkbox checkbox-primary"
+                                           name="relative_symlinks" id="relative_symlinks">
+                                    <div>
+                                        <span class="font-medium">Relative Symlinks</span>
+                                        <div class="label-text-alt">Make new links portable when mount and download paths keep the same relative layout</div>
+                                    </div>
+                                </label>
                             </div>
                         </div>
                     </div>
@@ -772,7 +807,7 @@
                                     <input type="radio" class="radio radio-primary" name="mount.type" value="dfs"
                                            id="mount.type.dfs" checked>
                                     <div>
-                                        <span class="font-medium">DFS (Decypharr Filesystem)</span>
+                                        <span class="font-medium">DFS (Tessarr Filesystem)</span>
                                         <div class="label-text-alt">Built-in filesystem implementation</div>
                                     </div>
                                 </label>
@@ -1337,6 +1372,82 @@
                     </div>
                 </div>
 
+                <div class="tab-content hidden" data-tab-content="strm">
+                    <div class="space-y-6">
+                        <div class="alert alert-info">
+                            <i class="bi bi-info-circle text-xl"></i>
+                            <div>
+                                <h3 class="font-bold">Mountless media library</h3>
+                                <div class="text-sm">Creates small, signed .strm files that Jellyfin, Plex, Emby, or
+                                    another player can scan. Playback resolves the current debrid or Usenet source at
+                                    request time, so provider links can refresh without rebuilding the media database.
+                                </div>
+                            </div>
+                        </div>
+
+                        <label class="label cursor-pointer justify-start gap-3">
+                            <input type="checkbox" class="checkbox checkbox-lg checkbox-primary"
+                                   id="strm.enabled" name="strm.enabled">
+                            <div>
+                                <span class="label-text font-medium text-lg">Enable STRM Library</span>
+                                <div class="label-text-alt">Runs alongside any mount type, including No Mount.</div>
+                            </div>
+                        </label>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                            <div class="lg:col-span-2">
+                                <label class="label" for="strm.path">
+                                    <span class="font-medium">Export path</span>
+                                </label>
+                                <input type="text" class="input w-full strm-setting" name="strm.path" id="strm.path"
+                                       placeholder="/home/user/media-strm">
+                                <span class="label-text-alt opacity-70">Use a dedicated folder. Tessarr refuses to
+                                    take ownership of a non-empty, unrecognized folder and preserves foreign files.</span>
+                            </div>
+
+                            <div>
+                                <label class="label" for="strm.delivery_mode">
+                                    <span class="font-medium">Playback delivery</span>
+                                </label>
+                                <select class="select w-full strm-setting" name="strm.delivery_mode"
+                                        id="strm.delivery_mode">
+                                    <option value="proxy">Proxy through Tessarr (recommended)</option>
+                                    <option value="redirect">Redirect to provider when possible</option>
+                                </select>
+                                <span class="label-text-alt opacity-70">Proxy supports both debrid and Usenet and keeps
+                                    provider URLs private. Redirect reduces server bandwidth for debrid playback but
+                                    exposes the temporary provider URL to the player.</span>
+                            </div>
+
+                            <div>
+                                <label class="label cursor-pointer justify-start gap-3 mt-8">
+                                    <input type="checkbox" class="checkbox checkbox-primary strm-setting"
+                                           id="strm.keep_media_extension" name="strm.keep_media_extension">
+                                    <div>
+                                        <span class="font-medium">Keep media extension</span>
+                                        <div class="label-text-alt">Write Movie.mkv.strm instead of Movie.strm.</div>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="card bg-base-200">
+                            <div class="card-body gap-3">
+                                <h3 class="card-title text-base">Reachability</h3>
+                                <p class="text-sm opacity-80">The General tab's Application URL is written into each
+                                    .strm file. Leave it blank only when the player runs on this same host and can reach
+                                    Tessarr on loopback.</p>
+                                <div class="card-actions justify-end">
+                                    <button type="button" class="btn btn-outline btn-primary strm-setting"
+                                            id="strmRegenerateBtn">
+                                        <i class="bi bi-arrow-repeat"></i>Regenerate library
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="tab-content hidden" data-tab-content="repair">
                     <div class="space-y-6">
                         <div>
@@ -1420,6 +1531,15 @@
                                     <option value="per_file">Per file</option>
                                 </select>
                             </div>
+
+                            <div>
+                                <label class="label" for="repair.stop_schedule">
+                                    <span class="font-medium">Stop schedule <span class="opacity-60 font-normal">(optional)</span></span>
+                                </label>
+                                <input type="text" class="input w-full" name="repair.stop_schedule" id="repair.stop_schedule"
+                                       placeholder="e.g. 06:00, 0 6 * * *, 4h">
+                                <span class="label-text-alt opacity-70">Cron expression, clock time, or interval. If a repair sweep is still running when this fires, it's stopped early. Uses "Auto-repair when broken" below to decide whether to repair whatever was found broken so far.</span>
+                            </div>
                         </div>
 
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1436,6 +1556,7 @@
                         </div>
                     </div>
                 </div>
+
 
             </div>
         </div>
@@ -1657,10 +1778,10 @@
         const tokenDisplay = document.getElementById('api-token-display');
 
         // Show loading state
-        window.decypharrUtils.setButtonLoading(refreshBtn, true, 'Refresh Token');
+        window.tessarrUtils.setButtonLoading(refreshBtn, true, 'Refresh Token');
 
         try {
-            const response = await window.decypharrUtils.fetcher('/api/refresh-token', {
+            const response = await window.tessarrUtils.fetcher('/api/refresh-token', {
                 method: 'POST'
             });
 
@@ -1670,13 +1791,15 @@
 
             const data = await response.json();
             tokenDisplay.value = data.token;
-            window.decypharrUtils.createToast(data.message || 'Token refreshed successfully', 'success');
+			tokenDisplay.dataset.tokenAvailable = 'true';
+			document.getElementById('copy-token-btn').disabled = false;
+            window.tessarrUtils.createToast(data.message || 'Token refreshed successfully', 'success');
 
         } catch (error) {
             console.error('Error refreshing token:', error);
-            window.decypharrUtils.createToast('Failed to refresh token: ' + error.message, 'error');
+            window.tessarrUtils.createToast('Failed to refresh token: ' + error.message, 'error');
         } finally {
-            window.decypharrUtils.setButtonLoading(refreshBtn, false);
+            window.tessarrUtils.setButtonLoading(refreshBtn, false);
         }
     }
 
@@ -1684,16 +1807,16 @@
         const tokenDisplay = document.getElementById('api-token-display');
         const token = tokenDisplay.value;
 
-        if (!token || token === 'No token generated') {
-            window.decypharrUtils.createToast('No token to copy. Please refresh the token first.', 'warning');
+		if (!token || tokenDisplay.dataset.tokenAvailable !== 'true') {
+            window.tessarrUtils.createToast('No token to copy. Please refresh the token first.', 'warning');
             return;
         }
 
         try {
-            await window.decypharrUtils.copyToClipboard(token);
+            await window.tessarrUtils.copyToClipboard(token);
         } catch (error) {
             console.error('Failed to copy token:', error);
-            window.decypharrUtils.createToast('Failed to copy token to clipboard', 'error');
+            window.tessarrUtils.createToast('Failed to copy token to clipboard', 'error');
         }
     }
 
@@ -1704,15 +1827,15 @@
         const updateBtn = document.getElementById('update-auth-btn');
 
         if (password !== confirmPassword) {
-            window.decypharrUtils.createToast('Passwords do not match', 'error');
+            window.tessarrUtils.createToast('Passwords do not match', 'error');
             return false;
         }
 
         // Show loading state
-        window.decypharrUtils.setButtonLoading(updateBtn, true, 'Update Authentication');
+        window.tessarrUtils.setButtonLoading(updateBtn, true, 'Update Authentication');
 
         try {
-            const response = await window.decypharrUtils.fetcher('/api/update-auth', {
+            const response = await window.tessarrUtils.fetcher('/api/update-auth', {
                 method: 'POST',
                 body: JSON.stringify({
                     username: username,
@@ -1727,7 +1850,7 @@
             }
 
             const data = await response.json();
-            window.decypharrUtils.createToast(data.message, 'success');
+            window.tessarrUtils.createToast(data.message, 'success');
 
             // Clear password fields for security
             document.getElementById('auth-password').value = '';
@@ -1737,10 +1860,10 @@
 
         } catch (error) {
             console.error('Error updating auth settings:', error);
-            window.decypharrUtils.createToast('Failed to update authentication: ' + error.message, 'error');
+            window.tessarrUtils.createToast('Failed to update authentication: ' + error.message, 'error');
             return false;
         } finally {
-            window.decypharrUtils.setButtonLoading(updateBtn, false);
+            window.tessarrUtils.setButtonLoading(updateBtn, false);
         }
     }
 </script>

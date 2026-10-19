@@ -3,7 +3,7 @@ title: API Reference
 description: REST API endpoints.
 ---
 
-Decypharr provides a REST API for programmatic access.
+Tessarr provides a REST API for programmatic access.
 
 ## Authentication
 
@@ -20,7 +20,7 @@ Get API token from **Settings** → **Auth** after login.
 
 ### GET /version
 
-Get Decypharr version.
+Get Tessarr version.
 
 ```bash
 curl http://localhost:8282/version
@@ -36,24 +36,47 @@ curl http://localhost:8282/version
 
 ### GET /api/config
 
-Get current configuration.
+Get the editable configuration without returning stored credentials. Configured
+provider keys, Arr tokens, Usenet and rclone passwords, proxy values, webhook
+URLs, and callback URLs are represented by the reserved
+`__TESSARR_REDACTED__` placeholder. The control-plane API token is never
+returned; `api_token_configured` reports whether one exists.
 
 ```bash
 curl -H "Authorization: Bearer TOKEN" \
   http://localhost:8282/api/config
 ```
 
-### POST /api/config
+### PATCH /api/config
 
-Update configuration.
+Update only the supplied configuration fields. Omitted fields are preserved.
+The request uses [JSON Merge Patch](https://www.rfc-editor.org/rfc/rfc7396)
+semantics, so setting a field to `null` removes it.
+
+When updating an existing provider entry, send the redaction placeholder back
+unchanged to preserve that entry's stored secret, send a new value to replace
+it, or send an empty string to request an empty value (normal configuration
+validation still applies). A placeholder whose provider identity no longer
+matches an existing entry is rejected instead of being persisted.
 
 ```bash
-curl -X POST \
+curl -X PATCH \
   -H "Authorization: Bearer TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"log_level": "debug"}' \
   http://localhost:8282/api/config
 ```
+
+### PUT /api/config
+
+Replace the editable configuration with a complete document. Authentication
+credentials and authentication enablement are managed separately and are not
+overwritten by this endpoint.
+
+`POST /api/config` remains temporarily available for older clients, but it is
+deprecated and rejects requests that omit the `debrids`, `mount`, or `usenet`
+sections. In compatibility mode it preserves other omitted fields. Use `PATCH`
+for all new partial-update integrations.
 
 ### GET /api/torrents
 
@@ -76,18 +99,23 @@ Add torrent or NZB.
 ```bash
 curl -X POST \
   -H "Authorization: Bearer TOKEN" \
-  -F "file=@file.torrent" \
+  -F "files=@file.torrent" \
   http://localhost:8282/api/add
 ```
 
-Or with URL:
+Or with a magnet link, torrent URL, 40-character hex infohash, or 32-character
+base32 infohash:
 
 ```bash
 curl -X POST \
   -H "Authorization: Bearer TOKEN" \
-  -d '{"url": "magnet:?xt=..."}' \
+  -F "urls=8a19577fb5f690970ca43a57ff1011ae202244b8" \
   http://localhost:8282/api/add
 ```
+
+Separate multiple `urls` values with newlines. Raw infohash imports are
+converted to tracker-free magnets; the provider supplies the torrent name and
+metadata after submission.
 
 ### DELETE /api/torrents
 
@@ -120,6 +148,7 @@ Trigger a sweep now. Optional JSON body fields:
 | `ignore_last_checked` | boolean | Probe entries even when their last health check is still fresh.    |
 | `auto_repair`         | boolean | Override the configured auto-repair setting for this run.          |
 | `unrestrict_link`     | boolean | For torrent entries, probe by generating an unrestricted link instead of calling the provider check endpoint. |
+| `verify_content`      | boolean | Manually add a bounded NZB media-head check for supported containers. With this enabled, omitted `auto_repair` defaults to `false` and omitted `protocol` to `nzb`; unsupported formats remain availability-only. |
 | `protocol`            | string  | `all`, `torrent`, or `nzb`. Selects which protocols this run probes. |
 
 ```bash
@@ -131,6 +160,20 @@ curl -X POST \
 ```
 
 Returns `409 Conflict` when a sweep is already running.
+
+Run a deeper, detect-only NZB check and include entries whose health is still
+fresh:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"verify_content":true,"ignore_last_checked":true,"auto_repair":false,"protocol":"nzb"}' \
+  http://localhost:8282/api/repair/run
+```
+
+`verify_content` is rejected with `protocol: "torrent"`. It does not affect
+imports, scheduled sweeps, or single-entry UI rechecks.
 
 ### POST /api/repair/stop
 
@@ -194,6 +237,21 @@ curl -X POST \
   http://localhost:8282/api/repair/recheck/media
 ```
 
+### POST /webhooks/tautulli
+
+Trigger a targeted media recheck from Tautulli. When authentication is
+enabled, configure the notification agent to send Tessarr's API token in an
+`Authorization: Bearer TOKEN` header. A payload without a media identifier
+starts a full sweep.
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"topic":"tautulli","arr":"Sonarr","media_id":"123","fix":false}' \
+  http://localhost:8282/webhooks/tautulli
+```
+
 ### GET /api/arrs
 
 List connected Arrs.
@@ -217,13 +275,14 @@ curl -X POST \
 
 ```json
 {
-  "api_token": "NEW_TOKEN"
+	"token": "NEW_TOKEN",
+	"message": "API token refreshed successfully"
 }
 ```
 
 ## QBitTorrent API
 
-Decypharr implements QBitTorrent Web API for Arr compatibility.
+Tessarr implements QBitTorrent Web API for Arr compatibility.
 
 ### POST /api/v2/auth/login
 
@@ -256,6 +315,19 @@ curl -X POST \
   http://localhost:8282/api/v2/torrents/add
 ```
 
+When every eligible provider gives a definite cache miss, the endpoint returns
+`409 Conflict` with `X-Tessarr-Error-Code: torrent_not_cached`. Mixed failures
+(for example, a cache miss followed by a provider outage) are not mislabeled as
+an all-provider cache miss.
+
+When every eligible provider rejects the content permanently, the endpoint
+returns `422 Unprocessable Entity` with
+`X-Tessarr-Error-Code: torrent_content_rejected`. Real-Debrid HTTP 451
+responses use this outcome. Tessarr cools down that provider and info hash
+for 24 hours, so recurring Arr grabs do not repeatedly call the rejecting
+provider; other providers remain eligible. Cache misses and operational
+failures are never placed in this cooldown.
+
 ### POST /api/v2/torrents/delete
 
 Delete torrents (QBit format).
@@ -287,6 +359,19 @@ List files in torrent.
 
 Download specific file.
 
+## STRM Library
+
+### POST /api/strm/regenerate
+
+Starts a complete reconciliation of the configured STRM export and returns
+`202 Accepted`. This control-plane endpoint requires the same authenticated
+session or bearer token as the rest of `/api`.
+
+Generated media URLs use `/stream/v1/{entryID}/{fileID}/{name}?s={signature}`.
+They are read-only and require a valid HMAC signature even when WebDAV or UI
+authentication is disabled. `HEAD` is answered from stored metadata without a
+provider or NNTP request; `GET` supports one HTTP byte range.
+
 ## Error Responses
 
 ```json
@@ -306,7 +391,21 @@ Download specific file.
 
 ## Rate Limiting
 
-API respects Debrid provider rate limits configured in `config.json`. No additional API rate limiting.
+API calls respect Debrid provider rate limits configured in `config.json`.
+CDN response bodies use a separate automatic concurrency governor: playback
+and seeks take priority over background downloads, one playback slot is kept
+available whenever the budget has at least two slots, and `429` responses
+reduce concurrency until the provider's `Retry-After` window has passed. This
+behavior requires no configuration.
+
+The authenticated `GET /debug/stats` response exposes a secret-free
+`cdn_traffic` snapshot with active and waiting request counts, adaptive limits,
+and throttle counters grouped by provider. API keys and download-account
+tokens are never included.
+
+The same response includes `torrent_admission`, an aggregate count of content
+rejections, submissions avoided by the bounded cooldown, active cooldowns, and
+the cooldown duration. It does not expose release names or info hashes.
 
 ## Examples
 

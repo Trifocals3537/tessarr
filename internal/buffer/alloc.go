@@ -10,26 +10,44 @@ import "sync"
 // blocks to a shared goroutine keeps the lock holder off the syscall: the pages
 // are still released promptly (the queue drains continuously), only the *timing*
 // moves off the critical path, so deterministic RAM release is preserved.
-var unmapCh = make(chan *[]byte, 256)
+var unmapCh = make(chan blockRelease, 256)
+
+// blockRelease keeps an allocation charged until its release completes.
+type blockRelease struct {
+	data *[]byte
+	pool *Pool
+}
+
+func (r blockRelease) release() {
+	munmapBlock(r.data)
+	r.pool.memAllocated.Add(-int64(blockSize))
+}
+
+func (r blockRelease) releaseQueued() {
+	defer r.pool.releaseWG.Done()
+	r.release()
+}
 
 func init() {
 	go func() {
-		for p := range unmapCh {
-			munmapBlock(p)
+		for r := range unmapCh {
+			r.releaseQueued()
 		}
 	}()
 }
 
 // releaseBlock unmaps p off the caller's goroutine when possible, falling back
 // to an inline unmap only if the queue is saturated (rare churn burst).
-func releaseBlock(p *[]byte) {
+func releaseBlock(p *[]byte, pool *Pool) {
 	if p == nil {
 		return
 	}
+	r := blockRelease{data: p, pool: pool}
+	pool.releaseWG.Add(1)
 	select {
-	case unmapCh <- p:
+	case unmapCh <- r:
 	default:
-		munmapBlock(p)
+		r.releaseQueued()
 	}
 }
 
@@ -61,47 +79,61 @@ type blockAllocator struct {
 	mu      sync.Mutex
 	free    []*[]byte
 	maxFree int
+	pool    *Pool
 }
 
-// get returns a blockSize buffer, reusing a freed one when available.
-func (a *blockAllocator) get() *[]byte {
+// get returns a blockSize buffer, reusing a freed one when available. A new
+// allocation is admitted against the pool's allocation budget atomically.
+func (a *blockAllocator) get() (*[]byte, bool) {
 	a.mu.Lock()
 	if n := len(a.free); n > 0 {
 		p := a.free[n-1]
 		a.free[n-1] = nil
 		a.free = a.free[:n-1]
+		a.pool.memReusable.Add(-int64(blockSize))
 		a.mu.Unlock()
-		return p
+		return p, true
 	}
 	a.mu.Unlock()
-	return mmapAlloc(blockSize)
+
+	if !a.pool.tryReserveAllocation() {
+		// Another Buffer may be holding unused allocations. Return those to the
+		// OS before refusing active data or forcing a write-through fallback.
+		a.pool.releaseReusable()
+		if !a.pool.tryReserveAllocation() {
+			return nil, false
+		}
+	}
+	return mmapAlloc(blockSize), true
 }
 
-// put hands a buffer back. It is retained for reuse if the free list has
-// room, otherwise unmapped immediately so the pages return to the OS.
+// put retains a block if the free list has room and the pool is open.
+// Otherwise, it sends the block for release.
 func (a *blockAllocator) put(p *[]byte) {
 	if p == nil {
 		return
 	}
 	a.mu.Lock()
-	if len(a.free) < a.maxFree {
+	if len(a.free) < a.maxFree && !a.pool.closed.Load() {
 		a.free = append(a.free, p)
+		a.pool.memReusable.Add(int64(blockSize))
 		a.mu.Unlock()
 		return
 	}
 	a.mu.Unlock()
 	// Off the caller's goroutine: put() is called under the Buffer's exclusive
 	// lock on the eviction path, and munmap must not stall readers there.
-	releaseBlock(p)
+	releaseBlock(p, a.pool)
 }
 
-// drain unmaps every buffer held for reuse. Call on Buffer.Close.
+// drain releases every buffer held for reuse.
 func (a *blockAllocator) drain() {
 	a.mu.Lock()
 	free := a.free
 	a.free = nil
+	a.pool.memReusable.Add(-int64(len(free)) * int64(blockSize))
 	a.mu.Unlock()
 	for _, p := range free {
-		munmapBlock(p)
+		blockRelease{data: p, pool: a.pool}.release()
 	}
 }

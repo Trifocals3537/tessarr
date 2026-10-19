@@ -41,7 +41,7 @@ class SetupWizard {
 
     async loadExistingConfig() {
         try {
-            const response = await window.decypharrUtils.fetcher('/api/config');
+            const response = await window.tessarrUtils.fetcher('/api/config');
             if (response.ok) {
                 const config = await response.json();
                 this.populateFields(config);
@@ -53,6 +53,7 @@ class SetupWizard {
     }
 
     populateFields(config) {
+		const redactedSecret = '__TESSARR_REDACTED__';
         // Populate authentication fields
         if (config.auth_username) {
             document.getElementById('auth-username').value = config.auth_username;
@@ -62,18 +63,28 @@ class SetupWizard {
         if (config.debrids && config.debrids.length > 0) {
             const debrid = config.debrids[0];
             document.getElementById('debrid-provider').value = debrid.provider || '';
-            document.getElementById('debrid-api-key').value = debrid.api_key || '';
+			const apiKey = document.getElementById('debrid-api-key');
+			if (debrid.api_key === redactedSecret) {
+				apiKey.placeholder = 'Configured — re-enter to rerun setup';
+			} else {
+				apiKey.value = debrid.api_key || '';
+			}
         }
 
         // Populate usenet fields if exists
-        if (config.usenet && config.usenet.length > 0) {
-            const usenet = config.usenet[0];
+		if (config.usenet?.providers?.length > 0) {
+			const usenet = config.usenet.providers[0];
             document.getElementById('usenet-host').value = usenet.host || '';
             document.getElementById('usenet-port').value = usenet.port || '';
             document.getElementById('usenet-username').value = usenet.username || '';
-            document.getElementById('usenet-password').value = usenet.password || '';
+			const password = document.getElementById('usenet-password');
+			if (usenet.password === redactedSecret) {
+				password.placeholder = 'Configured — re-enter to rerun setup';
+			} else {
+				password.value = usenet.password || '';
+			}
             document.getElementById('usenet-max-connections').value = usenet.max_connections || '';
-            document.getElementById('usenet-max-connections-per-reader').value = usenet.reader_connections || '';
+			document.getElementById('usenet-max-connections-per-reader').value = config.usenet.max_connections || '';
             document.getElementById('usenet-ssl').checked = !!usenet.ssl;
         }
 
@@ -83,16 +94,16 @@ class SetupWizard {
         }
 
         // Populate mount settings
-        if (config.dfs?.enabled) {
+		if (config.mount?.type === 'dfs') {
             document.getElementById('mount-type-dfs').checked = true;
-            document.getElementById('mount-path').value = config.dfs.mount_path || '';
-            document.getElementById('cache-dir').value = config.dfs.cache_dir || '';
-        } else if (config.rclone?.enabled) {
+			document.getElementById('mount-path').value = config.mount.mount_path || '';
+			document.getElementById('cache-dir').value = config.mount.dfs?.cache_dir || '';
+		} else if (config.mount?.type === 'rclone') {
             document.getElementById('mount-type-rclone').checked = true;
-            document.getElementById('mount-path').value = config.rclone.mount_path || '';
-            document.getElementById('cache-dir').value = config.rclone.vfs_cache_dir || '';
-            if (config.rclone.buffer_size) {
-                document.getElementById('rclone-buffer-size').value = config.rclone.buffer_size;
+			document.getElementById('mount-path').value = config.mount.mount_path || '';
+			document.getElementById('cache-dir').value = config.mount.rclone?.cache_dir || '';
+			if (config.mount.rclone?.buffer_size) {
+				document.getElementById('rclone-buffer-size').value = config.mount.rclone.buffer_size;
             }
         }
     }
@@ -412,9 +423,9 @@ class SetupWizard {
         if (this.setupState.step2 && this.setupState.step2.skip_debrid) {
             debridOverview.textContent = 'Debrid disabled (skipped)';
         } else if (this.setupState.step2 && this.setupState.step2.provider) {
-            debridOverview.innerHTML = `
-                <p><strong>Provider:</strong> ${this.setupState.step2.provider}</p>
-            `;
+			this.renderOverviewLines(debridOverview, [
+				['Provider', this.setupState.step2.provider]
+			]);
         } else {
             debridOverview.textContent = 'Not configured';
         }
@@ -423,13 +434,13 @@ class SetupWizard {
         if (this.setupState.step3 && this.setupState.step3.skip_usenet) {
             usenetOverview.textContent = 'Usenet disabled (skipped)';
         } else if (this.setupState.step3 && this.setupState.step3.host) {
-            usenetOverview.innerHTML = `
-                <p><strong>Server:</strong> ${this.setupState.step3.host}:${this.setupState.step3.port}</p>
-                <p><strong>Username:</strong> ${this.setupState.step3.username}</p>
-                <p><strong>Max Connections:</strong> ${this.setupState.step3.max_connections}</p>
-                <p><strong>Connections Per Stream:</strong> ${this.setupState.step3.reader_connections}</p>
-                <p><strong>Use SSL:</strong> ${this.setupState.step3.ssl ? 'Yes' : 'No'}</p>
-            `;
+			this.renderOverviewLines(usenetOverview, [
+				['Server', `${this.setupState.step3.host}:${this.setupState.step3.port}`],
+				['Username', this.setupState.step3.username],
+				['Max Connections', this.setupState.step3.max_connections],
+				['Connections Per Stream', this.setupState.step3.reader_connections],
+				['Use SSL', this.setupState.step3.ssl ? 'Yes' : 'No']
+			]);
         } else {
             usenetOverview.textContent = 'Not configured';
         }
@@ -445,17 +456,28 @@ class SetupWizard {
             } else if (this.setupState.step5.mount_type === 'external_rclone') {
                 mountType = 'External Rclone';
             } else if (this.setupState.step5.mount_type === 'dfs') {
-                mountType = 'DFS (Decypharr File System)';
+                mountType = 'DFS (Tessarr File System)';
             }
-            mountOverview.innerHTML = `
-                <p><strong>Type:</strong> ${mountType}</p>
-                <p><strong>Mount Path:</strong> ${this.setupState.step5.mount_path}</p>
-                <p><strong>Cache Directory:</strong> ${this.setupState.step5.cache_dir}</p>
-            `;
+			this.renderOverviewLines(mountOverview, [
+				['Type', mountType],
+				['Mount Path', this.setupState.step5.mount_path],
+				['Cache Directory', this.setupState.step5.cache_dir]
+			]);
         } else {
             mountOverview.textContent = 'Not configured';
         }
     }
+
+	renderOverviewLines(container, lines) {
+		container.replaceChildren();
+		lines.forEach(([label, value]) => {
+			const paragraph = document.createElement('p');
+			const heading = document.createElement('strong');
+			heading.textContent = `${label}:`;
+			paragraph.append(heading, document.createTextNode(` ${value ?? ''}`));
+			container.appendChild(paragraph);
+		});
+	}
 
     async handleFinish() {
         const finishBtn = document.getElementById('finish-btn');
@@ -483,7 +505,7 @@ class SetupWizard {
                 mount: this.setupState.step5,
             };
 
-            const response = await window.decypharrUtils.fetcher('/api/setup/complete', {
+            const response = await window.tessarrUtils.fetcher('/api/setup/complete', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(setupData),
@@ -495,10 +517,10 @@ class SetupWizard {
             }
 
             const data = await response.json();
-            window.decypharrUtils.createToast('Setup completed successfully! Redirecting...', 'success');
+            window.tessarrUtils.createToast('Setup completed successfully! Redirecting...', 'success');
 
             setTimeout(() => {
-                window.location.href = window.decypharrUtils.joinURL(window.urlBase, '/');
+                window.location.href = window.tessarrUtils.joinURL(window.urlBase, '/');
             }, 1500);
 
         } catch (error) {

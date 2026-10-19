@@ -28,7 +28,7 @@ const minifyOptions = {
     mangle: {
         toplevel: false,
         reserved: [
-            '$', 'jQuery', 'decypharrUtils', 'configManager', 'repairManager',
+            '$', 'jQuery', 'tessarrUtils', 'configManager', 'repairManager',
             'RepairManager', 'RepairUtils', 'ConfigManager', 'window', 'document'
         ]
     },
@@ -62,7 +62,7 @@ async function minifyFile(inputPath, outputPath) {
 
     } catch (error) {
         console.error(`   ✗ Error minifying ${inputPath}:`, error.message);
-        return null;
+        throw error;
     }
 }
 

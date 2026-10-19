@@ -3,6 +3,7 @@ package nntp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -15,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	nntpyenc "github.com/Trifocals3537/tessarr/internal/nntp/yenc"
+	"github.com/Trifocals3537/tessarr/internal/utils"
 	"github.com/rs/zerolog"
-	nntpyenc "github.com/sirrobot01/decypharr/internal/nntp/yenc"
-	"github.com/sirrobot01/decypharr/internal/utils"
 )
 
 // Note: Timeout values are defined in TimeoutConfig (client.go).
@@ -218,6 +219,7 @@ type Connection struct {
 	writer                      *bufio.Writer
 	logger                      zerolog.Logger
 	closed                      atomic.Bool
+	tlsConfig                   *tls.Config
 
 	// Body-copy idle tracking. Written by copyBodyWithIdleDeadline on
 	// copyBodyWithIdleDeadline periodically while reads make progress;
@@ -271,8 +273,8 @@ func (c *Connection) authenticate() error {
 	return nil
 }
 
-// startTLS initiates TLS encryption with proper error handling
-func (c *Connection) startTLS() error {
+// startTLS initiates verified TLS encryption with proper error handling.
+func (c *Connection) startTLS(ctx context.Context) error {
 	if err := c.sendCommand("STARTTLS"); err != nil {
 		return NewConnectionError(fmt.Errorf("failed to send STARTTLS: %w", err))
 	}
@@ -286,12 +288,14 @@ func (c *Connection) startTLS() error {
 		return classifyNNTPError(resp.Code, fmt.Sprintf("STARTTLS not supported: %s", resp.Message))
 	}
 
-	// Upgrade connection to TLS
-	tlsConn := tls.Client(c.conn, &tls.Config{
-		ServerName:         c.address,
-		InsecureSkipVerify: true, // Match createConnection behavior
-		MinVersion:         tls.VersionTLS12,
-	})
+	// Upgrade and complete the handshake before the connection can carry
+	// credentials. Handshake verifies the certificate against the platform
+	// trust store and the configured NNTP host.
+	tlsConn := tls.Client(c.conn, hardenedNNTPConfig(c.tlsConfig, c.address))
+	if err := completeTLSHandshake(ctx, tlsConn); err != nil {
+		_ = tlsConn.Close()
+		return NewConnectionError(fmt.Errorf("STARTTLS handshake failed: %w", err))
+	}
 
 	c.conn = tlsConn
 	c.reader = bufio.NewReaderSize(tlsConn, 256*1024)
@@ -429,25 +433,15 @@ func (c *Connection) GetArticle(messageID string) (*Article, error) {
 
 func (c *Connection) GetHeader(messageID string, maxSnippet int) (*YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
-	// Send BODY command to start streaming
-	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
-	}
-
-	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
-	if err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
-	}
-
-	if code != 222 {
-		return nil, classifyNNTPError(code, string(message))
+	if err := c.requestBody(messageID); err != nil {
+		return nil, err
 	}
 
 	// Set read deadline to prevent hanging on stalled servers
 	_ = c.conn.SetReadDeadline(utils.Now().Add(timeouts.StreamBodyTimeout))
 	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 
-	dec := nntpyenc.AcquireDecoder(c.reader)
+	dec := nntpyenc.AcquireNNTPDecoder(c.reader)
 	defer nntpyenc.ReleaseDecoder(dec)
 
 	// Read snippet to trigger header parsing and capture metadata.
@@ -495,23 +489,14 @@ func metadataFromDecoder(dec *nntpyenc.Decoder, snippet []byte) *YencMetadata {
 // while keeping the NNTP connection reusable by draining the decoder to EOF.
 func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
-	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
-	}
-
-	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
-	if err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
-	}
-
-	if code != 222 {
-		return nil, classifyNNTPError(code, string(message))
+	if err := c.requestBody(messageID); err != nil {
+		return nil, err
 	}
 
 	_ = c.conn.SetReadDeadline(utils.Now().Add(timeouts.StreamBodyTimeout))
 	defer func() { _ = c.conn.SetReadDeadline(time.Time{}) }()
 
-	dec := nntpyenc.AcquireDecoder(c.reader)
+	dec := nntpyenc.AcquireNNTPDecoder(c.reader)
 	defer nntpyenc.ReleaseDecoder(dec)
 
 	var snippet []byte
@@ -525,28 +510,22 @@ func (c *Connection) GetHeaderPrefix(messageID string, maxSnippet int) (*YencMet
 		snippet = snippet[:n]
 	}
 
-	if _, err := c.copyBodyWithIdleDeadline(io.Discard, dec, timeouts.StreamBodyTimeout); err != nil {
+	drained, err := c.copyBodyWithIdleDeadline(io.Discard, dec, timeouts.StreamBodyTimeout)
+	if err != nil {
 		_ = c.conn.Close()
 		return nil, classifyTransferError("failed to drain article body", err)
 	}
 
-	return metadataFromDecoder(dec, snippet), nil
+	meta := metadataFromDecoder(dec, snippet)
+	meta.DecodedSize = int64(len(snippet)) + drained
+	return meta, nil
 }
 
 // GetBody retrieves article body by message ID as raw bytes (used by GetHeader)
 func (c *Connection) GetBody(messageID string) ([]byte, error) {
 	messageID = FormatMessageID(messageID)
-	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
-	}
-
-	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
-	if err != nil {
-		return nil, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
-	}
-
-	if code != 222 {
-		return nil, classifyNNTPError(code, string(message))
+	if err := c.requestBody(messageID); err != nil {
+		return nil, err
 	}
 
 	// Set read deadline to prevent hanging on stalled servers
@@ -572,58 +551,51 @@ func (c *Connection) GetDecodedBody(messageID string) ([]byte, error) {
 // returning the parsed yEnc metadata from the same pass.
 func (c *Connection) GetDecodedBodyWithMetadata(messageID string) ([]byte, *YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
-	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return nil, nil, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
+	if err := c.requestBody(messageID); err != nil {
+		return nil, nil, err
 	}
 
-	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
-	if err != nil {
-		return nil, nil, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
-	}
-
-	if code != 222 {
-		return nil, nil, classifyNNTPError(code, string(message))
-	}
-
-	dec := nntpyenc.AcquireDecoder(c.reader)
+	dec := nntpyenc.AcquireNNTPDecoder(c.reader)
 	// Always release decoder back to pool, even on panic
 	defer nntpyenc.ReleaseDecoder(dec)
 
 	// Pre-allocate output buffer for decoded data (~700KB typical)
 	output := bytes.NewBuffer(make([]byte, 0, 750*1024))
-	_, err = c.copyBodyWithIdleDeadline(output, dec, timeouts.StreamBodyTimeout)
+	_, err := c.copyBodyWithIdleDeadline(output, dec, timeouts.StreamBodyTimeout)
 
 	if err != nil {
 		return nil, nil, classifyTransferError("streaming yenc decode failed", err)
 	}
 	decoded := output.Bytes()
 
-	return decoded, metadataFromDecoder(dec, nil), nil
+	meta := metadataFromDecoder(dec, nil)
+	meta.DecodedSize = int64(len(decoded))
+	return decoded, meta, nil
 }
 
 func (c *Connection) StreamBody(messageID string, w io.Writer) (int64, error) {
+	n, _, err := c.StreamBodyWithMetadata(messageID, w)
+	return n, err
+}
+
+// StreamBodyWithMetadata returns geometry from the same decoding pass. Callers
+// using a staging writer must validate it before publishing the cached slice.
+func (c *Connection) StreamBodyWithMetadata(messageID string, w io.Writer) (int64, *YencMetadata, error) {
 	messageID = FormatMessageID(messageID)
-	if err := c.sendCommandArg("BODY", messageID); err != nil {
-		return 0, NewConnectionError(fmt.Errorf("failed to send BODY command: %w", err))
+	if err := c.requestBody(messageID); err != nil {
+		return 0, nil, err
 	}
 
-	code, message, err := c.readResponseCodeWithDeadline(timeouts.StreamBodyTimeout)
-	if err != nil {
-		return 0, NewConnectionError(fmt.Errorf("failed to read body response: %w", err))
-	}
-
-	if code != 222 {
-		return 0, classifyNNTPError(code, string(message))
-	}
-
-	dec := nntpyenc.AcquireDecoder(c.reader)
+	dec := nntpyenc.AcquireNNTPDecoder(c.reader)
 	// Always release decoder back to pool, even on panic
 	defer nntpyenc.ReleaseDecoder(dec)
 	n, err := c.copyBodyWithIdleDeadline(w, dec, timeouts.StreamBodyTimeout)
 	if err != nil {
-		return n, classifyTransferError("streaming yenc decode failed", err)
+		return n, nil, classifyTransferError("streaming yenc decode failed", err)
 	}
-	return n, nil
+	meta := metadataFromDecoder(dec, nil)
+	meta.DecodedSize = n
+	return n, meta, nil
 }
 
 // readDotBytes reads dot-terminated NNTP data using textproto.DotReader

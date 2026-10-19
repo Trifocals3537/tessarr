@@ -1,0 +1,50 @@
+name: Ubuntu 26.04 Compatibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ubuntu-next-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    name: Go and FUSE compatibility
+    runs-on: ubuntu-26.04
+    env:
+      CGO_ENABLED: "1"
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install Linux FUSE headers
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
+
+      - name: Verify CI dependency pins
+        run: bash scripts/check-ci-pins.sh
+
+      - name: Verify Tessarr brand boundary
+        run: bash scripts/check-brand.sh
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build native binary
+        run: |
+          mkdir -p dist
+          go build -trimpath -o dist/tessarr .
+
+      - name: Smoke-test command line
+        run: ./dist/tessarr --help

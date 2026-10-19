@@ -3,11 +3,11 @@ title: WebDAV Server
 description: Access files via WebDAV protocol.
 ---
 
-Decypharr includes a WebDAV server for browsing and streaming files without mounting.
+Tessarr includes a WebDAV server for browsing and streaming files without mounting.
 
 ## Access WebDAV
 
-**URL**: `http://decypharr:8282/webdav/`
+**URL**: `http://tessarr:8282/webdav/`
 
 ## Mount in OS
 
@@ -16,7 +16,7 @@ Decypharr includes a WebDAV server for browsing and streaming files without moun
 **Finder** → **Go** → **Connect to Server** (`Cmd+K`)
 
 ```
-http://decypharr:8282/webdav/
+http://tessarr:8282/webdav/
 ```
 
 Enter username and password.
@@ -26,7 +26,7 @@ Enter username and password.
 **File Explorer** → **This PC** → **Map network drive**
 
 ```
-\\decypharr@8282\DavWWWRoot\webdav\
+\\tessarr@8282\DavWWWRoot\webdav\
 ```
 
 ### Linux
@@ -36,11 +36,11 @@ Enter username and password.
 sudo apt install davfs2
 
 # Mount
-sudo mount -t davfs http://decypharr:8282/webdav /mnt/decypharr
+sudo mount -t davfs http://tessarr:8282/webdav /mnt/tessarr
 
 # With auth
 sudo mount -t davfs -o username=USER,password=PASS \
-  http://decypharr:8282/webdav /mnt/decypharr
+  http://tessarr:8282/webdav /mnt/tessarr
 ```
 
 ## File Structure
@@ -94,13 +94,13 @@ WebDAV supports HTTP Range requests for streaming:
 
 ```bash
 # Direct playback
-vlc http://decypharr:8282/webdav/__all__/TorrentName/video.mkv
+vlc http://tessarr:8282/webdav/__all__/TorrentName/video.mkv
 ```
 
 Provide username:password if auth enabled:
 
 ```bash
-vlc http://user:pass@decypharr:8282/webdav/__all__/TorrentName/video.mkv
+vlc http://user:pass@tessarr:8282/webdav/__all__/TorrentName/video.mkv
 ```
 
 ## STRM Files
@@ -108,7 +108,7 @@ vlc http://user:pass@decypharr:8282/webdav/__all__/TorrentName/video.mkv
 Create STRM files pointing to WebDAV URLs:
 
 ```
-http://decypharr:8282/webdav/sonarr/ShowName/S01E01.mkv
+http://tessarr:8282/webdav/sonarr/ShowName/S01E01.mkv
 ```
 
 When Plex/Jellyfin plays the STRM, it streams from WebDAV.
@@ -127,7 +127,7 @@ For best performance, use [DFS mounting](../dfs/) instead of WebDAV.
 
 ### Connection Refused
 
-- Verify Decypharr is running: `curl http://decypharr:8282/version`
+- Verify Tessarr is running: `curl http://tessarr:8282/version`
 - Check firewall rules
 
 ### Authentication Failed
@@ -152,7 +152,7 @@ WebDAV uses Basic Auth (base64-encoded, not encrypted). Use HTTPS in production:
 ```nginx
 # nginx reverse proxy
 location /webdav/ {
-    proxy_pass http://decypharr:8282/webdav/;
+    proxy_pass http://tessarr:8282/webdav/;
     proxy_set_header Authorization $http_authorization;
     proxy_pass_header Authorization;
 }

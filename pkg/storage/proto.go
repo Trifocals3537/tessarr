@@ -3,8 +3,8 @@ package storage
 import (
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/config"
-	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
 )
 
 // ============================================================================
@@ -13,6 +13,7 @@ import (
 
 func fileToProto(f *File) *FileProto {
 	pb := &FileProto{
+		Id:       f.ID,
 		Name:     f.Name,
 		Path:     f.Path,
 		Size:     f.Size,
@@ -32,6 +33,7 @@ func fileToProto(f *File) *FileProto {
 
 func protoToFile(pb *FileProto) *File {
 	f := &File{
+		ID:       pb.Id,
 		Name:     pb.Name,
 		Path:     pb.Path,
 		Size:     pb.Size,
@@ -157,6 +159,11 @@ func EntryToProto(e *Entry) *EntryProto {
 		SkipMultiSeason:  e.SkipMultiSeason,
 		LastError:        e.LastError,
 		ErrorCount:       int32(e.ErrorCount),
+		QueueIncarnation: e.QueueIncarnation,
+		OutputName:       e.OutputName,
+		ClientEndpoint:   e.ClientEndpoint,
+		TerminalChecks:   int32(e.TerminalChecks),
+		HandoffReason:    e.HandoffReason,
 	}
 
 	// Timestamps
@@ -180,6 +187,14 @@ func EntryToProto(e *Entry) *EntryProto {
 	if e.LastErrorTime != nil {
 		pb.HasLastErrorTime = true
 		pb.LastErrorTimeUnix = e.LastErrorTime.Unix()
+	}
+	if e.LastObservedAt != nil {
+		pb.HasLastObservedAt = true
+		pb.LastObservedAtUnix = e.LastObservedAt.Unix()
+	}
+	if e.LastProgressAt != nil {
+		pb.HasLastProgressAt = true
+		pb.LastProgressAtUnix = e.LastProgressAt.Unix()
 	}
 
 	// Maps
@@ -225,6 +240,11 @@ func ProtoToEntry(pb *EntryProto) *Entry {
 		SkipMultiSeason:  pb.SkipMultiSeason,
 		LastError:        pb.LastError,
 		ErrorCount:       int(pb.ErrorCount),
+		QueueIncarnation: pb.QueueIncarnation,
+		OutputName:       pb.OutputName,
+		ClientEndpoint:   pb.ClientEndpoint,
+		TerminalChecks:   int(pb.TerminalChecks),
+		HandoffReason:    pb.HandoffReason,
 	}
 
 	// Timestamps
@@ -248,6 +268,14 @@ func ProtoToEntry(pb *EntryProto) *Entry {
 	if pb.HasLastErrorTime {
 		t := time.Unix(pb.LastErrorTimeUnix, 0)
 		e.LastErrorTime = &t
+	}
+	if pb.HasLastObservedAt {
+		t := time.Unix(pb.LastObservedAtUnix, 0)
+		e.LastObservedAt = &t
+	}
+	if pb.HasLastProgressAt {
+		t := time.Unix(pb.LastProgressAtUnix, 0)
+		e.LastProgressAt = &t
 	}
 
 	// Maps

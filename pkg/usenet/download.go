@@ -1,13 +1,14 @@
 package usenet
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
-	"github.com/sirrobot01/decypharr/internal/nntp"
+	"github.com/Trifocals3537/tessarr/internal/nntp"
 	"github.com/sourcegraph/conc/pool"
 )
 
@@ -35,17 +36,23 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 	if len(file.Segments) == 0 {
 		return fmt.Errorf("file has no segments: %s", file.Name)
 	}
+	downloadCtx, cancelDownload := context.WithCancel(ctx)
+	defer cancelDownload()
 
 	// Track progress
 	var completedSegments atomic.Int64
 	var downloadedBytes atomic.Int64
 
 	// Channel for segment results - buffered to allow parallel fetching ahead
-	resultChan := make(chan segmentResult, max(u.processingMaxConnections, 1)*2)
+	maxConnections := max(u.processingMaxConnections, 1)
+	reorderWindow := maxConnections * 2
+	resultChan := make(chan segmentResult, reorderWindow)
+	// A token remains held while a fetched payload is waiting for its turn to
+	// be written. This bounds out-of-order memory if an early segment is slow.
+	reorderSlots := make(chan struct{}, reorderWindow)
 
 	// Map to hold out-of-order segments waiting to be written
 	pendingSegments := make(map[int][]byte)
-	var pendingMu sync.Mutex
 	nextToWrite := 0
 
 	// Error tracking
@@ -57,15 +64,28 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 	writerWg.Go(func() {
 		for result := range resultChan {
 			if result.err != nil {
+				<-reorderSlots
 				writeErrMu.Lock()
 				if writeErr == nil {
 					writeErr = result.err
+					cancelDownload()
+					for range pendingSegments {
+						<-reorderSlots
+					}
+					clear(pendingSegments)
 				}
 				writeErrMu.Unlock()
 				continue
 			}
 
-			pendingMu.Lock()
+			writeErrMu.Lock()
+			stopped := writeErr != nil
+			writeErrMu.Unlock()
+			if stopped {
+				<-reorderSlots
+				continue
+			}
+
 			pendingSegments[result.index] = result.data
 
 			// Write all consecutive segments starting from nextToWrite
@@ -75,22 +95,27 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 					break
 				}
 				delete(pendingSegments, nextToWrite)
-				pendingMu.Unlock()
 
-				// Write to output
-				n, err := writer.Write(data)
+				// io.Copy turns a short write with no explicit writer error into
+				// io.ErrShortWrite, preventing a silently truncated output file.
+				n, err := io.Copy(writer, bytes.NewReader(data))
+				<-reorderSlots
 				if err != nil {
 					writeErrMu.Lock()
 					if writeErr == nil {
 						writeErr = fmt.Errorf("write failed at segment %d: %w", nextToWrite, err)
+						cancelDownload()
 					}
 					writeErrMu.Unlock()
-					pendingMu.Lock()
+					for range pendingSegments {
+						<-reorderSlots
+					}
+					clear(pendingSegments)
 					break
 				}
 
 				completedSegments.Add(1)
-				downloaded := downloadedBytes.Add(int64(n))
+				downloaded := downloadedBytes.Add(n)
 				nextToWrite++
 
 				// Call progress callback if provided
@@ -101,20 +126,34 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 					progressCallback(downloaded, speed)
 				}
 
-				pendingMu.Lock()
 			}
-			pendingMu.Unlock()
 		}
 	})
 
 	// Fetch segments in parallel
-	p := pool.New().WithContext(ctx).WithMaxGoroutines(max(u.processingMaxConnections, 1))
+	p := pool.New().WithContext(downloadCtx).WithMaxGoroutines(maxConnections)
 
 	for idx, segment := range file.Segments {
 		segIdx := idx
 		seg := segment
 
 		p.Go(func(ctx context.Context) error {
+			select {
+			case reorderSlots <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			resultSent := false
+			defer func() {
+				if !resultSent {
+					<-reorderSlots
+				}
+			}()
+			sendResult := func(result segmentResult) {
+				resultChan <- result
+				resultSent = true
+			}
+
 			// Check for write errors
 			writeErrMu.Lock()
 			if writeErr != nil {
@@ -136,25 +175,17 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 				return e
 			})
 			if err != nil {
-				resultChan <- segmentResult{index: segIdx, err: fmt.Errorf("segment %d: %w", segIdx, err)}
+				sendResult(segmentResult{index: segIdx, err: fmt.Errorf("segment %d: %w", segIdx, err)})
 				return nil // Don't stop other workers
 			}
 
-			// Handle SegmentDataStart for sliced segments
-			if seg.SegmentDataStart > 0 {
-				if seg.SegmentDataStart >= int64(len(data)) {
-					resultChan <- segmentResult{index: segIdx, err: fmt.Errorf("segment %d: offset exceeds data", segIdx)}
-					return nil
-				}
-				data = data[seg.SegmentDataStart:]
+			data, err = prepareSegmentPayload(data, seg.SegmentDataStart, seg.Bytes)
+			if err != nil {
+				sendResult(segmentResult{index: segIdx, err: fmt.Errorf("segment %d: %w", segIdx, err)})
+				return nil
 			}
 
-			// Trim to expected size
-			if int64(len(data)) > seg.Bytes {
-				data = data[:seg.Bytes]
-			}
-
-			resultChan <- segmentResult{index: segIdx, data: data}
+			sendResult(segmentResult{index: segIdx, data: data})
 			return nil
 		})
 	}
@@ -180,4 +211,21 @@ func (u *Usenet) Download(ctx context.Context, nzoID, filename string, writer io
 		Msg("Download complete")
 
 	return nil
+}
+
+func prepareSegmentPayload(data []byte, dataStart, expectedBytes int64) ([]byte, error) {
+	if dataStart < 0 {
+		return nil, fmt.Errorf("negative data offset %d", dataStart)
+	}
+	if expectedBytes <= 0 {
+		return nil, fmt.Errorf("invalid expected size %d", expectedBytes)
+	}
+	if dataStart > int64(len(data)) {
+		return nil, fmt.Errorf("data offset %d exceeds decoded size %d", dataStart, len(data))
+	}
+	available := int64(len(data)) - dataStart
+	if available < expectedBytes {
+		return nil, fmt.Errorf("incomplete decoded data: got %d of %d bytes after offset %d", available, expectedBytes, dataStart)
+	}
+	return data[dataStart : dataStart+expectedBytes], nil
 }

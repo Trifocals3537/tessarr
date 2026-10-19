@@ -7,18 +7,22 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/mount/dfs/backend"
+	"github.com/Trifocals3537/tessarr/pkg/mount/dfs/config"
+	"github.com/Trifocals3537/tessarr/pkg/mount/dfs/vfs"
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/mount/dfs/backend"
-	"github.com/sirrobot01/decypharr/pkg/mount/dfs/config"
-	"github.com/sirrobot01/decypharr/pkg/mount/dfs/vfs"
 )
 
 const (
@@ -40,12 +44,19 @@ type Backend struct {
 	server      *fuse.Server
 	ready       atomic.Bool
 	unmountFunc func(ctx context.Context)
+	unmountOnce sync.Once
 	root        *Dir
 	vfs         *vfs.Manager
 }
 
 // NewBackend creates a new hanwen backend
 func NewBackend(vfs *vfs.Manager, config *config.FuseConfig) (backend.Backend, error) {
+	if vfs == nil {
+		return nil, fmt.Errorf("VFS manager is required")
+	}
+	if config == nil {
+		return nil, fmt.Errorf("FUSE config is required")
+	}
 	now := utils.Now()
 	log := logger.New("hanwen-backend")
 	// One shared rate-limited logger for the whole mount. Files/Dirs reference
@@ -61,37 +72,79 @@ func NewBackend(vfs *vfs.Manager, config *config.FuseConfig) (backend.Backend, e
 	}, nil
 }
 
+func (b *Backend) mountOptions() fuse.MountOptions {
+	return fuse.MountOptions{
+		FsName:               "tessarr",
+		Debug:                false,
+		Name:                 "tessarr",
+		DisableXAttrs:        true,
+		IgnoreSecurityLabels: true,
+		MaxWrite:             1024 * 1024,
+		AllowOther:           true,
+		// Keep one bad handler request from taking down the mount, while routing
+		// the panic and stack through Tessarr's normal structured logs.
+		PanicHandler: func(p any) fuse.Status {
+			b.logger.Error().Any("panic", p).Bytes("stack", debug.Stack()).Msg("FUSE handler panic")
+			return fuse.EIO
+		},
+	}
+}
+
+func normalizeMountPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("mount path is empty")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve mount path: %w", err)
+	}
+	abs = filepath.Clean(abs)
+	if filepath.Dir(abs) == abs {
+		return "", fmt.Errorf("refusing to use filesystem root as mount path: %s", abs)
+	}
+	return abs, nil
+}
+
 // Mount mounts the filesystem using hanwen/go-fuse
 func (b *Backend) Mount(ctx context.Context) error {
-	// Create mount point if it doesn't exist(skip if on Windows)
-
+	if b.config == nil {
+		return fmt.Errorf("FUSE config is not initialized")
+	}
 	if b.root == nil {
 		return fmt.Errorf("root node is not initialized")
 	}
 	if b.vfs == nil {
 		return fmt.Errorf("VFS manager is not initialized")
 	}
-
-	_ = os.MkdirAll(b.config.MountPath, 0755)
-	// Try to unmount if already mounted
-	b.forceUnmount(ctx)
-
-	mountOpt := fuse.MountOptions{
-		FsName:               "decypharr",
-		Debug:                false,
-		Name:                 "decypharr",
-		DisableXAttrs:        true,
-		IgnoreSecurityLabels: true,
-		MaxWrite:             1024 * 1024,
-		AllowOther: true,
+	mountPath, err := normalizeMountPath(b.config.MountPath)
+	if err != nil {
+		return err
 	}
+	b.config.MountPath = mountPath
+	b.unmountOnce = sync.Once{}
+
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return fmt.Errorf("create mount point: %w", err)
+	}
+	// Recover a stale mount from a previous process without spawning unmount
+	// helpers during every normal startup.
+	mounted, mountCheckErr := mountPointActive(mountPath)
+	if mountCheckErr != nil {
+		b.logger.Warn().Err(mountCheckErr).Msg("Could not inspect mountpoint; attempting stale-mount cleanup")
+		b.forceUnmount(ctx)
+	} else if mounted {
+		b.logger.Warn().Msg("Existing FUSE mount detected; attempting stale-mount cleanup")
+		b.forceUnmount(ctx)
+	}
+
+	mountOpt := b.mountOptions()
 
 	var opt []string
 
 	opt = append(opt, "default_permissions")
 
 	if runtime.GOOS == "darwin" {
-		opt = append(opt, "volname=decypharr")
+		opt = append(opt, "volname=tessarr")
 		opt = append(opt, "noapplexattr")
 		opt = append(opt, "noappledouble")
 	}
@@ -170,10 +223,13 @@ func (b *Backend) Mount(ctx context.Context) error {
 	}
 
 	umount := func(ctx context.Context) {
+		b.ready.Store(false)
 		b.logger.Info().Msg("Unmounting filesystem")
 
-		// Create a channel to track completion
-		done := make(chan struct{})
+		// Server.Unmount is synchronous and only returns after its FUSE event
+		// loops exit. Keep it behind a channel so the caller's shutdown deadline
+		// is still honored.
+		done := make(chan error, 1)
 
 		go func() {
 			// Close VFS manager
@@ -183,25 +239,25 @@ func (b *Backend) Mount(ctx context.Context) error {
 				}
 			}
 
-			_ = server.Unmount()
-			time.Sleep(1 * time.Second)
-
-			// Check if still mounted
-			if _, err := os.Stat(b.config.MountPath); err == nil {
-				b.logger.Warn().Msg("FUSE filesystem still mounted, attempting force unmount")
-				b.forceUnmount(ctx)
-			}
-
-			close(done)
+			done <- server.Unmount()
 		}()
 
 		// Wait for unmount to complete or context timeout
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				b.logger.Warn().Err(err).Msg("Graceful FUSE unmount failed, attempting force unmount")
+				b.forceUnmount(ctx)
+				return
+			}
 			b.logger.Info().Msg("Filesystem unmounted successfully")
 		case <-ctx.Done():
 			b.logger.Warn().Err(ctx.Err()).Msg("Unmount timed out, forcing unmount")
-			b.forceUnmount(ctx)
+			// The caller's context is already done, so give the bounded fallback
+			// its own window instead of passing an immediately-cancelled context.
+			forceCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			b.forceUnmount(forceCtx)
+			cancel()
 		}
 	}
 
@@ -213,19 +269,22 @@ func (b *Backend) Mount(ctx context.Context) error {
 // Unmount unmounts the filesystem
 func (b *Backend) Unmount(ctx context.Context) error {
 	b.logger.Info().Msg("Unmounting hanwen backend")
-	if b.unmountFunc != nil {
-		// unmountFunc already closes the VFS manager as part of its teardown;
-		// don't close it a second time here.
-		b.unmountFunc(ctx)
-		return nil
-	}
-	// Mount never completed: force-unmount and close the VFS ourselves.
-	b.forceUnmount(ctx)
-	if b.vfs != nil {
-		if err := b.vfs.Close(); err != nil {
-			b.logger.Warn().Err(err).Msg("Failed to close VFS")
+	b.ready.Store(false)
+	b.unmountOnce.Do(func() {
+		if b.unmountFunc != nil {
+			// unmountFunc already closes the VFS manager as part of its teardown;
+			// don't close it a second time here.
+			b.unmountFunc(ctx)
+			return
 		}
-	}
+		// Mount never completed: force-unmount and close the VFS ourselves.
+		b.forceUnmount(ctx)
+		if b.vfs != nil {
+			if err := b.vfs.Close(); err != nil {
+				b.logger.Warn().Err(err).Msg("Failed to close VFS")
+			}
+		}
+	})
 	return nil
 }
 
@@ -259,11 +318,20 @@ func (b *Backend) Refresh(dir string) {
 
 // forceUnmount attempts to force unmount a path using system commands
 func (b *Backend) forceUnmount(ctx context.Context) {
+	if b.config == nil {
+		b.logger.Warn().Msg("Skipping force unmount without FUSE config")
+		return
+	}
+	mountPath, err := normalizeMountPath(b.config.MountPath)
+	if err != nil {
+		b.logger.Warn().Err(err).Msg("Skipping force unmount for unsafe mount path")
+		return
+	}
 	methods := [][]string{
-		{"umount", b.config.MountPath},
-		{"umount", "-l", b.config.MountPath}, // lazy unmount
-		{"fusermount", "-uz", b.config.MountPath},
-		{"fusermount3", "-uz", b.config.MountPath},
+		{"fusermount3", "-uz", mountPath},
+		{"fusermount", "-uz", mountPath},
+		{"umount", mountPath},
+		{"umount", "-l", mountPath}, // lazy unmount
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)

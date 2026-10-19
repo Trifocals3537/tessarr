@@ -19,19 +19,17 @@ type RateLimitedLogger struct {
 	maxItems int // Prevent unbounded memory growth
 }
 
-// NewRateLimitedLogger creates a new rate-limited logger.
-// window: time duration to suppress duplicate messages
-// maxItems: maximum number of unique keys to track (prevents memory leak)
+// NewRateLimitedLogger creates a one-minute, memory-bounded deduplicating
+// logger. Options can replace its output logger.
+type Option func(*RateLimitedLogger)
 
-type Options func(*RateLimitedLogger)
-
-func WithLogger(logger zerolog.Logger) Options {
+func WithLogger(logger zerolog.Logger) Option {
 	return func(r *RateLimitedLogger) {
 		r.logger = logger
 	}
 }
 
-func NewRateLimitedLogger(opts ...Options) *RateLimitedLogger {
+func NewRateLimitedLogger(opts ...Option) *RateLimitedLogger {
 	r := &RateLimitedLogger{
 		logger:   Default(),
 		window:   1 * time.Minute,
@@ -47,15 +45,13 @@ func NewRateLimitedLogger(opts ...Options) *RateLimitedLogger {
 // shouldLog returns true if this key should be logged (not seen recently).
 // Thread-safe.
 func (r *RateLimitedLogger) shouldLog(key string) bool {
+	now := time.Now()
 	// Check if seen recently
 	if lastSeen, ok := r.seen.Load(key); ok {
-		now := time.Now()
 		if now.Sub(lastSeen) < r.window {
 			return false // Suppress
 		}
 	}
-
-	now := time.Now()
 
 	// Evict old entries if map is too large
 	if r.seen.Size() >= r.maxItems {
@@ -70,7 +66,7 @@ func (r *RateLimitedLogger) shouldLog(key string) bool {
 		// If still too large, clear half
 		if r.seen.Size() >= r.maxItems {
 			i := 0
-			r.seen.Range(func(key string, value time.Time) bool {
+			r.seen.Range(func(key string, _ time.Time) bool {
 				if i%2 == 0 {
 					r.seen.Delete(key)
 				}
@@ -132,69 +128,4 @@ func (e *RateLimitedEvent) Debug() *zerolog.Event {
 		return e.parent.logger.Debug()
 	}
 	return nopLogger.Debug()
-}
-
-// --- Legacy API (still available) ---
-
-// Error logs an error message with deduplication by key.
-// Deprecated: Use Rate(key).Error() for cleaner API.
-func (r *RateLimitedLogger) Error(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Error()
-	}
-	return nil
-}
-
-// Warn logs a warning message with deduplication by key.
-// Deprecated: Use Rate(key).Warn() for cleaner API.
-func (r *RateLimitedLogger) Warn(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Warn()
-	}
-	return nil
-}
-
-// Info logs an info message with deduplication by key.
-// Deprecated: Use Rate(key).Info() for cleaner API.
-func (r *RateLimitedLogger) Info(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Info()
-	}
-	return nil
-}
-
-// Debug logs a debug message with deduplication by key.
-// Deprecated: Use Rate(key).Debug() for cleaner API.
-func (r *RateLimitedLogger) Debug(key string) *zerolog.Event {
-	if r.shouldLog(key) {
-		return r.logger.Debug()
-	}
-	return nil
-}
-
-// ErrorOnce logs an error only once per key until Reset is called.
-// Useful for "permanent" errors that should only be logged once per session.
-func (r *RateLimitedLogger) ErrorOnce(key string) *zerolog.Event {
-	if _, ok := r.seen.Load(key); ok {
-		return nopLogger.Error()
-	}
-
-	// Use far-future time to prevent re-logging
-	r.seen.Store(key, time.Now().Add(24*365*time.Hour))
-	return r.logger.Error()
-}
-
-// Reset clears all tracked messages, allowing them to be logged again.
-func (r *RateLimitedLogger) Reset() {
-	r.seen = xsync.NewMap[string, time.Time]()
-}
-
-// ResetKey allows a specific key to be logged again.
-func (r *RateLimitedLogger) ResetKey(key string) {
-	r.seen.Delete(key)
-}
-
-// Logger returns the underlying zerolog.Logger for non-rate-limited logging.
-func (r *RateLimitedLogger) Logger() zerolog.Logger {
-	return r.logger
 }

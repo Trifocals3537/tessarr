@@ -1,111 +1,210 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v2.6.0 or v2.6.0-beta.1
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  REGISTRY_GHCR: ghcr.io/sirrobot01/decypharr
-  REGISTRY_HUB: docker.io/cy01/blackhole
-  LDFLAGS_PKG: github.com/sirrobot01/decypharr/pkg/version
+  GHCR_IMAGE: ghcr.io/trifocals3537/tessarr
+  LDFLAGS_PKG: github.com/Trifocals3537/tessarr/pkg/version
 
 jobs:
-  # Determine release channel from tag
   prepare:
-    runs-on: ubuntu-latest
+    name: Prepare release metadata
+    # The repository ID remains stable when the Tessarr repository is renamed.
+    if: github.repository_id == '1173113218'
+    runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.meta.outputs.version }}
-      channel: ${{ steps.meta.outputs.channel }}
+      version: ${{ steps.metadata.outputs.version }}
+      channel: ${{ steps.metadata.outputs.channel }}
+      tag: ${{ steps.metadata.outputs.tag }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
       - name: Extract version and channel
-        id: meta
+        id: metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          if [[ "$TAG" == *"-beta"* ]]; then
-            echo "channel=beta" >> "$GITHUB_OUTPUT"
-          elif [[ "$TAG" == *"-rc"* ]]; then
-            echo "channel=rc" >> "$GITHUB_OUTPUT"
-          else
-            echo "channel=stable" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          tag="${RELEASE_TAG}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(beta|rc)(\.[0-9]+)?)?$ ]]; then
+            echo "Unsupported release tag: ${tag}" >&2
+            echo "Expected vMAJOR.MINOR.PATCH, optionally followed by -beta[.N] or -rc[.N]" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+
+          case "${version}" in
+            *-beta*)
+              channel=beta
+              release_ref=refs/heads/beta
+              ;;
+            *-rc*)
+              channel=rc
+              release_ref=refs/heads/beta
+              ;;
+            *)
+              channel=stable
+              release_ref=refs/heads/main
+              ;;
+          esac
+
+          if [[ "${GITHUB_REF}" != "${release_ref}" ]]; then
+            echo "${tag} must be dispatched from ${release_ref#refs/heads/}" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Release tag already exists: ${tag}" >&2
+            exit 1
           fi
 
-  # Build Linux binaries (CGO required for FUSE + rapidyenc)
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing ${tag} from ${GITHUB_REF_NAME} at ${GITHUB_SHA}"
+
   build-linux:
-    runs-on: ubuntu-latest
+    name: Linux ${{ matrix.label }}
+    runs-on: ubuntu-24.04
     needs: prepare
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
-            cc: gcc
-            cxx: g++
+            label: x86_64
+            zig_target: x86_64-linux-gnu.2.17
+            machine_pattern: x86-64
           - arch: arm64
-            cc: zig cc -target aarch64-linux-gnu
-            cxx: zig c++ -target aarch64-linux-gnu
+            label: arm64
+            zig_target: aarch64-linux-gnu.2.17
+            machine_pattern: ARM aarch64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Install Zig
-        if: matrix.arch == 'arm64'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
+        run: bash scripts/install-zig.sh 0.14.1
 
-      - name: Install libfuse-dev
-        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y binutils file libfuse-dev
 
       - name: Build
         env:
           CGO_ENABLED: 1
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
+          CC: zig cc -target ${{ matrix.zig_target }}
+          CXX: zig c++ -target ${{ matrix.zig_target }}
           VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr
+            -o dist/tessarr
+
+      - name: Verify architecture and glibc baseline
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine_pattern }}
+        run: |
+          set -euo pipefail
+
+          file dist/tessarr
+          file dist/tessarr | grep -F "${EXPECTED_MACHINE}"
+
+          max_glibc="$(
+            readelf --version-info dist/tessarr |
+              grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' |
+              sort -Vu |
+              tail -n 1 || true
+          )"
+
+          if [[ -z "${max_glibc}" ]]; then
+            echo "No glibc version requirements were found" >&2
+            exit 1
+          fi
+
+          if [[ "$(printf '%s\n' "${max_glibc}" "GLIBC_2.17" | sort -V | tail -n 1)" != "GLIBC_2.17" ]]; then
+            echo "Binary requires ${max_glibc}, newer than the GLIBC_2.17 baseline" >&2
+            exit 1
+          fi
+
+          echo "Maximum glibc requirement: ${max_glibc}"
+
+      - name: Smoke-test on Ubuntu 20.04
+        if: matrix.arch == 'amd64'
+        run: |
+          docker run --rm \
+            --volume "${PWD}/dist:/work:ro" \
+            ubuntu:20.04 \
+            bash -euc '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates libfuse2
+              /work/tessarr --help
+              install -d -m 0700 /tmp/tessarr-config
+              printf "%s\n" \
+                "{\"debrids\":[{\"name\":\"realdebrid\",\"api_key\":\"test-key\"}],\"download_folder\":\"/tmp/download\"}" \
+                > /tmp/tessarr-config/config.json
+              chmod 0644 /tmp/tessarr-config/config.json
+              /work/tessarr --config /tmp/tessarr-config --check-config
+              test "$(stat -c %a /tmp/tessarr-config/config.json)" = 644
+            '
 
       - name: Package
         run: |
-          ARCH="${{ matrix.arch }}"
-          [ "$ARCH" = "amd64" ] && ARCH="x86_64"
-          tar czf "dist/decypharr_Linux_${ARCH}.tar.gz" -C dist decypharr
+          set -euo pipefail
+          install -m 0644 packaging/systemd/tessarr.service dist/tessarr.service
+          install -m 0644 LICENSE dist/LICENSE
+          tar czf "dist/tessarr_Linux_${{ matrix.label }}.tar.gz" \
+            -C dist tessarr tessarr.service LICENSE
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-${{ matrix.arch }}
-          path: dist/decypharr_Linux_*.tar.gz
+          path: dist/tessarr_Linux_*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
-  # Build Windows binary (no CGO — cgofuse uses syscall.LoadLibrary for WinFsp)
   build-windows:
-    runs-on: ubuntu-latest
+    name: Windows x86_64
+    runs-on: ubuntu-24.04
     needs: prepare
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Build
         env:
@@ -115,40 +214,56 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr.exe
+            -o dist/tessarr.exe
+          install -m 0644 LICENSE dist/LICENSE
+
+      - name: Verify architecture
+        run: |
+          set -euo pipefail
+          file dist/tessarr.exe
+          file dist/tessarr.exe | grep -F "x86-64"
 
       - name: Package
         working-directory: dist
-        run: zip decypharr_Windows_x86_64.zip decypharr.exe
+        run: zip tessarr_Windows_x86_64.zip tessarr.exe LICENSE
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-amd64
-          path: dist/decypharr_Windows_x86_64.zip
+          path: dist/tessarr_Windows_x86_64.zip
+          if-no-files-found: error
+          retention-days: 7
 
-  # Build macOS binaries (CGO required, needs macFUSE headers)
   build-darwin:
-    runs-on: macos-latest
+    name: macOS ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
     needs: prepare
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: amd64
             label: x86_64
+            runner: macos-15-intel
+            expected_arch: x86_64
           - arch: arm64
             label: arm64
+            runner: macos-15
+            expected_arch: arm64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.26'
+          go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.sum
 
       - name: Install macFUSE headers
         run: brew install macfuse
@@ -161,49 +276,82 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           go build -trimpath \
             -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${VERSION} -X ${LDFLAGS_PKG}.Channel=${CHANNEL}" \
-            -o dist/decypharr
+            -o dist/tessarr
+          install -m 0644 LICENSE dist/LICENSE
+
+      - name: Verify architecture and command line
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          set -euo pipefail
+          file dist/tessarr
+          test "$(lipo -archs dist/tessarr)" = "${EXPECTED_ARCH}"
+          ./dist/tessarr --help
 
       - name: Package
-        run: tar czf "dist/decypharr_Darwin_${{ matrix.label }}.tar.gz" -C dist decypharr
+        run: >-
+          tar czf "dist/tessarr_Darwin_${{ matrix.label }}.tar.gz"
+          -C dist tessarr LICENSE
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: darwin-${{ matrix.arch }}
-          path: dist/decypharr_Darwin_*.tar.gz
+          path: dist/tessarr_Darwin_*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
-  # Build and push multi-platform Docker images
   docker:
-    runs-on: ubuntu-latest
-    needs: prepare
+    name: Publish container image
+    runs-on: ubuntu-24.04
+    needs:
+      - prepare
+      - build-linux
+      - build-windows
+      - build-darwin
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.channel }},enable=${{ needs.prepare.outputs.channel != 'stable' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.channel == 'stable' }}
+          labels: |
+            org.opencontainers.image.title=Tessarr
+            org.opencontainers.image.description=Self-hosted debrid and Usenet media bridge with qBittorrent and SABnzbd-compatible APIs
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/${{ github.sha }}/README.md
+            org.opencontainers.image.authors=Tessarr contributors
+            org.opencontainers.image.licenses=MIT
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -211,42 +359,68 @@ jobs:
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
             CHANNEL=${{ needs.prepare.outputs.channel }}
-          tags: |
-            ${{ env.REGISTRY_GHCR }}:${{ github.ref_name }}
-            ${{ env.REGISTRY_GHCR }}:latest
-            ${{ env.REGISTRY_HUB }}:${{ github.ref_name }}
-            ${{ env.REGISTRY_HUB }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+          provenance: mode=max
+          sbom: true
 
-  # Create GitHub release with all binaries
   release:
-    runs-on: ubuntu-latest
-    needs: [ prepare, build-linux, build-windows, build-darwin ]
+    name: Publish GitHub release
+    runs-on: ubuntu-24.04
+    needs:
+      - prepare
+      - build-linux
+      - build-windows
+      - build-darwin
+      - docker
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
+          pattern: "!*.dockerbuild"
           merge-multiple: true
+
+      - name: Generate release checksums
+        working-directory: dist
+        run: sha256sum ./* > SHA256SUMS
 
       - name: Create release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET_COMMIT: ${{ github.sha }}
           CHANNEL: ${{ needs.prepare.outputs.channel }}
         run: |
-          PRERELEASE=""
-          if [ "$CHANNEL" != "stable" ]; then
-            PRERELEASE="--prerelease"
+          set -euo pipefail
+
+          if git ls-remote --exit-code --tags origin \
+            "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Release tag appeared while the build was running: ${TAG}" >&2
+            exit 1
           fi
 
-          gh release create "$TAG" dist/* \
-            --title "decypharr ${TAG}" \
-            --generate-notes \
-            $PRERELEASE \
-            --notes-start-tag "$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")"
+          release_args=(
+            --title "tessarr ${TAG}"
+            --generate-notes
+            --target "${TARGET_COMMIT}"
+          )
+
+          if [[ "${CHANNEL}" != "stable" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          previous_tag="$(git describe --tags --abbrev=0 "${TARGET_COMMIT}^" 2>/dev/null || true)"
+          if [[ -n "${previous_tag}" ]]; then
+            release_args+=(--notes-start-tag "${previous_tag}")
+          fi
+
+          gh release create "${TAG}" dist/* "${release_args[@]}"

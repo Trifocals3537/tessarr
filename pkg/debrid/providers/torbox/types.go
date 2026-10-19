@@ -1,6 +1,12 @@
 package torbox
 
-import "time"
+import (
+	"bytes"
+	"strconv"
+	"time"
+
+	json "github.com/bytedance/sonic"
+)
 
 type APIResponse[T any] struct {
 	Success bool   `json:"success"`
@@ -70,7 +76,50 @@ type torboxInfo struct {
 	TrackerMessage   any     `json:"tracker_message"`
 }
 
-type InfoResponse APIResponse[torboxInfo]
+// torboxInfoList accepts both documented single-item responses and defensive
+// list responses. TorBox documents an object when the id query is honored, but
+// installations have observed an array when a relay returns list-shaped data.
+// Callers still select the requested ID, so an ignored filter cannot return the
+// wrong torrent merely because it appeared first in the array.
+type torboxInfoList []torboxInfo
+
+func (items *torboxInfoList) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
+		*items = nil
+		return nil
+	}
+	if data[0] == '[' {
+		var list []torboxInfo
+		if err := json.Unmarshal(data, &list); err != nil {
+			return err
+		}
+		*items = list
+		return nil
+	}
+
+	var item torboxInfo
+	if err := json.Unmarshal(data, &item); err != nil {
+		return err
+	}
+	*items = torboxInfoList{item}
+	return nil
+}
+
+type InfoResponse APIResponse[torboxInfoList]
+
+func (r *InfoResponse) torrent(id string) *torboxInfo {
+	if r == nil || r.Data == nil {
+		return nil
+	}
+	for index := range *r.Data {
+		item := &(*r.Data)[index]
+		if strconv.Itoa(item.Id) == id {
+			return item
+		}
+	}
+	return nil
+}
 
 type DownloadLinksResponse APIResponse[string]
 

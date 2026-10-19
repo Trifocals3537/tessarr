@@ -1,28 +1,79 @@
 package reader
 
 import (
+	"errors"
 	"sync"
 
-	"github.com/sirrobot01/decypharr/internal/buffer"
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/buffer"
+	"github.com/Trifocals3537/tessarr/internal/config"
 )
 
-// usenet owns its streaming-buffer pool here rather than the buffer package
-// owning a "usenet" singleton — the buffer package stays generic. The pool is
-// created once with the configured usenet RAM budget and shared across every
-// SegmentCache. Disk is bounded per-stream by the sliding-window sweep
-// (see SegmentCache.sweepWindow), so the pool runs no disk backstop.
-var (
-	bufPoolOnce sync.Once
-	bufPool     *buffer.Pool
-)
+// Pools owns the shared stream-buffer budget for one Usenet service run.
+// Scoping it to the service makes config restarts apply the new budget and
+// ensures old mmap allocations are released before the replacement starts.
+type Pools struct {
+	buffers *buffer.Pool
+	mu      sync.Mutex
+	closed  bool
+	caches  map[*SegmentCache]struct{}
+}
 
-func usenetBufferPool() *buffer.Pool {
-	bufPoolOnce.Do(func() {
-		bufPool = buffer.NewPool(buffer.PoolConfig{
+func NewPools(memoryBudget int64) *Pools {
+	return &Pools{
+		buffers: buffer.NewPool(buffer.PoolConfig{
 			Name:         "usenet",
-			MemoryBudget: config.Get().Usenet.BufferMemoryBytes(),
-		})
-	})
-	return bufPool
+			MemoryBudget: memoryBudget,
+		}),
+		caches: make(map[*SegmentCache]struct{}),
+	}
+}
+
+func defaultPools() *Pools {
+	return NewPools(config.Get().Usenet.BufferMemoryBytes())
+}
+
+// Stats reports allocated buffer bytes. These are not process RSS values.
+func (p *Pools) Stats() map[string]any {
+	if p == nil {
+		return map[string]any{}
+	}
+	blocks := p.buffers.Stats()
+	return map[string]any{
+		"memory_in_use":    blocks.MemoryInUse,
+		"memory_allocated": blocks.MemoryAllocated,
+		"memory_budget":    blocks.MemoryBudget,
+		"buffers":          blocks.Buffers,
+	}
+}
+
+func (p *Pools) unregister(cache *SegmentCache) {
+	p.mu.Lock()
+	delete(p.caches, cache)
+	p.mu.Unlock()
+}
+
+// Close releases this service run's buffers. Call after its readers stop.
+func (p *Pools) Close() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	caches := make([]*SegmentCache, 0, len(p.caches))
+	for cache := range p.caches {
+		caches = append(caches, cache)
+	}
+	p.mu.Unlock()
+	var closeErr error
+	for _, cache := range caches {
+		closeErr = errors.Join(closeErr, cache.Close())
+	}
+	if err := p.buffers.Close(); err != nil && !errors.Is(err, buffer.ErrClosed) {
+		closeErr = errors.Join(closeErr, err)
+	}
+	return closeErr
 }

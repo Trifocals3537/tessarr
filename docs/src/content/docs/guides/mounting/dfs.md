@@ -1,13 +1,13 @@
 ---
 title: DFS Mounting
-description: Decypharr File System details.
+description: Tessarr File System details.
 ---
 
-DFS (Decypharr File System) is a custom VFS implementation optimized for streaming from Debrid and Usenet.
+DFS (Tessarr File System) is a custom VFS implementation optimized for streaming from Debrid and Usenet.
 
 ## Windows Requirement
 
-If you run Decypharr on Windows and use `mount.type: "dfs"`, you must install **WinFsp** first.  
+If you run Tessarr on Windows and use `mount.type: "dfs"`, you must install **WinFsp** first.
 Without WinFsp, DFS mounts will not start.
 
 ## Features
@@ -25,7 +25,7 @@ In `config.json`:
 {
   "mount": {
     "type": "dfs",
-    "mount_path": "/mnt/decypharr",
+    "mount_path": "/mnt/tessarr",
     "dfs": {
       "cache_dir": "/cache/dfs",
       "chunk_size": "10MB",

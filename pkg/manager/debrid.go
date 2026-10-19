@@ -3,17 +3,18 @@ package manager
 import (
 	"cmp"
 	"errors"
+	"sort"
 
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	debrid "github.com/sirrobot01/decypharr/pkg/debrid/common"
-	"github.com/sirrobot01/decypharr/pkg/debrid/providers/alldebrid"
-	"github.com/sirrobot01/decypharr/pkg/debrid/providers/debridlink"
-	"github.com/sirrobot01/decypharr/pkg/debrid/providers/premiumize"
-	"github.com/sirrobot01/decypharr/pkg/debrid/providers/realdebrid"
-	"github.com/sirrobot01/decypharr/pkg/debrid/providers/torbox"
-	"github.com/sirrobot01/decypharr/pkg/debrid/types"
-	"github.com/sirrobot01/decypharr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/providers/alldebrid"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/providers/debridlink"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/providers/premiumize"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/providers/realdebrid"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/providers/torbox"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/types"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
 	"go.uber.org/ratelimit"
 )
 
@@ -58,11 +59,11 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 
 	switch dc.Provider {
 	case "realdebrid":
-		client, err = realdebrid.New(dc, rateLimits)
+		client, err = realdebrid.New(dc, rateLimits, m.providerTraffic)
 	case "alldebrid":
 		client, err = alldebrid.New(dc, rateLimits)
 	case "torbox":
-		client, err = torbox.New(dc, rateLimits)
+		client, err = torbox.New(dc, rateLimits, m.providerTraffic)
 	case "debridlink":
 		client, err = debridlink.New(dc, rateLimits)
 	case "premiumize":
@@ -78,16 +79,49 @@ func (m *Manager) createClient(dc config.Debrid) (debrid.Client, error) {
 	return client, nil
 }
 
-// FilterDebrid returns clients that match the filter function
+// FilterDebrid returns matching clients in configuration order. The client
+// registry is a concurrent map and its iteration order is intentionally
+// undefined, so iterating it directly makes multi-provider fallback random.
+// Clients that are not present in the current configuration are retained as a
+// deterministic, lexically sorted fallback for tests and transitional reloads.
 func (m *Manager) FilterDebrid(filter func(debrid.Client) bool) []debrid.Client {
-	var filtered []debrid.Client
+	if m == nil || m.clients == nil {
+		return nil
+	}
 
-	m.clients.Range(func(key string, client debrid.Client) bool {
-		if client != nil && filter(client) {
+	filtered := make([]debrid.Client, 0)
+	seen := make(map[string]struct{})
+	appendClient := func(name string) {
+		if _, exists := seen[name]; exists {
+			return
+		}
+		seen[name] = struct{}{}
+		client, ok := m.clients.Load(name)
+		if !ok || client == nil {
+			return
+		}
+		if filter == nil || filter(client) {
 			filtered = append(filtered, client)
+		}
+	}
+
+	if m.config != nil {
+		for _, configured := range m.config.Debrids {
+			appendClient(configured.Name)
+		}
+	}
+
+	extraNames := make([]string, 0)
+	m.clients.Range(func(name string, _ debrid.Client) bool {
+		if _, exists := seen[name]; !exists {
+			extraNames = append(extraNames, name)
 		}
 		return true
 	})
+	sort.Strings(extraNames)
+	for _, name := range extraNames {
+		appendClient(name)
+	}
 	return filtered
 }
 

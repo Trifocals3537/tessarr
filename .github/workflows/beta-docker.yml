@@ -1,6 +1,7 @@
 name: Beta Docker Build
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - beta
@@ -9,171 +10,88 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: beta-docker-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
-  DOCKERHUB_IMAGE: cy01/blackhole
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/decypharr
+  GHCR_IMAGE: ghcr.io/trifocals3537/tessarr
+  BETA_VERSION_BASE: "2.6.0"
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      beta_version: ${{ steps.calculate_version.outputs.beta_version }}
+  build:
+    name: Build and publish beta image
+    # The repository ID remains stable when the Tessarr repository is renamed.
+    if: >-
+      github.repository_id == '1173113218' &&
+      github.ref == 'refs/heads/beta'
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
       - name: Calculate beta version
-        id: calculate_version
+        id: version
+        shell: bash
         run: |
-          LATEST_TAG=$(git tag | grep -v 'beta' | sort -V | tail -n1)
-          echo "Found latest tag: ${LATEST_TAG}"
+          set -euo pipefail
 
-          IFS='.' read -r -a VERSION_PARTS <<< "$LATEST_TAG"
-          MAJOR="${VERSION_PARTS[0]}"
-          MINOR="${VERSION_PARTS[1]}"
-          PATCH="${VERSION_PARTS[2]}"
+          if [[ ! "${BETA_VERSION_BASE}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid BETA_VERSION_BASE: ${BETA_VERSION_BASE}" >&2
+            echo "Expected MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
 
-          NEW_PATCH=$((PATCH + 1))
-          BETA_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          short_sha="${GITHUB_SHA::7}"
+          beta_version="${BETA_VERSION_BASE}-beta.${GITHUB_RUN_NUMBER}.${short_sha}"
 
-          echo "Calculated beta version: ${BETA_VERSION}"
-          echo "beta_version=${BETA_VERSION}" >> $GITHUB_OUTPUT
-
-  build:
-    needs: prepare
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
-    steps:
-      - name: Prepare platform pair
-        run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-
-      - name: Checkout repository
-        uses: actions/checkout@v5
+          echo "version=${beta_version}" >> "${GITHUB_OUTPUT}"
+          echo "Building beta version ${beta_version}"
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
         with:
           registry: ghcr.io
-          username: ${{ github.repository_owner }}
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push by digest (Docker Hub)
-        id: build_dockerhub
-        uses: docker/build-push-action@v6
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.GHCR_IMAGE }}
+          tags: |
+            type=raw,value=beta
+            type=raw,value=${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=Tessarr
+            org.opencontainers.image.description=Self-hosted debrid and Usenet media bridge with qBittorrent and SABnzbd-compatible APIs
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/${{ github.sha }}/README.md
+            org.opencontainers.image.authors=Tessarr contributors
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push multi-platform image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64
+          push: true
           build-args: |
-            VERSION=${{ needs.prepare.outputs.beta_version }}
+            VERSION=${{ steps.version.outputs.version }}
             CHANNEL=beta
-          cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,scope=build-${{ env.PLATFORM_PAIR }},mode=max
-          outputs: type=image,name=${{ env.DOCKERHUB_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Build and push by digest (GHCR)
-        id: build_ghcr
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          build-args: |
-            VERSION=${{ needs.prepare.outputs.beta_version }}
-            CHANNEL=beta
-          cache-from: type=gha,scope=build-${{ env.PLATFORM_PAIR }}
-          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Export digests
-        run: |
-          mkdir -p /tmp/digests/dockerhub /tmp/digests/ghcr
-
-          dockerhub_digest="${{ steps.build_dockerhub.outputs.digest }}"
-          echo "Docker Hub digest: ${dockerhub_digest}"
-          touch "/tmp/digests/dockerhub/${dockerhub_digest#sha256:}"
-
-          ghcr_digest="${{ steps.build_ghcr.outputs.digest }}"
-          echo "GHCR digest: ${ghcr_digest}"
-          touch "/tmp/digests/ghcr/${ghcr_digest#sha256:}"
-
-      - name: Upload Docker Hub digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-dockerhub-${{ env.PLATFORM_PAIR }}
-          path: /tmp/digests/dockerhub/*
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload GHCR digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digests-ghcr-${{ env.PLATFORM_PAIR }}
-          path: /tmp/digests/ghcr/*
-          if-no-files-found: error
-          retention-days: 1
-
-  merge:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download Docker Hub digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests/dockerhub
-          pattern: digests-dockerhub-*
-          merge-multiple: true
-
-      - name: Download GHCR digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests/ghcr
-          pattern: digests-ghcr-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create Docker Hub manifest and push
-        working-directory: /tmp/digests/dockerhub
-        run: |
-          docker buildx imagetools create \
-            --tag ${{ env.DOCKERHUB_IMAGE }}:beta \
-            $(printf '${{ env.DOCKERHUB_IMAGE }}@sha256:%s ' *)
-
-      - name: Create GHCR manifest and push
-        working-directory: /tmp/digests/ghcr
-        run: |
-          docker buildx imagetools create \
-            --tag ${{ env.GHCR_IMAGE }}:beta \
-            $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=beta
+          cache-to: type=gha,scope=beta,mode=max
+          provenance: mode=max
+          sbom: true

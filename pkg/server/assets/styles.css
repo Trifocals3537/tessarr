@@ -18,11 +18,123 @@
 /*}*/
 
 :root {
-    --warning-color: rgb(245 158 11); /* amber-500 */
+    --warning-color: rgb(180 117 28);
+    --tessarr-ink: #111b34;
+    --tessarr-teal: #238b87;
+    --tessarr-violet: #7065a8;
+    --tessarr-ivory: #f5f1e8;
+}
+
+[data-theme="light"] {
+    color-scheme: light;
+    --color-base-100: #fffdf8;
+    --color-base-200: #f5f1e8;
+    --color-base-300: #e6e0d6;
+    --color-base-content: #172036;
+    --color-primary: #197c79;
+    --color-primary-content: #ffffff;
+    --color-secondary: #7065a8;
+    --color-secondary-content: #ffffff;
+    --color-accent: #a96753;
+    --color-accent-content: #ffffff;
+    --color-neutral: #172036;
+    --color-neutral-content: #f7f4ed;
+    --color-info: #39759b;
+    --color-success: #367c5e;
+    --color-warning: #b4751c;
+    --color-error: #b64e5a;
+    --radius-selector: 0.45rem;
+    --radius-field: 0.55rem;
+    --radius-box: 0.8rem;
+    --border: 1px;
+    --depth: 0;
+    --noise: 0;
+    --b1: 42 100% 99%;
+    --b2: 42 39% 94%;
+    --b3: 38 24% 87%;
+    --bc: 228 40% 15%;
+    --p: 178 66% 29%;
 }
 
 [data-theme="dark"] {
-    --warning-color: rgb(251 191 36); /* amber-400 - lighter for dark theme */
+    color-scheme: dark;
+    --warning-color: rgb(223 172 89);
+    --color-base-100: #11182a;
+    --color-base-200: #0b1120;
+    --color-base-300: #202a42;
+    --color-base-content: #e9e7e1;
+    --color-primary: #55aaa5;
+    --color-primary-content: #071817;
+    --color-secondary: #9a8dcc;
+    --color-secondary-content: #130f22;
+    --color-accent: #c78068;
+    --color-accent-content: #21100b;
+    --color-neutral: #202a42;
+    --color-neutral-content: #f2efe8;
+    --color-info: #70a6c7;
+    --color-success: #72ad8b;
+    --color-warning: #dfa954;
+    --color-error: #df7781;
+    --radius-selector: 0.45rem;
+    --radius-field: 0.55rem;
+    --radius-box: 0.8rem;
+    --border: 1px;
+    --depth: 0;
+    --noise: 0;
+    --b1: 224 42% 12%;
+    --b2: 222 49% 8%;
+    --b3: 222 35% 19%;
+    --bc: 42 17% 90%;
+    --p: 177 36% 50%;
+}
+
+html {
+    background: var(--color-base-200);
+}
+
+body {
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    letter-spacing: -0.005em;
+}
+
+.tessarr-navbar {
+    border-bottom: 1px solid color-mix(in srgb, var(--color-base-content) 10%, transparent);
+    box-shadow: 0 8px 28px color-mix(in srgb, var(--color-neutral) 8%, transparent);
+}
+
+.tessarr-brand-name {
+    color: var(--color-base-content);
+    letter-spacing: -0.025em;
+}
+
+.tessarr-card {
+    border: 1px solid color-mix(in srgb, var(--color-base-content) 10%, transparent);
+    box-shadow: 0 18px 45px color-mix(in srgb, var(--color-neutral) 11%, transparent);
+}
+
+.tessarr-setup-card {
+    width: calc(100vw - 2rem);
+    max-width: 56rem;
+    min-width: 0;
+}
+
+.tessarr-setup-card .card-body,
+.tessarr-setup-card .setup-step,
+.tessarr-setup-card form {
+    min-width: 0;
+    max-width: 100%;
+}
+
+.tessarr-setup-card .setup-step {
+    overflow-wrap: anywhere;
+}
+
+.tessarr-kicker {
+    color: var(--color-primary);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
 }
 
 
@@ -75,8 +187,7 @@
 }
 
 .btn:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    box-shadow: 0 3px 10px color-mix(in srgb, var(--color-neutral) 12%, transparent);
 }
 
 .btn:active:not(:disabled) {
@@ -88,7 +199,7 @@
 }
 
 .card:hover {
-    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+    border-color: color-mix(in srgb, var(--color-primary) 28%, var(--color-base-300));
 }
 
 .table tbody tr:hover {
@@ -111,19 +222,7 @@
     overflow: hidden;
 }
 
-.stepper-nav .nav-link::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: -100%;
-    width: 100%;
-    height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-}
-
-.stepper-nav .nav-link:hover::before {
-    left: 100%;
-}
+.stepper-nav .nav-link::before { content: none; }
 
 /* Modal animations */
 .modal {
@@ -335,9 +434,8 @@
 
 /* Dark mode specific improvements */
 [data-theme="dark"] .glass {
-    background: rgba(255, 255, 255, 0.05);
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: color-mix(in srgb, var(--color-base-100) 94%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-base-content) 10%, transparent);
 }
 
 /* Keep placeholders dim and distinguishable */
@@ -454,6 +552,15 @@
 @media (max-width: 768px) {
     .card:hover {
         box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+    }
+
+    .tessarr-setup-card {
+        width: calc(100vw - 1rem);
+    }
+
+    .tessarr-setup-card .card-body {
+        padding: 1.25rem;
+        overflow: hidden;
     }
 }
 

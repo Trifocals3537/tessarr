@@ -1,7 +1,7 @@
 package storage
 
 import (
-	"github.com/sirrobot01/decypharr/pkg/storage/hybrid"
+	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -17,11 +17,24 @@ func (s *Storage) GetEntryItems() map[string]struct{} {
 
 // UpdateEntryItem updates an entry item from an entry
 func (s *Storage) UpdateEntryItem(entry *Entry) error {
-	s.updateEntryItem(entry)
+	s.entryItemsMu.Lock()
+	defer s.entryItemsMu.Unlock()
+	if err := s.markEntryItemsDirtyLocked(); err != nil {
+		return err
+	}
+	if err := s.updateEntryItem(entry); err != nil {
+		return err
+	}
+	s.markEntryItemMutation(nil, entry)
 	return nil
 }
 
 func (s *Storage) UpdateItem(item *EntryItem) error {
+	s.entryItemsMu.Lock()
+	defer s.entryItemsMu.Unlock()
+	if err := s.markEntryItemsDirtyLocked(); err != nil {
+		return err
+	}
 	var oldFingerprint string
 	if existing, err := s.GetEntryItem(item.Name); err == nil {
 		oldFingerprint = EntryItemRepairFingerprint(existing)

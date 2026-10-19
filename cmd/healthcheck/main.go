@@ -14,7 +14,7 @@ import (
 
 	json "github.com/bytedance/sonic"
 
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/config"
 )
 
 // HealthStatus represents the status of various components
@@ -22,6 +22,7 @@ type HealthStatus struct {
 	QbitAPI       bool `json:"qbit_api"`
 	WebUI         bool `json:"web_ui"`
 	WebDAVService bool `json:"webdav_service"`
+	DataReady     bool `json:"data_ready"`
 	OverallStatus bool `json:"overall_status"`
 }
 
@@ -33,7 +34,10 @@ func main() {
 	flag.StringVar(&configPath, "config", "/data", "path to the data folder")
 	flag.BoolVar(&debug, "debug", false, "enable debug mode for detailed output")
 	flag.Parse()
-	config.SetConfigPath(configPath)
+	if err := config.SetConfigPath(configPath); err != nil {
+		fmt.Fprintln(os.Stderr, "invalid configuration path")
+		os.Exit(1)
+	}
 	cfg := config.Get()
 	// GetReader port from environment variable or use default
 	port := cmp.Or(os.Getenv("QBIT_PORT"), cfg.Port)
@@ -43,6 +47,7 @@ func main() {
 		QbitAPI:       false,
 		WebUI:         false,
 		WebDAVService: false,
+		DataReady:     false,
 		OverallStatus: false,
 	}
 
@@ -60,10 +65,12 @@ func main() {
 
 	status.QbitAPI = checkQbitAPI(ctx, client, baseUrl, port, auth, cfg.UseAuth)
 	status.WebUI = checkWebUI(ctx, client, baseUrl, port, auth, cfg.UseAuth)
-	status.WebDAVService = checkBaseWebdav(ctx, client, baseUrl, port, cfg)
+	status.WebDAVService = checkWebDAVReadiness(ctx, client, baseUrl, port, cfg)
+	status.DataReady = checkDataReadiness(ctx, client, baseUrl, port)
 	// Determine overall status
-	// Consider the application healthy if core services are running
-	status.OverallStatus = status.QbitAPI && status.WebUI && status.WebDAVService
+	// The control plane alone is insufficient: Plex/Jellyfin require a proven
+	// data path, so readiness is mandatory for an overall healthy result.
+	status.OverallStatus = status.QbitAPI && status.WebUI && status.WebDAVService && status.DataReady
 
 	// Optional: output health status as JSON for logging
 	if debug {
@@ -110,6 +117,27 @@ func checkWebUI(ctx context.Context, client *http.Client, baseUrl, port string, 
 	defer drainAndClose(resp)
 
 	return isHealthyStatus(resp.StatusCode, authMayBeRequired, http.StatusOK) || isRedirect(resp.StatusCode)
+}
+
+func checkDataReadiness(ctx context.Context, client *http.Client, baseUrl, port string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, localURL(port, baseUrl, "ready"), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer drainAndClose(resp)
+	return resp.StatusCode == http.StatusOK
+}
+
+func checkWebDAVReadiness(ctx context.Context, client *http.Client, baseUrl, port string, cfg *config.Config) bool {
+	if cfg.DisableWebDav {
+		return true
+	}
+
+	return checkBaseWebdav(ctx, client, baseUrl, port, cfg)
 }
 
 func checkBaseWebdav(ctx context.Context, client *http.Client, baseUrl, port string, cfg *config.Config) bool {

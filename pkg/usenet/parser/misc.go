@@ -5,14 +5,14 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Tensai75/nzbparser"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/sirrobot01/decypharr/pkg/usenet/types"
+	"github.com/Trifocals3537/tessarr/internal/safepath"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/types"
 )
 
 // getRARVolumeOrder returns a sort key for RAR volume ordering.
@@ -57,14 +57,11 @@ func wrapNZBFile(f *storage.NZBFile) ([]*storage.NZBFile, error) {
 
 // fileMetaKey returns a stable key for associating per-file metadata.
 func fileMetaKey(file nzbparser.NzbFile) string {
-	if file.Number > 0 {
-		return fmt.Sprintf("n:%d", file.Number)
+	if len(file.Segments) > 0 {
+		return "m:" + file.Segments[0].Id
 	}
 	if file.Subject != "" {
 		return "s:" + file.Subject
-	}
-	if len(file.Segments) > 0 {
-		return "m:" + file.Segments[0].Id
 	}
 	return ""
 }
@@ -78,15 +75,18 @@ func getGroupsList(groups map[string]struct{}) []string {
 }
 
 func determineNZBName(filename string, meta map[string]string) string {
-	// Prefer filename if it exists
-	if filename != "" {
-		filename = strings.TrimSuffix(filename, filepath.Ext(filename))
-	} else if name := meta["Name"]; name != "" {
-		filename = name
-	} else if title := meta["title"]; title != "" {
-		filename = title
+	candidates := []string{
+		strings.TrimSuffix(filename, filepath.Ext(filename)),
+		meta["Name"],
+		meta["title"],
 	}
-	return utils.RemoveInvalidChars(filename)
+	for _, candidate := range candidates {
+		cleaned := utils.RemoveInvalidChars(candidate)
+		if safepath.ValidateIdentifier(cleaned) == nil {
+			return cleaned
+		}
+	}
+	return ""
 }
 
 func determineExtension(group *FileGroup) string {
@@ -101,97 +101,34 @@ func determineExtension(group *FileGroup) string {
 }
 
 func getNZBSegments(index int, file nzbparser.NzbFile, group *FileGroup) (int64, []storage.NZBSegment) {
-	if len(file.Segments) == 0 {
+	if !sortAndValidateSegments(file.Segments) {
 		return 0, nil
 	}
-
-	sort.Slice(file.Segments, func(i, j int) bool {
-		return file.Segments[i].Number < file.Segments[j].Number
-	})
-
-	// Segment numbers must form one contiguous range (usually 1..N, some
-	// posters number from 0). A file with holes or duplicates cannot produce
-	// a consistent offset map: the old code zero-filled missing slots, which
-	// leaked segments with empty message-ids and offset 0 into the .meta
-	// files, the streaming reader (non-monotonic offset table breaks its
-	// binary search), and Download. Reject such files outright.
-	minSegNum, maxSegNum := file.Segments[0].Number, file.Segments[0].Number
-	for _, seg := range file.Segments {
-		if seg.Number < minSegNum {
-			minSegNum = seg.Number
-		}
-		if seg.Number > maxSegNum {
-			maxSegNum = seg.Number
+	var fileSize, segmentSize int64
+	if meta, ok := group.fileMeta[fileMetaKey(file)]; ok {
+		fileSize, segmentSize = meta.fileSize, meta.segmentSize
+	} else if group.metadata != nil {
+		// Explicit metadata is used by archive/unit-test callers. Never estimate
+		// decoded byte geometry from the encoded NZB byte counts.
+		fileSize, segmentSize = group.metadata.fileSize, group.metadata.segmentSize
+		if index == len(group.Files)-1 {
+			fileSize = group.metadata.lastFileSize
 		}
 	}
-	if maxSegNum-minSegNum+1 != len(file.Segments) {
+	if fileSize <= 0 || segmentSize <= 0 || (fileSize-1)/segmentSize+1 != int64(len(file.Segments)) {
 		return 0, nil
 	}
-
-	nzbSegments := make([]storage.NZBSegment, len(file.Segments))
-
-	currentOffset := int64(0)
-	metadata := group.getMetadata()
-
-	fileSize := metadata.fileSize
-	if index == len(group.Files)-1 {
-		fileSize = metadata.lastFileSize
+	segments := make([]storage.NZBSegment, 0, len(file.Segments))
+	// One backing allocation for immutable provenance, retained through slices.
+	sources := make([]storage.NZBArticleGeometry, len(file.Segments))
+	var offset int64
+	for i, s := range file.Segments {
+		size := min(segmentSize, fileSize-offset)
+		sources[i] = storage.NZBArticleGeometry{Size: fileSize, Offset: offset, Bytes: size, Part: int64(i + 1), Total: int64(len(file.Segments))}
+		segments = append(segments, storage.NZBSegment{Number: s.Number, MessageID: s.Id, Bytes: size, StartOffset: offset, EndOffset: offset + size - 1, Group: group.BaseName, Source: &sources[i]})
+		offset += size
 	}
-
-	for idx, segment := range file.Segments {
-		// A segment without a message id can never be fetched; it would also
-		// defeat the empty-slot duplicate check below.
-		if segment.Id == "" {
-			return 0, nil
-		}
-		segSize := metadata.segmentSize
-		if idx == len(file.Segments)-1 {
-			// Last segment may be smaller
-			// Last segment calculation
-			// Check if the file size metadata assumes a different file (e.g. mixed groups)
-			// Expected total size if all segments were full
-			fullSegsSize := metadata.segmentSize * int64(len(file.Segments)-1) // size of all previous segments
-
-			// If fileSize is inconsistent with the number of segments (too small or too large),
-			// fallback to estimation for this last segment.
-			// Threshold: if difference > 1.5 segments
-			isSizeMismatch := false
-			expectedTotal := fullSegsSize + metadata.segmentSize // rough estimate
-			diff := fileSize - expectedTotal
-			if diff < 0 {
-				diff = -diff
-			}
-			if diff > (metadata.segmentSize*3)/2 {
-				isSizeMismatch = true
-			}
-
-			if isSizeMismatch {
-				// Fallback: estimate from encoded bytes
-				segSize = int64(float64(segment.Bytes) * 0.97)
-			} else {
-				segSize = fileSize - fullSegsSize
-			}
-		}
-		seg := storage.NZBSegment{
-			Number:      segment.Number,
-			MessageID:   segment.Id,
-			Bytes:       segSize,
-			StartOffset: currentOffset,
-			EndOffset:   currentOffset + segSize - 1,
-			Group:       group.BaseName,
-		}
-
-		// Normalize to the range base so 0- and 1-indexed numbering both map
-		// onto a dense array. A duplicate number means the range check above
-		// passed on count alone while another slot stays empty — reject.
-		segIdx := segment.Number - minSegNum
-		if nzbSegments[segIdx].MessageID != "" {
-			return 0, nil
-		}
-		nzbSegments[segIdx] = seg
-		currentOffset += segSize
-	}
-	return currentOffset, nzbSegments
+	return offset, segments
 }
 
 func buildBaseSegments(group *FileGroup) ([]storage.NZBSegment, []storage.ArchiveVolumeInfo, int64) {

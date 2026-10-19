@@ -1,7 +1,12 @@
 {{ define "register" }}
 <div class="flex min-h-screen items-center justify-center bg-base-200">
-    <div class="card w-full max-w-md bg-base-100 shadow-xl">
+    <div class="card tessarr-card w-full max-w-md bg-base-100">
         <div class="card-body">
+			<div class="mb-2 flex flex-col items-center gap-2 text-center">
+				<img src="{{.URLBase}}images/logo.png" alt="Tessarr" class="h-20 w-20">
+				<p class="tessarr-kicker">Tessarr</p>
+				<p class="text-sm opacity-70">Many sources. One library.</p>
+			</div>
             <h2 class="card-title justify-center mb-6">First Time Auth Setup</h2>
             <form id="authForm" class="space-y-4">
                 <div>
@@ -61,10 +66,10 @@
                     if (!response.ok) {
                         return response.text().then(errorText => {
                             // Throw an error with the response text
-                            window.decypharrUtils.createToast(errorText || 'Registration failed', 'error');
+                            window.tessarrUtils.createToast(errorText || 'Registration failed', 'error');
                         });
                     } else {
-                        window.location.href = window.decypharrUtils.joinURL(window.urlBase, '/');
+                        window.location.href = window.tessarrUtils.joinURL(window.urlBase, '/');
                     }
 
                 })
@@ -75,10 +80,10 @@
 
         // Handle skip auth button
         skipAuthBtn.addEventListener('click', function () {
-            window.decypharrUtils.fetcher('/skip-auth', {method: 'POST'})
+            window.tessarrUtils.fetcher('/skip-auth', {method: 'POST'})
                 .then(response => {
                     if (response.ok) {
-                        window.location.href = window.decypharrUtils.joinURL(window.urlBase, '/');
+                        window.location.href = window.tessarrUtils.joinURL(window.urlBase, '/');
                     } else {
                         throw new Error('Failed to skip authentication');
                     }

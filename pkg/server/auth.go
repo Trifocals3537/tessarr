@@ -2,12 +2,13 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -34,13 +35,27 @@ func (s *Server) skipAuthHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	cfg.UseAuth = false
-	if err := cfg.Save(); err != nil {
+	if !isLoopbackBindAddress(cfg.BindAddress) {
+		http.Error(
+			w,
+			"Authentication cannot be disabled on a non-loopback listener",
+			http.StatusForbidden,
+		)
+		return
+	}
+	if !s.requireBrowserMutation(w, r) {
+		return
+	}
+	result, err := config.Update(func(draft *config.Config) error {
+		draft.UseAuth = false
+		return nil
+	})
+	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to save config")
 		http.Error(w, "failed to save config", http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	redirectLocal(w, result.Active.URLBase, "", http.StatusSeeOther)
 }
 
 // isValidAPIToken checks if the request contains a valid API token
@@ -72,7 +87,7 @@ func (s *Server) isValidAPIToken(r *http.Request) bool {
 	}
 
 	// Check if the provided token matches the configured token
-	return token == auth.APIToken
+	return subtle.ConstantTimeCompare([]byte(token), []byte(auth.APIToken)) == 1
 }
 
 // generateAPIToken creates a new random API token
@@ -86,8 +101,7 @@ func (s *Server) generateAPIToken() (string, error) {
 
 // refreshAPIToken generates a new API token and saves it
 func (s *Server) refreshAPIToken() (string, error) {
-	auth := config.Get().GetAuth()
-	if auth == nil {
+	if config.Get().GetAuth() == nil {
 		return "", fmt.Errorf("authentication not configured")
 	}
 
@@ -97,11 +111,14 @@ func (s *Server) refreshAPIToken() (string, error) {
 		return "", err
 	}
 
-	// Update auth config
-	auth.APIToken = token
-
-	// Save auth config
-	if err := config.Get().SaveAuth(auth); err != nil {
+	_, err = config.Update(func(draft *config.Config) error {
+		if draft.Auth == nil {
+			return fmt.Errorf("authentication not configured")
+		}
+		draft.Auth.APIToken = token
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
 

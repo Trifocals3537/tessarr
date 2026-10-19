@@ -1,9 +1,9 @@
 ---
-title: Decypharr
+title: Tessarr
 description: Media gateway for Debrid & Usenet.
 template: splash
 hero:
-  tagline: Media gateway for Debrid & Usenet.
+  tagline: Many sources. One library.
   image:
     file: ../../assets/logo.png
   actions:
@@ -12,43 +12,28 @@ hero:
       icon: right-arrow
       variant: primary
     - text: View on GitHub
-      link: https://github.com/sirrobot01/decypharr
+      link: https://github.com/Trifocals3537/decypharr
       icon: external
 ---
 
-import indexImage from '../../assets/images/index.png';
-import indexImageWhite from '../../assets/images/index-white.png';
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-<div>
-  <img
-    class="dark:sl-hidden"
-    src={indexImageWhite.src}
-    alt="Decypharr landing page preview"
-  />
-  <img
-    class="light:sl-hidden"
-    src={indexImage.src}
-    alt="Decypharr landing page preview"
-  />
-</div>
+## What is Tessarr?
 
-## What is Decypharr?
-
-Decypharr bridges your media automation tools (Sonarr, Radarr, etc.) with Debrid services and Usenet providers. Instead of downloading torrents and NZB files to your local storage, Decypharr streams them directly from the cloud.
+Tessarr bridges your media automation tools (Sonarr, Radarr, etc.) with Debrid services and Usenet providers. Instead of downloading torrents and NZB files to your local storage, Tessarr streams them directly from the cloud.
 
 ### In Simple Terms
 
-**Without Decypharr:**
+**Without Tessarr:**
 1. Sonarr/Radarr finds a torrent
 2. qBittorrent downloads it to your hard drive (takes time, uses disk space)
 3. Your media server (Plex/Jellyfin) plays from local storage
 
-**With Decypharr:**
+**With Tessarr:**
 1. Sonarr/Radarr finds a torrent
-2. Decypharr sends it to your Debrid provider (Real Debrid, All Debrid, etc.)
+2. Tessarr sends it to your Debrid provider (Real Debrid, All Debrid, etc.)
 3. The Debrid service downloads it to their servers (fast, no local disk needed)
-4. Decypharr mounts the remote files as if they were on your computer
+4. Tessarr mounts the remote files as if they were on your computer
 5. Your media server streams directly from the cloud
 
 ### Key Benefits
@@ -63,16 +48,16 @@ Decypharr bridges your media automation tools (Sonarr, Radarr, etc.) with Debrid
 
 <CardGrid>
   <Card title="1. You Send Requests" icon="rocket">
-    Sonarr/Radarr sends torrents or NZB files to Decypharr (like it would to qBittorrent/Sabnzbd).
+    Sonarr/Radarr sends torrents or NZB files to Tessarr (like it would to qBittorrent/Sabnzbd).
   </Card>
-  <Card title="2. Decypharr Processes" icon="seti:config">
-    Decypharr forwards torrents to your Debrid provider or processes NZBs via direct NNTP connection.
+  <Card title="2. Tessarr Processes" icon="seti:config">
+    Tessarr forwards torrents to your Debrid provider or processes NZBs via direct NNTP connection.
   </Card>
   <Card title="3. Cloud Storage" icon="seti:folder">
     Debrid services download torrents to their servers. Usenet content is streamed on-demand from NNTP servers.
   </Card>
   <Card title="4. Files Appear Locally" icon="puzzle">
-    Decypharr mounts remote files using DFS, Rclone, or serves via WebDAV - appears as local filesystem.
+    Tessarr mounts remote files using DFS, Rclone, or serves via WebDAV - appears as local filesystem.
   </Card>
 </CardGrid>
 
@@ -109,7 +94,7 @@ Decypharr bridges your media automation tools (Sonarr, Radarr, etc.) with Debrid
 
 ## What You Need
 
-1. **Decypharr** (this software)
+1. **Tessarr** (this software)
 2. **At least one:**
    - Debrid subscription (Real Debrid, All Debrid, Debrid Link, or Torbox)
    - Usenet provider with NNTP access

@@ -57,7 +57,13 @@ Rotate between multiple keys for higher throughput:
 
 ### Rate Limiting
 
-Respect Real Debrid's rate limits:
+Tessarr automatically enforces Real Debrid's documented 250 API
+requests/minute limit once per API token. Main, repair, download-link, and retry
+traffic using the same token share that budget. A conservative short-burst limit
+also avoids sending the add-magnet bursts that Real Debrid can reject with
+misleading errors.
+
+The configuration limits remain useful as additional, tighter workload controls:
 
 ```json
 {
@@ -70,6 +76,9 @@ Respect Real Debrid's rate limits:
   ]
 }
 ```
+
+These settings cannot raise the built-in provider limit. Media bytes from Real
+Debrid download hosts are not API calls and do not consume this request budget.
 
 ### Proxy Support
 
@@ -127,7 +136,7 @@ You can add multiple Real Debrid accounts:
 }
 ```
 
-Decypharr will use the first provider with available slots.
+Tessarr will use the first provider with available slots.
 
 ## Troubleshooting
 
@@ -138,7 +147,10 @@ Decypharr will use the first provider with available slots.
 
 ### Rate Limit Errors
 
-Reduce `rate_limit` or add more `download_api_keys`.
+The built-in controller automatically honors HTTP 429 backoff across every
+client using the affected token. If errors persist, reduce the configured
+`rate_limit`, `repair_rate_limit`, or `download_rate_limit` to further smooth
+your workload.
 
 ### No Free Slots
 

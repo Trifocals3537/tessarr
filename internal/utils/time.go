@@ -68,17 +68,33 @@ func (ct *CachedTime) update() {
 
 // Unix returns the cached Unix timestamp (seconds since epoch).
 func (ct *CachedTime) Unix() int64 {
+	if !ct.running.Load() {
+		// No background refresh is active: the cached value is frozen at
+		// construction time. Serve the real clock instead so duration and
+		// deadline arithmetic cannot silently operate on a stale instant.
+		return time.Now().Unix()
+	}
 	return ct.unix.Load()
 }
 
 // UnixNano returns the cached Unix timestamp in nanoseconds.
 func (ct *CachedTime) UnixNano() int64 {
+	if !ct.running.Load() {
+		return time.Now().UnixNano()
+	}
 	return ct.unixNs.Load()
 }
 
 // Now returns the cached time as a time.Time value.
 // Note: This is slightly less accurate but avoids syscalls.
 func (ct *CachedTime) Now() time.Time {
+	if !ct.running.Load() {
+		// Fall back to the real clock when the refresher is not running.
+		// The cached value would otherwise be frozen at process start;
+		// any deadline computed from it (e.g. NNTP connection handshakes)
+		// would already be expired once the process outlives the cache.
+		return time.Now()
+	}
 	return time.Unix(0, ct.unixNs.Load())
 }
 

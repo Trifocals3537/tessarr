@@ -3,22 +3,9 @@ title: Setup Wizard
 description: First-run setup walkthrough.
 ---
 
-import authSetupImage from '../../../assets/images/setup/auth.png';
-import debridSetupImage from '../../../assets/images/setup/debrid.png';
-import usenetSetupImage from '../../../assets/images/setup/usenet.png';
-import mountSetupImage from '../../../assets/images/setup/mount.png';
-
-On first run, Decypharr presents a setup wizard to configure core settings.
+On first run, Tessarr presents a setup wizard to configure core settings.
 
 ## Step 1: Authentication
-
-<img
-	src={authSetupImage.src}
-	width={authSetupImage.width}
-	height={authSetupImage.height}
-	alt="Setup wizard authentication screen"
-/>
-*Screenshot: Authentication setup screen.*
 
 Create your admin credentials:
 - **Username**: Your login username
@@ -29,14 +16,6 @@ The API token is auto-generated and shown after setup completes.
 :::
 
 ## Step 2: Debrid Providers
-
-<img
-	src={debridSetupImage.src}
-	width={debridSetupImage.width}
-	height={debridSetupImage.height}
-	alt="Setup wizard debrid providers screen"
-/>
-*Screenshot: Debrid provider selection.*
 
 Add at least one Debrid provider:
 
@@ -54,14 +33,6 @@ For each provider:
 
 ## Step 3: Usenet Providers (Optional)
 
-<img
-	src={usenetSetupImage.src}
-	width={usenetSetupImage.width}
-	height={usenetSetupImage.height}
-	alt="Setup wizard Usenet configuration screen"
-/>
-*Screenshot: Usenet provider configuration.*
-
 Add NNTP servers for Usenet support:
 
 **Required:**
@@ -75,15 +46,13 @@ Add NNTP servers for Usenet support:
 - SSL enabled (recommended)
 - Priority (for multiple providers)
 
-## Step 4: Mount Configuration
+## Step 4: Download Folder
 
-<img
-	src={mountSetupImage.src}
-	width={mountSetupImage.width}
-	height={mountSetupImage.height}
-	alt="Setup wizard mount type selection screen"
-/>
-*Screenshot: Mount type selection.*
+Choose the staging directory where Arr applications will see completed
+downloads. Use a path that both Tessarr and the relevant Arr application can
+access.
+
+## Step 5: Mount Configuration
 
 Choose how files are mounted:
 
@@ -94,11 +63,11 @@ Choose how files are mounted:
 | **External Rclone** | Connect to existing Rclone RC instance |
 | **None** | No mounting (API/WebDAV only) |
 
-**Mount Path**: Where files appear (e.g., `/mnt/decypharr`)
+**Mount Path**: Where files appear (e.g., `/mnt/tessarr`)
 
 **Cache Directory**: Local cache storage (e.g., `/cache`)
 
-## Step 5: Review & Complete
+## Step 6: Review & Complete
 
 Review settings and click **Complete Setup**.
 

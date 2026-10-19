@@ -3,18 +3,75 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	json "github.com/bytedance/sonic"
 
-	"github.com/sirrobot01/decypharr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/config"
 )
+
+func (s *Server) clientNetworkMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.accessPolicyErr != nil {
+			http.Error(w, "Client network policy is invalid", http.StatusServiceUnavailable)
+			return
+		}
+		if !clientAddressAllowed(r.RemoteAddr, s.allowedClients) {
+			// Keep this at debug level: an Internet scan must not be able to
+			// turn a correctly-blocked request into unbounded warning logs.
+			s.logger.Debug().
+				Str("remote_address", r.RemoteAddr).
+				Msg("Rejected request outside allowed client networks")
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func clientAddressAllowed(remoteAddress string, allowed []netip.Prefix) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+
+	remoteAddress = strings.TrimSpace(remoteAddress)
+	addressPort, err := netip.ParseAddrPort(remoteAddress)
+	var address netip.Addr
+	if err == nil {
+		address = addressPort.Addr()
+	} else {
+		address, err = netip.ParseAddr(remoteAddress)
+	}
+	if err != nil {
+		return false
+	}
+	address = address.Unmap().WithZone("")
+	for _, prefix := range allowed {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check if setup is needed
 		cfg := config.Get()
 		if !cfg.UseAuth {
+			// Preserve credentialless local API clients, which normally omit
+			// browser origin headers, while rejecting a browser page trying to
+			// mutate the loopback control plane from another origin.
+			if !isSafeHTTPMethod(r.Method) && browserOriginPresent(r) &&
+				!requestOriginAllowed(r, cfg.AppURL) {
+				if s.isAPIRequest(r) {
+					s.sendJSONError(w, "Cross-site request rejected", http.StatusForbidden)
+				} else {
+					http.Error(w, "Cross-site request rejected", http.StatusForbidden)
+				}
+				return
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -25,7 +82,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			if isAPI {
 				s.sendJSONError(w, "Authentication setup required", http.StatusUnauthorized)
 			} else {
-				http.Redirect(w, r, "/register", http.StatusSeeOther)
+				redirectLocal(w, cfg.URLBase, "register", http.StatusSeeOther)
 			}
 			return
 		}
@@ -36,15 +93,21 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Fall back to session authentication
-		session, _ := s.cookie.Get(r, "auth-session")
-		auth, ok := session.Values["authenticated"].(bool)
-
-		if !ok || !auth {
+		// Fall back to a versioned browser session. Credential changes bump the
+		// version in auth.json, invalidating every previously issued cookie.
+		if !s.sessionAuthenticated(r) {
 			if isAPI {
 				s.sendJSONError(w, "Authentication required. Please provide a valid API token in the Authorization header (Bearer <token>) or authenticate via session cookies.", http.StatusUnauthorized)
 			} else {
-				http.Redirect(w, r, "/login", http.StatusSeeOther)
+				redirectLocal(w, cfg.URLBase, "login", http.StatusSeeOther)
+			}
+			return
+		}
+		if !s.browserMutationAllowed(r) {
+			if isAPI {
+				s.sendJSONError(w, "Cross-site request rejected", http.StatusForbidden)
+			} else {
+				http.Error(w, "Cross-site request rejected", http.StatusForbidden)
 			}
 			return
 		}
@@ -55,7 +118,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 
 // isAPIRequest checks if the request is for an API endpoint
 func (s *Server) isAPIRequest(r *http.Request) bool {
-	return strings.HasPrefix(r.URL.Path, "/api/")
+	path := pathWithoutURLBase(r.URL.Path, s.urlBase)
+	return strings.HasPrefix(path, "/api/") ||
+		strings.HasPrefix(path, "/webhooks/")
 }
 
 // sendJSONError sends a JSON error response
@@ -76,15 +141,18 @@ func (s *Server) setupRedirectMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cfg := config.Get()
 
+		path := pathWithoutURLBase(r.URL.Path, s.urlBase)
 		// Skip setup check for setup-related routes
-		if strings.HasPrefix(r.URL.Path, "/setup") ||
-			strings.HasPrefix(r.URL.Path, "/api/setup") ||
-			strings.HasPrefix(r.URL.Path, "/api/login") ||
-			strings.HasPrefix(r.URL.Path, "/api/logout") ||
-			strings.HasPrefix(r.URL.Path, "/api/config") ||
-			strings.HasPrefix(r.URL.Path, "/assets") ||
-			strings.HasPrefix(r.URL.Path, "/images") ||
-			r.URL.Path == "/version" {
+		if strings.HasPrefix(path, "/setup") ||
+			strings.HasPrefix(path, "/api/setup") ||
+			strings.HasPrefix(path, "/api/login") ||
+			strings.HasPrefix(path, "/api/logout") ||
+			strings.HasPrefix(path, "/api/config") ||
+			strings.HasPrefix(path, "/assets") ||
+			strings.HasPrefix(path, "/images") ||
+			path == "/live" ||
+			path == "/ready" ||
+			path == "/version" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -95,7 +163,7 @@ func (s *Server) setupRedirectMiddleware(next http.Handler) http.Handler {
 			if isAPI {
 				s.sendJSONError(w, fmt.Sprintf("[error] %s Setup wizard must be completed first. Please visit /setup", err), http.StatusServiceUnavailable)
 			} else {
-				http.Redirect(w, r, "/setup", http.StatusSeeOther)
+				redirectLocal(w, cfg.URLBase, "setup", http.StatusSeeOther)
 			}
 			return
 		}

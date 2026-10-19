@@ -1,6 +1,7 @@
 package arr
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,9 @@ type ImportResponseSchema struct {
 		LanguageProfileId int `json:"languageProfileId"`
 		Id                int `json:"id"`
 	} `json:"series"`
+	Movie struct {
+		Id int `json:"id"`
+	} `json:"movie"`
 	SeasonNumber int `json:"seasonNumber"`
 	Episodes     []struct {
 		SeriesId                 int       `json:"seriesId"`
@@ -116,7 +120,8 @@ type ManualImportRequestFile struct {
 	DownloadId   string `json:"downloadId"`
 	FolderName   string `json:"folderName"`
 	Path         string `json:"path"`
-	SeriesId     int    `json:"seriesId"`
+	SeriesId     int    `json:"seriesId,omitempty"`
+	MovieId      int    `json:"movieId,omitempty"`
 	SeasonNumber int    `json:"seasonNumber"`
 	EpisodeIds   []int  `json:"episodeIds"`
 	Quality      struct {
@@ -154,13 +159,20 @@ type ManualImportRequestSchema struct {
 }
 
 func (a *Arr) Import(downloadID string) (io.ReadCloser, error) {
+	return a.ImportCtx(context.Background(), downloadID)
+}
+
+func (a *Arr) ImportCtx(ctx context.Context, downloadID string) (io.ReadCloser, error) {
 	query := gourl.Values{}
 	query.Add("downloadId", downloadID)
 	url := "api/v3/manualimport" + "?" + query.Encode()
 	var data []ImportResponseSchema
-	_, err := a.Request(http.MethodGet, url, nil, &data)
+	resp, err := a.RequestCtx(ctx, http.MethodGet, url, nil, &data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to import: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("failed to import: %s", resp.Status)
 	}
 	var files []ManualImportRequestFile
 	for _, d := range data {
@@ -173,6 +185,7 @@ func (a *Arr) Import(downloadID string) (io.ReadCloser, error) {
 			Path:              d.Path,
 			FolderName:        d.FolderName,
 			SeriesId:          d.Series.Id,
+			MovieId:           d.Movie.Id,
 			SeasonNumber:      d.SeasonNumber,
 			EpisodeIds:        episodesIds,
 			Quality:           d.Quality,
@@ -194,9 +207,13 @@ func (a *Arr) Import(downloadID string) (io.ReadCloser, error) {
 	}
 
 	url = "api/v3/command"
-	resp, err := a.Request(http.MethodPost, url, request, nil)
+	resp, err = a.RequestCtx(ctx, http.MethodPost, url, request, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to import: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		closeArrResponse(resp)
+		return nil, fmt.Errorf("failed to import: %s", resp.Status)
 	}
 	return resp.Body, nil
 }

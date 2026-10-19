@@ -3,12 +3,12 @@ package webdav
 import (
 	"net/http"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/manager"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/logger"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/manager"
 )
 
 func init() {
@@ -41,15 +41,12 @@ func NewHandler(mgr *manager.Manager) *Handler {
 
 func (h *Handler) readinessMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case <-h.manager.IsReady():
-			// WebDAV is ready, proceed
+		if h.manager.DataReady() {
 			next.ServeHTTP(w, r)
-		default:
-			// WebDAV is still initializing
-			w.Header().Set("Retry-After", "5")
-			http.Error(w, "WebDAV service is initializing, please try again shortly", http.StatusServiceUnavailable)
+			return
 		}
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "WebDAV service is initializing, please try again shortly", http.StatusServiceUnavailable)
 	})
 }
 

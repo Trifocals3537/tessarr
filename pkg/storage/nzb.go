@@ -103,13 +103,38 @@ func (nzb *NZB) GetFiles() []NZBFile {
 
 // NZBSegment represents a segment with all necessary download info
 type NZBSegment struct {
-	Number           int    `json:"number" msgpack:"number"`
-	MessageID        string `json:"message_id" msgpack:"message_id"`
-	Bytes            int64  `json:"bytes" msgpack:"bytes"`                           // Size of data to read from this segment
-	StartOffset      int64  `json:"start_offset" msgpack:"start_offset"`             // Position in the OUTPUT file where this segment's data goes
-	EndOffset        int64  `json:"end_offset" msgpack:"end_offset"`                 // End position in the OUTPUT file
-	Group            string `json:"group"`                                           // Newsgroup
-	SegmentDataStart int64  `json:"segment_data_start" msgpack:"segment_data_start"` // Offset within the decoded NNTP segment where reading should begin (for sliced reads)
+	Number           int                 `json:"number" msgpack:"number"`
+	MessageID        string              `json:"message_id" msgpack:"message_id"`
+	Bytes            int64               `json:"bytes" msgpack:"bytes"`                                         // Size of data to read from this segment
+	StartOffset      int64               `json:"start_offset" msgpack:"start_offset"`                           // Position in the OUTPUT file where this segment's data goes
+	EndOffset        int64               `json:"end_offset" msgpack:"end_offset"`                               // End position in the OUTPUT file
+	Group            string              `json:"group"`                                                         // Newsgroup
+	SegmentDataStart int64               `json:"segment_data_start" msgpack:"segment_data_start"`               // Offset within the decoded NNTP segment where reading should begin (for sliced reads)
+	Source           *NZBArticleGeometry `json:"source_geometry,omitempty" msgpack:"source_geometry,omitempty"` // Immutable original article geometry; nil for legacy maps.
+}
+
+// NZBArticleGeometry identifies an article's position in its original posted
+// file, before archive headers are sliced away or logical offsets are rebased.
+// Part is always one-based, independently of zero/one-based NZB numbering.
+type NZBArticleGeometry struct {
+	Size   int64 `json:"size" msgpack:"size"`
+	Offset int64 `json:"offset" msgpack:"offset"`
+	Bytes  int64 `json:"bytes" msgpack:"bytes"`
+	Part   int64 `json:"part" msgpack:"part"`
+	Total  int64 `json:"total" msgpack:"total"`
+}
+
+func (g *NZBArticleGeometry) Valid() bool {
+	return g != nil && g.Size > 0 && g.Offset >= 0 && g.Offset < g.Size &&
+		g.Bytes > 0 && g.Bytes <= g.Size-g.Offset && g.Part > 0 && g.Total >= g.Part
+}
+
+// Matches checks source identity using geometry and the actual decoded byte
+// count. Some posters omit optional part/total fields; supplied values must
+// match exactly. Filename text and logical output offsets are not identities.
+func (g *NZBArticleGeometry) Matches(size, begin, end, part, total, decoded int64) bool {
+	return g.Valid() && size == g.Size && begin == g.Offset+1 && end == g.Offset+g.Bytes &&
+		decoded == g.Bytes && (part == 0 || part == g.Part) && (total == 0 || total == g.Total)
 }
 
 // ArchiveVolumeInfo holds metadata about archive volumes (internal parser use only)

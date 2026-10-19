@@ -4,11 +4,10 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/Trifocals3537/tessarr/internal/nntp"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
 // SegmentFetcher handles downloading segments from NNTP with deduplication and retry.
@@ -33,9 +32,9 @@ type SegmentFetcher struct {
 	inFlightMu sync.Mutex
 
 	// Background prefetch
-	prefetchCh     chan int
-	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
-	prefetchWg     sync.WaitGroup
+	prefetch        *prefetchScheduler
+	prefetchWorkers int
+	prefetchWg      sync.WaitGroup
 
 	// Lifecycle
 	ctx    context.Context
@@ -65,20 +64,16 @@ func NewSegmentFetcher(
 	}
 
 	sf := &SegmentFetcher{
-		client:     client,
-		cache:      cache,
-		config:     config,
-		logger:     logger.With().Str("component", "fetcher").Logger(),
-		stats:      stats,
-		semaphore:  make(chan struct{}, maxConns),
-		inFlight:   make(map[int]*fetchPromise),
-		prefetchCh: make(chan int, 256), // Buffer for prefetch hints
-		// A packed atomic bitmap keeps duplicate suppression cheap even for
-		// very large NZBs: 100k segments consume about 12 KiB, versus roughly
-		// 400 KiB for one atomic.Bool per segment.
-		prefetchQueued: make([]atomic.Uint64, (cache.SegmentCount()+63)/64),
-		ctx:            ctx,
-		cancel:         cancel,
+		client:    client,
+		cache:     cache,
+		config:    config,
+		logger:    logger.With().Str("component", "fetcher").Logger(),
+		stats:     stats,
+		semaphore: make(chan struct{}, maxConns),
+		inFlight:  make(map[int]*fetchPromise),
+		prefetch:  newPrefetchScheduler(defaultPrefetchQueueDepth, stats),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	// Start fewer prefetch workers than foreground connection slots. Seeky
@@ -86,6 +81,7 @@ func NewSegmentFetcher(
 	// still running; reserving at least one slot prevents background prefetch
 	// from starving the blocking read that the caller is waiting on.
 	numPrefetchWorkers := maxConns - 1
+	sf.prefetchWorkers = numPrefetchWorkers
 	if numPrefetchWorkers > 0 {
 		for i := range numPrefetchWorkers {
 			sf.prefetchWg.Add(1)
@@ -218,7 +214,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		}
 
 		// Stream the decoded body into the chosen tier.
-		n, err := conn.StreamBody(messageID, writer)
+		n, meta, err := conn.StreamBodyWithMetadata(messageID, writer)
 		if err != nil {
 			writer.Discard()
 			if ctxErr := downloadCtx.Err(); ctxErr != nil {
@@ -229,6 +225,13 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		if ctxErr := downloadCtx.Err(); ctxErr != nil {
 			writer.Discard()
 			return ctxErr
+		}
+		// New imports retain raw article geometry separately from logical
+		// archive offsets. Never publish a CRC-valid but misplaced article.
+		// Legacy maps without provenance keep their existing slice checks.
+		if seg.Source != nil && (meta == nil || meta.PartSize != n || !seg.Source.Matches(meta.Size, meta.Begin, meta.End, meta.Part, meta.Total, n)) {
+			writer.Discard()
+			return &nntp.Error{Type: nntp.ErrorTypeArticleNotFound, Message: "article yEnc geometry does not match expected source"}
 		}
 
 		// Treat zero-byte articles as missing — the article exists on the
@@ -241,8 +244,18 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 			}
 		}
 
-		// Commit (updates cache state to StateOnDisk).
-		writer.Finalize()
+		// Commit only if the complete expected slice reached the cache. Treat a
+		// short article as unavailable on this provider so ExecuteWithFailover
+		// can try the same message ID elsewhere instead of publishing corrupt
+		// bytes as StateOnDisk.
+		if err := writer.Finalize(); err != nil {
+			writer.Discard()
+			return &nntp.Error{
+				Type:    nntp.ErrorTypeArticleNotFound,
+				Message: "article returned incomplete decoded data",
+				Err:     err,
+			}
+		}
 
 		return nil
 	})
@@ -261,61 +274,35 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	return nil
 }
 
-func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {
-	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
-		return false
-	}
-	word := &sf.prefetchQueued[segIdx>>6]
-	mask := uint64(1) << uint(segIdx&63)
-	for {
-		old := word.Load()
-		if old&mask != 0 {
-			return false
-		}
-		if word.CompareAndSwap(old, old|mask) {
-			return true
-		}
-	}
-}
-
-func (sf *SegmentFetcher) clearPrefetchQueued(segIdx int) {
-	if segIdx < 0 || segIdx >= sf.cache.SegmentCount() {
-		return
-	}
-	word := &sf.prefetchQueued[segIdx>>6]
-	mask := uint64(1) << uint(segIdx&63)
-	word.And(^mask)
-}
-
 // QueuePrefetch adds a segment to the background prefetch queue (non-blocking).
 func (sf *SegmentFetcher) QueuePrefetch(segIdx int) {
-	// Check if already cached
-	state := sf.cache.GetState(segIdx)
-	if state == StateOnDisk || state == StateFetching {
-		return
-	}
-	// State remains Empty while a hint is waiting in prefetchCh. Track that
-	// interval separately so frequent small ReadAt calls cannot enqueue the
-	// same read-ahead window hundreds of times and crowd useful hints out.
-	if !sf.markPrefetchQueued(segIdx) {
-		return
-	}
-
-	select {
-	case sf.prefetchCh <- segIdx:
-		// Queued successfully
-	default:
-		sf.clearPrefetchQueued(segIdx)
-		// Queue full, drop the hint
-		sf.stats.PrefetchMisses.Add(1)
-	}
+	sf.QueuePrefetchRange(context.Background(), segIdx, segIdx)
 }
 
-// QueuePrefetchRange queues multiple segments for prefetch.
-func (sf *SegmentFetcher) QueuePrefetchRange(startSeg, endSeg int) {
-	for i := startSeg; i <= endSeg; i++ {
-		sf.QueuePrefetch(i)
+// QueuePrefetchRange queues a consumer's segment range for fair, round-robin
+// prefetch. A canceled consumer loses only its own pending hints; overlapping
+// hints from other consumers stay scheduled.
+func (sf *SegmentFetcher) QueuePrefetchRange(ctx context.Context, startSeg, endSeg int) {
+	if sf.prefetchWorkers < 1 || startSeg > endSeg {
+		return
 	}
+	startSeg = max(startSeg, 0)
+	endSeg = min(endSeg, sf.cache.SegmentCount()-1)
+	if startSeg > endSeg {
+		return
+	}
+	session := prefetchSessionFromContext(ctx)
+	sf.prefetch.addRange(ctx, session, startSeg, endSeg, func(segIdx int) bool {
+		state := sf.cache.GetState(segIdx)
+		return state != StateOnDisk && state != StateFetching
+	})
+}
+
+// CancelPendingPrefetch drops queued work for one consumer after a distant
+// seek. In-flight work is deliberately left alone and can still satisfy an
+// overlapping consumer.
+func (sf *SegmentFetcher) CancelPendingPrefetch(session *prefetchSession) {
+	sf.prefetch.dropPending(session)
 }
 
 // prefetchWorker processes segments from the prefetch queue.
@@ -323,16 +310,12 @@ func (sf *SegmentFetcher) prefetchWorker(id int) {
 	defer sf.prefetchWg.Done()
 
 	for {
-		select {
-		case <-sf.ctx.Done():
+		task, ok := sf.prefetch.nextTask()
+		if !ok {
 			return
-		case segIdx, ok := <-sf.prefetchCh:
-			if !ok {
-				return
-			}
-			sf.prefetchOne(segIdx)
-			sf.clearPrefetchQueued(segIdx)
 		}
+		sf.prefetchOne(task.segment)
+		sf.prefetch.complete(task)
 	}
 }
 
@@ -424,12 +407,14 @@ func (sf *SegmentFetcher) retryBackoff(attempt int) time.Duration {
 
 // Close stops all workers and waits for them to finish.
 //
-// prefetchCh is deliberately never closed: QueuePrefetch can race Close (a
-// ReadAtContext already past the reader's closed check), and a send on a
-// closed channel panics even inside a select. Workers exit via sf.ctx instead,
-// and the channel is garbage-collected with the fetcher.
+// The scheduler is closed before waiting so idle workers wake immediately.
+// QueuePrefetchRange can safely race Close because scheduler admission is
+// guarded by a mutex rather than a channel that could be closed under a send.
 func (sf *SegmentFetcher) Close() {
 	sf.cancel()
+	if sf.prefetch != nil {
+		sf.prefetch.close()
+	}
 	sf.prefetchWg.Wait()
 }
 

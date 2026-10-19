@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,9 +12,9 @@ import (
 
 	json "github.com/bytedance/sonic"
 
+	"github.com/Trifocals3537/tessarr/internal/request"
+	"github.com/Trifocals3537/tessarr/internal/utils"
 	"github.com/rs/zerolog"
-	"github.com/sirrobot01/decypharr/internal/request"
-	"github.com/sirrobot01/decypharr/internal/utils"
 )
 
 type Client struct {
@@ -61,30 +62,32 @@ func (r *Client) Do(ctx context.Context, req Request, res any) error {
 
 	finalURL, err := utils.JoinURL(r.baseURL, req.Command)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid rclone base URL or command")
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, finalURL, bytes.NewBuffer(body))
 
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create rclone request")
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	response, err := r.client.Do(httpReq)
 	if err != nil {
-		return err
+		// net/http errors include the complete request URL, which can contain
+		// embedded RC credentials in legacy configurations.
+		return fmt.Errorf("rclone request failed")
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("rclone error: %s - %s", response.Status, string(respBody))
+		_, _ = utils.ReadAllLimited(response.Body, 64<<10)
+		return fmt.Errorf("rclone error: %s", response.Status)
 	}
 
 	if res != nil {
-		if err := json.ConfigDefault.NewDecoder(response.Body).Decode(res); err != nil && err != io.EOF {
+		if err := utils.DecodeJSONResponse(response.Body, res); err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
 	}

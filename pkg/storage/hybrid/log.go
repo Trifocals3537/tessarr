@@ -3,10 +3,13 @@ package hybrid
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+
+	"github.com/Trifocals3537/tessarr/internal/safepath"
 )
 
 // Log format:
@@ -33,9 +36,13 @@ import (
 //   - Checksum: 4 bytes (CRC32)
 
 const (
-	logMagic      = "HYBR"
-	logVersion    = uint32(3) // v3: added Protocol, Bad, AddedOn
-	logHeaderSize = 16
+	logMagic               = "HYBR"
+	logVersion             = uint32(3) // v3: added Protocol, Bad, AddedOn
+	logHeaderSize          = 16
+	maxLogRecordBytes      = 256 << 20
+	maxLogKeyBytes         = 1 << 20
+	maxUint16EncodedLength = 1<<16 - 1
+	logRecordFixedBytes    = 35
 )
 
 // LogRecord represents a single record in the log
@@ -65,15 +72,68 @@ type appendLog struct {
 
 // openAppendLog opens an existing log or creates a new one
 func openAppendLog(path string) (*appendLog, error) {
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	file, created, err := openAppendLogFile(path, true)
 	if err != nil {
 		return nil, err
 	}
+	return initializeAppendLog(file, path, created)
+}
 
+// openExistingAppendLog opens an existing regular append log without creating
+// it. Compaction recovery uses this so inspecting a missing artifact can never
+// manufacture an empty database and accidentally make it authoritative.
+func openExistingAppendLog(path string) (*appendLog, error) {
+	file, _, err := openAppendLogFile(path, false)
+	if err != nil {
+		return nil, err
+	}
 	info, err := file.Stat()
 	if err != nil {
-		file.Close()
+		return nil, errors.Join(err, file.Close())
+	}
+	if info.Size() == 0 {
+		return nil, errors.Join(
+			fmt.Errorf("existing append log is empty: %s", path),
+			file.Close(),
+		)
+	}
+	return initializeAppendLog(file, path, false)
+}
+
+// createAppendLogExclusive creates a fresh regular append log and refuses to
+// follow or replace an existing path. In particular, a stale .compact symlink
+// cannot redirect compaction writes into an unrelated file.
+func createAppendLogExclusive(path string) (*appendLog, error) {
+	file, _, err := safepath.OpenRegularFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
 		return nil, err
+	}
+	info, statErr := file.Stat()
+	if statErr != nil || !info.Mode().IsRegular() {
+		closeErr := file.Close()
+		removeErr := safepath.RemoveRegularFile(path)
+		return nil, errors.Join(
+			statErr,
+			closeErr,
+			removeErr,
+			fmt.Errorf("append log path is not a regular file: %s", path),
+		)
+	}
+	return initializeAppendLog(file, path, true)
+}
+
+func openAppendLogFile(path string, create bool) (*os.File, bool, error) {
+	flag := os.O_RDWR
+	if create {
+		flag |= os.O_CREATE
+	}
+	return safepath.OpenRegularFile(path, flag, 0644)
+}
+
+func initializeAppendLog(file *os.File, path string, created bool) (*appendLog, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errors.Join(err, file.Close())
 	}
 
 	log := &appendLog{
@@ -85,42 +145,22 @@ func openAppendLog(path string) (*appendLog, error) {
 	if info.Size() == 0 {
 		// New file - write header
 		if err := log.writeHeader(); err != nil {
-			file.Close()
-			return nil, err
+			closeErr := file.Close()
+			if created {
+				return nil, errors.Join(err, closeErr, safepath.RemoveRegularFile(path))
+			}
+			return nil, errors.Join(err, closeErr)
 		}
 		log.writePos = logHeaderSize
 	} else {
 		// Existing file - validate header and find write position
 		version, err := log.validateHeader()
 		if err != nil {
-			file.Close()
-			return nil, err
+			return nil, errors.Join(err, file.Close())
 		}
 		log.version = version
 		log.writePos = info.Size()
 	}
-
-	return log, nil
-}
-
-// createAppendLog creates a new log file (always fresh)
-func createAppendLog(path string) (*appendLog, error) {
-	file, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-
-	log := &appendLog{
-		file:    file,
-		path:    path,
-		version: logVersion,
-	}
-
-	if err := log.writeHeader(); err != nil {
-		file.Close()
-		return nil, err
-	}
-	log.writePos = logHeaderSize
 
 	return log, nil
 }
@@ -165,17 +205,21 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, category, pro
 	nameBytes := []byte(name)
 	protocolBytes := []byte(protocol)
 
-	// Calculate total record size
-	recordSize := 4 + len(keyBytes) + // keyLen + key
-		4 + len(value) + // valueLen + value
-		1 + // flags (bit 0 = deleted, bit 1 = bad)
-		2 + len(catBytes) + // categoryLen + category
-		2 + len(provBytes) + // providerLen + provider
-		2 + len(statusBytes) + // statusLen + status
-		2 + len(nameBytes) + // nameLen + name
-		8 + // totalSize
-		2 + len(protocolBytes) + // protocolLen + protocol
-		8 // addedOn
+	recordSize, err := encodedLogRecordSize(
+		len(keyBytes),
+		len(value),
+		len(catBytes),
+		len(provBytes),
+		len(statusBytes),
+		len(nameBytes),
+		len(protocolBytes),
+	)
+	if err != nil {
+		return 0, 0, err
+	}
+	if recordSize < logRecordFixedBytes || recordSize > maxLogRecordBytes {
+		return 0, 0, fmt.Errorf("invalid append log record size %d", recordSize)
+	}
 
 	buf := make([]byte, recordSize)
 	pos := 0
@@ -252,8 +296,41 @@ func (l *appendLog) Append(key string, value []byte, deleted bool, category, pro
 	return valueOffset, int32(len(value)), nil
 }
 
+func encodedLogRecordSize(key, value, category, provider, status, name, protocol int) (int, error) {
+	if key < 0 || key > maxLogKeyBytes {
+		return 0, fmt.Errorf("append log key exceeds %d bytes", maxLogKeyBytes)
+	}
+
+	for _, field := range []struct {
+		name   string
+		length int
+	}{
+		{name: "category", length: category},
+		{name: "provider", length: provider},
+		{name: "status", length: status},
+		{name: "name", length: name},
+		{name: "protocol", length: protocol},
+	} {
+		if field.length < 0 || field.length > maxUint16EncodedLength {
+			return 0, fmt.Errorf("append log %s exceeds %d bytes", field.name, maxUint16EncodedLength)
+		}
+	}
+
+	recordSize := logRecordFixedBytes
+	for _, length := range []int{key, value, category, provider, status, name, protocol} {
+		if length < 0 || length > maxLogRecordBytes-recordSize {
+			return 0, fmt.Errorf("append log record exceeds %d bytes", maxLogRecordBytes)
+		}
+		recordSize += length
+	}
+	return recordSize, nil
+}
+
 // ReadAt reads value data at the given offset into a freshly allocated buffer.
 func (l *appendLog) ReadAt(offset int64, size int32) ([]byte, error) {
+	if size < 0 || size > maxLogRecordBytes {
+		return nil, fmt.Errorf("invalid append log read size %d", size)
+	}
 	buf := make([]byte, size)
 	_, err := l.file.ReadAt(buf, offset)
 	if err != nil {
@@ -267,6 +344,9 @@ func (l *appendLog) ReadAt(offset int64, size int32) ([]byte, error) {
 // valid only until buf is next reused — callers that retain the bytes must
 // copy them. Used by scan paths to avoid an allocation per record.
 func (l *appendLog) ReadAtInto(offset int64, size int32, buf []byte) ([]byte, error) {
+	if size < 0 || size > maxLogRecordBytes {
+		return nil, fmt.Errorf("invalid append log read size %d", size)
+	}
 	if cap(buf) < int(size) {
 		buf = make([]byte, size)
 	} else {
@@ -294,8 +374,8 @@ func (l *appendLog) Iterate(fn func(*LogRecord) error) error {
 
 	pos := int64(logHeaderSize)
 	fileSize := l.writePos
-	var fixed [8]byte    // scratch for fixed-width fields
-	var sbuf []byte      // reused scratch for length-prefixed strings
+	var fixed [8]byte // scratch for fixed-width fields
+	var sbuf []byte   // reused scratch for length-prefixed strings
 
 	for pos < fileSize {
 		record, nextPos, err := readRecordFrom(r, pos, l.version, fixed[:], &sbuf)
@@ -311,6 +391,39 @@ func (l *appendLog) Iterate(fn func(*LogRecord) error) error {
 		pos = nextPos
 	}
 
+	return nil
+}
+
+// ValidateComplete verifies that every byte after the header belongs to a
+// complete record. Iterate intentionally tolerates a torn final append for
+// normal crash recovery; compaction artifacts must be stricter because startup
+// may promote one to the canonical database.
+func (l *appendLog) ValidateComplete() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if _, err := l.file.Seek(logHeaderSize, io.SeekStart); err != nil {
+		return err
+	}
+	r := bufio.NewReaderSize(l.file, 1<<20)
+
+	pos := int64(logHeaderSize)
+	fileSize := l.writePos
+	var fixed [8]byte
+	var sbuf []byte
+	for pos < fileSize {
+		_, nextPos, err := readRecordFrom(r, pos, l.version, fixed[:], &sbuf)
+		if err != nil {
+			return fmt.Errorf("incomplete record at offset %d: %w", pos, err)
+		}
+		if nextPos <= pos || nextPos > fileSize {
+			return fmt.Errorf("invalid record boundary %d after offset %d (file size %d)", nextPos, pos, fileSize)
+		}
+		pos = nextPos
+	}
+	if pos != fileSize {
+		return fmt.Errorf("append log ended at %d, expected %d", pos, fileSize)
+	}
 	return nil
 }
 
@@ -363,7 +476,7 @@ func readRecordFrom(r *bufio.Reader, startPos int64, version uint32, fixed []byt
 	if err != nil {
 		return nil, 0, err
 	}
-	if keyLen > 1024*1024 { // 1MB sanity check
+	if keyLen > maxLogKeyBytes {
 		return nil, 0, fmt.Errorf("invalid key length: %d", keyLen)
 	}
 	key, err := readStr(int(keyLen))

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	debridTypes "github.com/sirrobot01/decypharr/pkg/debrid/types"
-	"github.com/sirrobot01/decypharr/pkg/storage"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
 )
 
 // Multi-season detection patterns
@@ -73,6 +73,7 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 		for _, file := range seasonInfo.Files {
 			seasonFiles[file.Name] = &storage.File{
 				Name:      file.Name,
+				Path:      file.Path,
 				Size:      file.Size,
 				ByteRange: file.ByteRange,
 				Deleted:   file.Deleted,
@@ -104,6 +105,9 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 		}
 
 		// Copy placement
+		if torrent.IsTorrent() && torrent.OutputName != "" {
+			seasonTorrent.OutputName = storage.NewTorrentOutputName(seasonTorrent.Name, seasonTorrent.InfoHash)
+		}
 		maps.Copy(seasonTorrent.Providers, torrent.Providers)
 		seasonResults = append(seasonResults, seasonTorrent)
 	}

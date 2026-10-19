@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - beta
+      - next
+  schedule:
+    - cron: "23 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cgo: "1"
+          - os: windows-latest
+            cgo: "0"
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: ${{ matrix.cgo }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install Linux FUSE headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+  native:
+    name: Native Linux build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install Linux FUSE headers
+        run: sudo apt-get update && sudo apt-get install -y libfuse-dev
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Verify Tessarr brand boundary
+        run: bash scripts/check-brand.sh
+
+      - name: Verify CI dependency pins
+        run: bash scripts/check-ci-pins.sh
+
+      - name: Install pinned security analyzers
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Static analysis
+        run: staticcheck ./...
+
+      - name: Vulnerability analysis
+        run: govulncheck ./...
+
+      - name: Race-test all packages
+        run: go test -race ./...
+
+      - name: Build native binary
+        run: |
+          mkdir -p dist
+          go build -trimpath -o dist/tessarr .
+
+      - name: Smoke-test command line
+        run: ./dist/tessarr --help
+
+  seedbox:
+    name: Shared seedbox release candidate
+    runs-on: ubuntu-24.04
+    env:
+      CGO_ENABLED: "1"
+      GOOS: linux
+      GOARCH: amd64
+      CC: zig cc -target x86_64-linux-gnu.2.17
+      CXX: zig c++ -target x86_64-linux-gnu.2.17
+      LDFLAGS_PKG: github.com/Trifocals3537/tessarr/pkg/version
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install Zig
+        run: bash scripts/install-zig.sh 0.14.1
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y binutils file libfuse-dev
+
+      - name: Build x86_64 release candidate
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="ci-${GITHUB_SHA::12}"
+          go build -trimpath \
+            -ldflags="-s -w -X ${LDFLAGS_PKG}.Version=${version} -X ${LDFLAGS_PKG}.Channel=ci" \
+            -o dist/tessarr
+
+      - name: Verify architecture and glibc baseline
+        run: |
+          set -euo pipefail
+          file dist/tessarr
+          file dist/tessarr | grep -F "x86-64"
+
+          max_glibc="$(
+            readelf --version-info dist/tessarr |
+              grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' |
+              sort -Vu |
+              tail -n 1 || true
+          )"
+
+          if [[ -z "${max_glibc}" ]]; then
+            echo "No glibc version requirements were found" >&2
+            exit 1
+          fi
+          if [[ "$(printf '%s\n' "${max_glibc}" "GLIBC_2.17" | sort -V | tail -n 1)" != "GLIBC_2.17" ]]; then
+            echo "Binary requires ${max_glibc}, newer than the GLIBC_2.17 baseline" >&2
+            exit 1
+          fi
+          echo "Maximum glibc requirement: ${max_glibc}"
+
+      - name: Smoke-test on Ubuntu 20.04
+        run: |
+          docker run --rm \
+            --volume "${PWD}/dist:/work:ro" \
+            ubuntu:20.04 \
+            bash -euc '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates libfuse2
+              /work/tessarr --help
+              install -d -m 0700 /tmp/tessarr-config
+              printf "%s\n" \
+                "{\"debrids\":[{\"name\":\"realdebrid\",\"api_key\":\"test-key\"}],\"download_folder\":\"/tmp/download\"}" \
+                > /tmp/tessarr-config/config.json
+              chmod 0644 /tmp/tessarr-config/config.json
+              /work/tessarr --config /tmp/tessarr-config --check-config
+              test "$(stat -c %a /tmp/tessarr-config/config.json)" = 644
+            '
+
+      - name: Package candidate
+        run: |
+          set -euo pipefail
+          install -m 0644 packaging/systemd/tessarr.service dist/tessarr.service
+          install -m 0644 LICENSE dist/LICENSE
+          tar czf dist/tessarr_seedbox_Linux_x86_64.tar.gz \
+            -C dist tessarr tessarr.service LICENSE
+
+      - name: Upload candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: seedbox-linux-amd64-candidate
+          path: dist/tessarr_seedbox_Linux_x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  frontend:
+    name: Browser assets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Audit build dependencies
+        run: npm audit --audit-level=high
+
+      - name: Test browser behavior
+        run: npm test
+
+      - name: Build assets
+        run: npm run build
+
+      - name: Verify generated assets are current
+        run: git diff --exit-code -- pkg/server/assets/build

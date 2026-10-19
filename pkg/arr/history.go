@@ -1,14 +1,17 @@
 package arr
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	gourl "net/url"
 	"strconv"
 	"strings"
 
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
 )
 
 type QueueAction string
@@ -137,6 +140,11 @@ func (a *Arr) GetHistory(downloadId, eventType string) *HistorySchema {
 }
 
 func (a *Arr) GetQueue() []QueueSchema {
+	queue, _ := a.GetQueueCtx(context.Background())
+	return queue
+}
+
+func (a *Arr) GetQueueCtx(ctx context.Context) ([]QueueSchema, error) {
 	query := gourl.Values{}
 	query.Add("page", "1")
 	query.Add("pageSize", "200")
@@ -145,12 +153,12 @@ func (a *Arr) GetQueue() []QueueSchema {
 	for {
 		url := "api/v3/queue" + "?" + query.Encode()
 		var data QueueResponseScheme
-		resp, err := a.Request(http.MethodGet, url, nil, &data)
+		resp, err := a.RequestCtx(ctx, http.MethodGet, url, nil, &data)
 		if err != nil {
-			break
+			return results, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			break
+			return results, fmt.Errorf("get queue: %s", resp.Status)
 		}
 
 		results = append(results, data.Records...)
@@ -162,7 +170,137 @@ func (a *Arr) GetQueue() []QueueSchema {
 		query.Set("page", strconv.Itoa(data.Page+1))
 	}
 
-	return results
+	return results, nil
+}
+
+// BlocklistAndResearchDownloadCtx removes the exact tracked torrent from this
+// Arr, blocklists its release, and allows the Arr to search for a replacement.
+// A download ID must resolve to exactly one queue row. This legacy method does
+// not prove download-client ownership; automated uncached handoff uses the
+// endpoint-checked variant below.
+func (a *Arr) BlocklistAndResearchDownloadCtx(ctx context.Context, downloadID string) (bool, error) {
+	return a.blocklistAndResearchDownloadCtx(ctx, downloadID, "", nil)
+}
+
+// BlocklistAndResearchDownloadForEndpointCtx additionally requires the queue
+// item to belong to the qBittorrent client that submitted the download. The
+// endpoint is the Host authority seen on the authenticated add request.
+func (a *Arr) BlocklistAndResearchDownloadForEndpointCtx(ctx context.Context, downloadID, endpoint string) (bool, error) {
+	return a.BlocklistAndResearchDownloadForEndpointBeforeDeleteCtx(ctx, downloadID, endpoint, nil)
+}
+
+// BlocklistAndResearchDownloadForEndpointBeforeDeleteCtx runs beforeDelete only
+// after unique client and queue ownership validation, before Arr can synchronously
+// call back into the download client. A persistence failure prevents Arr DELETE.
+func (a *Arr) BlocklistAndResearchDownloadForEndpointBeforeDeleteCtx(ctx context.Context, downloadID, endpoint string, beforeDelete func() error) (bool, error) {
+	if strings.TrimSpace(endpoint) == "" {
+		return false, fmt.Errorf("submitting qBittorrent endpoint is required")
+	}
+	clientName, err := a.downloadClientForEndpointCtx(ctx, endpoint)
+	if err != nil {
+		return false, err
+	}
+	return a.blocklistAndResearchDownloadCtx(ctx, downloadID, clientName, beforeDelete)
+}
+
+type arrDownloadClient struct {
+	Name           string `json:"name"`
+	Implementation string `json:"implementation"`
+	Fields         []struct {
+		Name  string          `json:"name"`
+		Value json.RawMessage `json:"value"`
+	} `json:"fields"`
+}
+
+func (a *Arr) downloadClientForEndpointCtx(ctx context.Context, endpoint string) (string, error) {
+	parsed, err := gourl.Parse("http://" + endpoint)
+	if err != nil || parsed.Hostname() == "" || parsed.Port() == "" || parsed.User != nil || parsed.Path != "" {
+		return "", fmt.Errorf("invalid submitting qBittorrent endpoint")
+	}
+	var clients []arrDownloadClient
+	resp, err := a.RequestCtx(ctx, http.MethodGet, "api/v3/downloadclient", nil, &clients)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get Arr download clients: %s", resp.Status)
+	}
+	var matched string
+	for _, client := range clients {
+		if !strings.EqualFold(client.Implementation, "QBittorrent") {
+			continue
+		}
+		var host, port string
+		for _, field := range client.Fields {
+			var value string
+			if err := json.Unmarshal(field.Value, &value); err != nil {
+				value = strings.TrimSpace(string(field.Value))
+			}
+			switch strings.ToLower(field.Name) {
+			case "host":
+				host = value
+			case "port":
+				port = value
+			}
+		}
+		if !strings.EqualFold(host, parsed.Hostname()) || port != parsed.Port() {
+			continue
+		}
+		if matched != "" || strings.TrimSpace(client.Name) == "" {
+			return "", fmt.Errorf("ambiguous Arr qBittorrent endpoint ownership")
+		}
+		matched = client.Name
+	}
+	if matched == "" {
+		return "", fmt.Errorf("submitting qBittorrent endpoint is not configured in Arr")
+	}
+	return matched, nil
+}
+
+func (a *Arr) blocklistAndResearchDownloadCtx(ctx context.Context, downloadID, clientName string, beforeDelete func() error) (bool, error) {
+	downloadID = strings.TrimSpace(downloadID)
+	if downloadID == "" {
+		return false, fmt.Errorf("download ID is required")
+	}
+	queue, err := a.GetQueueCtx(ctx)
+	if err != nil {
+		return false, err
+	}
+	matched := make(map[int]bool)
+	for _, item := range queue {
+		if item.Id <= 0 || !strings.EqualFold(strings.TrimSpace(item.Protocol), "torrent") {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(item.DownloadId), downloadID) {
+			matched[item.Id] = true
+		}
+	}
+	if len(matched) == 0 {
+		return false, nil
+	}
+	if len(matched) != 1 {
+		return false, fmt.Errorf(
+			"download ID %s matched %d Arr queue items; refusing ambiguous removal",
+			downloadID,
+			len(matched),
+		)
+	}
+	if clientName != "" {
+		for _, item := range queue {
+			if matched[item.Id] && !strings.EqualFold(strings.TrimSpace(item.DownloadClient), clientName) {
+				return false, fmt.Errorf("Arr queue item is not owned by the submitting qBittorrent client")
+			}
+		}
+	}
+	if beforeDelete != nil {
+		if err := beforeDelete(); err != nil {
+			return false, err
+		}
+	}
+	if err := a.removeQueueItemsCtx(ctx, matched, true, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // queueItemText returns the lowercased join of every statusMessages title and
@@ -206,13 +344,21 @@ func resolveAction(q QueueSchema, rules []config.QueueCleanupRule) QueueAction {
 }
 
 func (a *Arr) CleanupQueue() error {
+	return a.CleanupQueueCtx(context.Background())
+}
+
+func (a *Arr) CleanupQueueCtx(ctx context.Context) error {
 	if a == nil {
 		return fmt.Errorf("arr not configured")
 	}
 	l := logger.New("arr")
 	rules := config.Get().QueueCleanup.Rules
 
-	queue := a.GetQueue()
+	queue, err := a.GetQueueCtx(ctx)
+	if err != nil {
+		return err
+	}
+	var cleanupErr error
 	blacklists := make(map[int]bool)        // blocklist + remove, no re-search
 	blacklistResearch := make(map[int]bool) // blocklist + remove + re-search
 	manualImports := make(map[string]bool)  // force manual import
@@ -228,30 +374,35 @@ func (a *Arr) CleanupQueue() error {
 	}
 
 	if len(blacklistResearch) > 0 {
-		if err := a.removeQueueItems(blacklistResearch, true, false); err != nil {
+		if err := a.removeQueueItemsCtx(ctx, blacklistResearch, true, false); err != nil {
 			l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: blacklist + research failed")
+			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
 	if len(blacklists) > 0 {
-		if err := a.removeQueueItems(blacklists, true, true); err != nil {
+		if err := a.removeQueueItemsCtx(ctx, blacklists, true, true); err != nil {
 			l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: blacklist failed")
+			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
 	if len(manualImports) > 0 {
-		go func() {
-			if err := a.ManualImportItems(manualImports); err != nil {
-				l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: manual import failed")
-			}
-		}()
+		if err := a.ManualImportItemsCtx(ctx, manualImports); err != nil {
+			l.Error().Err(err).Str("arr", a.Name).Msg("queue cleanup: manual import failed")
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
 	}
 
-	return nil
+	return cleanupErr
 }
 
 // FindGrabHistoryID returns the ID and downloadId of the most recent "grabbed"
 // history record for the given episode (Sonarr) or movie (Radarr). Returns
 // (0, "", nil) when no grab record is found (e.g. history trimmed, manual import).
 func (a *Arr) FindGrabHistoryID(mediaDBID int) (int, string, error) {
+	return a.FindGrabHistoryIDCtx(context.Background(), mediaDBID)
+}
+
+func (a *Arr) FindGrabHistoryIDCtx(ctx context.Context, mediaDBID int) (int, string, error) {
 	if a == nil {
 		return 0, "", fmt.Errorf("arr not configured")
 	}
@@ -277,7 +428,7 @@ func (a *Arr) FindGrabHistoryID(mediaDBID int) (int, string, error) {
 
 	var data HistorySchema
 	url := "api/v3/history?" + query.Encode()
-	resp, err := a.Request(http.MethodGet, url, nil, &data)
+	resp, err := a.RequestCtx(ctx, http.MethodGet, url, nil, &data)
 	if err != nil {
 		return 0, "", err
 	}
@@ -295,6 +446,10 @@ func (a *Arr) FindGrabHistoryID(mediaDBID int) (int, string, error) {
 // the release in the arr and, if redownload is enabled, triggers a re-search
 // for whatever is currently missing from that grab's scope.
 func (a *Arr) MarkHistoryFailed(historyID int) error {
+	return a.MarkHistoryFailedCtx(context.Background(), historyID)
+}
+
+func (a *Arr) MarkHistoryFailedCtx(ctx context.Context, historyID int) error {
 	if a == nil {
 		return fmt.Errorf("arr not configured")
 	}
@@ -302,10 +457,11 @@ func (a *Arr) MarkHistoryFailed(historyID int) error {
 		return nil
 	}
 	url := fmt.Sprintf("api/v3/history/failed/%d", historyID)
-	resp, err := a.Request(http.MethodPost, url, nil, nil)
+	resp, err := a.RequestCtx(ctx, http.MethodPost, url, nil, nil)
 	if err != nil {
 		return err
 	}
+	defer closeArrResponse(resp)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("history/failed %d: %s", historyID, resp.Status)
 	}
@@ -315,7 +471,7 @@ func (a *Arr) MarkHistoryFailed(historyID int) error {
 // removeQueueItems bulk-removes queue items from the arr. blocklist controls
 // whether the releases are added to the blocklist; skipRedownload controls
 // whether a re-search is triggered (false = re-search, the "research" action).
-func (a *Arr) removeQueueItems(items map[int]bool, blocklist, skipRedownload bool) error {
+func (a *Arr) removeQueueItemsCtx(ctx context.Context, items map[int]bool, blocklist, skipRedownload bool) error {
 	queueIDs := make([]int, 0, len(items))
 	for id := range items {
 		queueIDs = append(queueIDs, id)
@@ -332,20 +488,32 @@ func (a *Arr) removeQueueItems(items map[int]bool, blocklist, skipRedownload boo
 	query.Add("changeCategory", "false")
 	url := "api/v3/queue/bulk" + "?" + query.Encode()
 
-	_, err := a.Request(http.MethodDelete, url, payload, nil)
+	resp, err := a.RequestCtx(ctx, http.MethodDelete, url, payload, nil)
 	if err != nil {
 		return err
+	}
+	defer closeArrResponse(resp)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("remove queue items: %s", resp.Status)
 	}
 	return nil
 }
 
 func (a *Arr) ManualImportItems(items map[string]bool) error {
+	return a.ManualImportItemsCtx(context.Background(), items)
+}
+
+func (a *Arr) ManualImportItemsCtx(ctx context.Context, items map[string]bool) error {
+	var importErr error
 	for downloadId := range items {
-		_, err := a.Import(downloadId)
+		body, err := a.ImportCtx(ctx, downloadId)
 		if err != nil {
-			// log error
-			fmt.Println(err)
+			importErr = errors.Join(importErr, err)
+			continue
+		}
+		if body != nil {
+			_ = body.Close()
 		}
 	}
-	return nil
+	return importErr
 }

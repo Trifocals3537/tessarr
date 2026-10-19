@@ -1,25 +1,28 @@
 package server
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 
 	json "github.com/bytedance/sonic"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/pkg/arr"
+	"github.com/Trifocals3537/tessarr/pkg/manager"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/Trifocals3537/tessarr/pkg/version"
 	"github.com/go-chi/chi/v5"
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"github.com/sirrobot01/decypharr/pkg/arr"
-	"github.com/sirrobot01/decypharr/pkg/manager"
-	"github.com/sirrobot01/decypharr/pkg/storage"
-	"github.com/sirrobot01/decypharr/pkg/version"
 	"github.com/sourcegraph/conc/iter"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type mountCacheCleaner interface {
@@ -36,8 +39,43 @@ func (s *Server) handleGetArrs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := utils.ParseMultipartFormBounded(
+		w,
+		r,
+		utils.MaxImportRequestBytes,
+		utils.MaxMultipartMemoryBytes,
+	); err != nil {
+		if utils.IsRequestTooLarge(err) {
+			http.Error(w, "Import request is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Invalid multipart import request", http.StatusBadRequest)
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	if utils.MultipartFormPartCount(r.MultipartForm) > utils.MaxMultipartFormParts {
+		http.Error(
+			w,
+			fmt.Sprintf("Import request exceeds the %d-part limit", utils.MaxMultipartFormParts),
+			http.StatusRequestEntityTooLarge,
+		)
+		return
+	}
+
+	itemCount := countImportLines(r.FormValue("urls")) +
+		countImportLines(r.FormValue("nzbURLs"))
+	if r.MultipartForm != nil {
+		itemCount += len(r.MultipartForm.File["files"])
+		itemCount += len(r.MultipartForm.File["nzbFiles"])
+	}
+	if itemCount > utils.MaxImportItems {
+		http.Error(
+			w,
+			fmt.Sprintf("Import request exceeds the %d-item limit", utils.MaxImportItems),
+			http.StatusRequestEntityTooLarge,
+		)
 		return
 	}
 
@@ -76,24 +114,99 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 		magnet     *utils.Magnet
 		nzbContent []byte
 		name       string
-		source     string // for error messages
+		source     string // redacted source for logs
+		errMessage string
 	}
 
-	var tasks []addTask
+	tasks := make([]addTask, 0, itemCount)
+	var retainedBytes int64
+	remainingBytes := func() int64 {
+		return utils.MaxImportRequestBytes - retainedBytes
+	}
+	reserveBytes := func(size int64) error {
+		if size < 0 || size > remainingBytes() {
+			retainedBytes = utils.MaxImportRequestBytes
+			return fmt.Errorf(
+				"%w: aggregate maximum is %d bytes",
+				utils.ErrContentTooLarge,
+				utils.MaxImportRequestBytes,
+			)
+		}
+		retainedBytes += size
+		return nil
+	}
+	addErrorTask := func(message string) {
+		tasks = append(tasks, addTask{taskType: "error", errMessage: message})
+	}
 
 	// Collect torrent URLs
 	if urls := r.FormValue("urls"); urls != "" {
 		for u := range strings.SplitSeq(urls, "\n") {
 			if trimmed := strings.TrimSpace(u); trimmed != "" {
-				magnet, err := utils.GetMagnetFromUrl(trimmed, rmTrackerUrls)
-				if err != nil {
-					tasks = append(tasks, addTask{
-						taskType: "error",
-						source:   fmt.Sprintf("Failed to parse URL %s: %v", trimmed, err),
-					})
+				safeURL := utils.RedactedURL(trimmed)
+				maxBytes := min(utils.MaxMetadataFileBytes, remainingBytes())
+				if maxBytes <= 0 {
+					addErrorTask("Import metadata exceeds the aggregate byte limit")
 					continue
 				}
-				tasks = append(tasks, addTask{taskType: "torrent", magnet: magnet, source: fmt.Sprintf("URL %s", trimmed)})
+
+				var magnet *utils.Magnet
+				var err error
+				lowerURL := strings.ToLower(trimmed)
+				if strings.HasPrefix(lowerURL, "http://") ||
+					strings.HasPrefix(lowerURL, "https://") {
+					_, torrentData, downloadErr := utils.DownloadFileBounded(
+						ctx,
+						trimmed,
+						maxBytes,
+					)
+					downloaded := int64(len(torrentData))
+					if downloaded == 0 && errors.Is(downloadErr, utils.ErrContentTooLarge) {
+						// A declared Content-Length can be rejected before reading
+						// the body. Pessimistically charge this URL its full
+						// allowance so repeated oversized responses cannot bypass
+						// the aggregate download budget.
+						downloaded = maxBytes
+					}
+					if reserveErr := reserveBytes(downloaded); reserveErr != nil {
+						addErrorTask("Import metadata exceeds the aggregate byte limit")
+						continue
+					}
+					if downloadErr != nil {
+						addErrorTask(fmt.Sprintf(
+							"Failed to fetch torrent URL %s: %v",
+							safeURL,
+							downloadErr,
+						))
+						continue
+					}
+					magnet, err = utils.GetMagnetFromBytes(torrentData, rmTrackerUrls)
+				} else {
+					magnet, err = utils.GetMagnetFromURLContext(
+						ctx,
+						trimmed,
+						rmTrackerUrls,
+						maxBytes,
+					)
+				}
+				if err != nil {
+					addErrorTask(fmt.Sprintf("Failed to parse torrent URL %s: %v", safeURL, err))
+					continue
+				}
+				retained := magnetRetainedBytes(magnet)
+				if magnet.File != nil {
+					// HTTP torrent bytes were already charged above.
+					retained -= int64(len(magnet.File))
+				}
+				if err := reserveBytes(retained); err != nil {
+					addErrorTask("Import metadata exceeds the aggregate byte limit")
+					continue
+				}
+				tasks = append(tasks, addTask{
+					taskType: "torrent",
+					magnet:   magnet,
+					source:   "torrent URL " + safeURL,
+				})
 			}
 		}
 	}
@@ -101,24 +214,49 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	// Collect torrent files
 	if files := r.MultipartForm.File["files"]; len(files) > 0 {
 		for _, fileHeader := range files {
-			file, err := fileHeader.Open()
-			if err != nil {
-				tasks = append(tasks, addTask{
-					taskType: "error",
-					source:   fmt.Sprintf("Failed to open file %s: %v", fileHeader.Filename, err),
-				})
+			maxBytes := min(utils.MaxMetadataFileBytes, remainingBytes())
+			if fileHeader.Size > maxBytes || maxBytes <= 0 {
+				addErrorTask(fmt.Sprintf(
+					"Torrent file %s exceeds the import byte limit",
+					fileHeader.Filename,
+				))
 				continue
 			}
 
-			magnet, err := utils.GetMagnetFromFile(file, fileHeader.Filename, rmTrackerUrls)
+			file, err := fileHeader.Open()
 			if err != nil {
-				tasks = append(tasks, addTask{
-					taskType: "error",
-					source:   fmt.Sprintf("Failed to parse torrent file %s: %v", fileHeader.Filename, err),
-				})
+				addErrorTask(fmt.Sprintf("Failed to open torrent file %s", fileHeader.Filename))
 				continue
 			}
-			tasks = append(tasks, addTask{taskType: "torrent", magnet: magnet, source: fmt.Sprintf("File %s", fileHeader.Filename), name: fileHeader.Filename})
+
+			magnet, parseErr := utils.GetMagnetFromFileBounded(
+				file,
+				fileHeader.Filename,
+				rmTrackerUrls,
+				maxBytes,
+			)
+			closeErr := file.Close()
+			if parseErr == nil && closeErr != nil {
+				parseErr = closeErr
+			}
+			if parseErr != nil {
+				addErrorTask(fmt.Sprintf(
+					"Failed to parse torrent file %s: %v",
+					fileHeader.Filename,
+					parseErr,
+				))
+				continue
+			}
+			if err := reserveBytes(magnetRetainedBytes(magnet)); err != nil {
+				addErrorTask("Import metadata exceeds the aggregate byte limit")
+				continue
+			}
+			tasks = append(tasks, addTask{
+				taskType: "torrent",
+				magnet:   magnet,
+				source:   "torrent file " + fileHeader.Filename,
+				name:     fileHeader.Filename,
+			})
 		}
 	}
 
@@ -126,15 +264,36 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	if nzbURLs := r.FormValue("nzbURLs"); nzbURLs != "" {
 		for u := range strings.SplitSeq(nzbURLs, "\n") {
 			if trimmed := strings.TrimSpace(u); trimmed != "" {
-				filename, content, err := utils.DownloadFile(trimmed, utils.WithHeader("User-Agent", s.nzbUserAgent))
-				if err != nil {
-					tasks = append(tasks, addTask{
-						taskType: "error",
-						source:   fmt.Sprintf("Failed to fetch NZB from URL %s: %v", trimmed, err),
-					})
+				safeURL := utils.RedactedURL(trimmed)
+				maxBytes := min(utils.MaxMetadataFileBytes, remainingBytes())
+				if maxBytes <= 0 {
+					addErrorTask("Import metadata exceeds the aggregate byte limit")
 					continue
 				}
-				tasks = append(tasks, addTask{taskType: "nzb", nzbContent: content, name: filename, source: fmt.Sprintf("NZB URL %s", trimmed)})
+				filename, content, err := utils.DownloadFileBounded(
+					ctx,
+					trimmed,
+					maxBytes,
+					utils.WithHeader("User-Agent", s.nzbUserAgent),
+				)
+				downloaded := int64(len(content))
+				if downloaded == 0 && errors.Is(err, utils.ErrContentTooLarge) {
+					downloaded = maxBytes
+				}
+				if reserveErr := reserveBytes(downloaded); reserveErr != nil {
+					addErrorTask("Import metadata exceeds the aggregate byte limit")
+					continue
+				}
+				if err != nil {
+					addErrorTask(fmt.Sprintf("Failed to fetch NZB from URL %s: %v", safeURL, err))
+					continue
+				}
+				tasks = append(tasks, addTask{
+					taskType:   "nzb",
+					nzbContent: content,
+					name:       filename,
+					source:     "NZB URL " + safeURL,
+				})
 			}
 		}
 	}
@@ -142,16 +301,39 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	// Collect NZB files
 	if nzbFiles := r.MultipartForm.File["nzbFiles"]; len(nzbFiles) > 0 {
 		for _, fileHeader := range nzbFiles {
-			content, err := getNZBContentFromFile(fileHeader)
-			if err != nil {
-				tasks = append(tasks, addTask{
-					taskType: "error",
-					source:   fmt.Sprintf("Failed to read NZB file %s: %v", fileHeader.Filename, err),
-				})
+			maxBytes := min(utils.MaxMetadataFileBytes, remainingBytes())
+			if fileHeader.Size > maxBytes || maxBytes <= 0 {
+				addErrorTask(fmt.Sprintf(
+					"NZB file %s exceeds the import byte limit",
+					fileHeader.Filename,
+				))
 				continue
 			}
-			tasks = append(tasks, addTask{taskType: "nzb", nzbContent: content, source: fmt.Sprintf("NZB File %s", fileHeader.Filename), name: fileHeader.Filename})
+			content, err := getNZBContentFromFile(fileHeader, maxBytes)
+			if err != nil {
+				addErrorTask(fmt.Sprintf(
+					"Failed to read NZB file %s: %v",
+					fileHeader.Filename,
+					err,
+				))
+				continue
+			}
+			if err := reserveBytes(int64(len(content))); err != nil {
+				addErrorTask("Import metadata exceeds the aggregate byte limit")
+				continue
+			}
+			tasks = append(tasks, addTask{
+				taskType:   "nzb",
+				nzbContent: content,
+				source:     "NZB file " + fileHeader.Filename,
+				name:       fileHeader.Filename,
+			})
 		}
+	}
+
+	if len(tasks) == 0 {
+		utils.JSONResponse(w, []*manager.ImportRequest{}, http.StatusOK)
+		return
 	}
 
 	// Parse all tasks in parallel using iter.Map
@@ -165,7 +347,7 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 			// Task already failed during collection phase
 			return &manager.ImportRequest{
 				Status: "error",
-				Error:  fmt.Sprintf("Failed to import torrent %s: %v", task.name, task.magnet),
+				Error:  task.errMessage,
 			}
 
 		case "torrent":
@@ -204,24 +386,56 @@ func (s *Server) handleAddContent(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, filtered, http.StatusOK)
 }
 
-func getNZBContentFromFile(fileHeader *multipart.FileHeader) ([]byte, error) {
+func getNZBContentFromFile(fileHeader *multipart.FileHeader, maxBytes int64) ([]byte, error) {
 	file, err := fileHeader.Open()
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	// Read NZB content
-	nzbContent, err := io.ReadAll(file)
+	nzbContent, err := utils.ReadAllLimited(file, maxBytes)
 	if err != nil {
 		return nil, err
 	}
 	return nzbContent, nil
 }
 
+func countImportLines(values string) int {
+	count := 0
+	for value := range strings.SplitSeq(values, "\n") {
+		if strings.TrimSpace(value) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func magnetRetainedBytes(magnet *utils.Magnet) int64 {
+	if magnet == nil {
+		return 0
+	}
+	return int64(len(magnet.File)) + int64(len(magnet.Link)) + int64(len(magnet.Name))
+}
+
 func (s *Server) handleGetVersion(w http.ResponseWriter, r *http.Request) {
 	v := version.GetInfo()
 	utils.JSONResponse(w, v, http.StatusOK)
+}
+
+func (s *Server) handleLiveness(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	utils.JSONResponse(w, map[string]string{"status": "live"}, http.StatusOK)
+}
+
+func (s *Server) handleReadiness(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	status := s.manager.ReadinessStatus()
+	code := http.StatusOK
+	if !status.Ready {
+		code = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", "5")
+	}
+	utils.JSONResponse(w, status, code)
 }
 
 func (s *Server) handleRunMountCacheCleanup(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +459,7 @@ func (s *Server) handleRunMountCacheCleanup(w http.ResponseWriter, r *http.Reque
 	}
 
 	if s.stats != nil {
-		s.stats.Refresh()
+		s.stats.RequestRefresh()
 	}
 
 	utils.JSONResponse(w, map[string]any{
@@ -275,7 +489,7 @@ func (s *Server) handlePurgeMountCache(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.stats != nil {
-		s.stats.Refresh()
+		s.stats.RequestRefresh()
 	}
 
 	utils.JSONResponse(w, map[string]any{
@@ -422,21 +636,7 @@ func (s *Server) handleDeleteTorrent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "No hash provided", http.StatusBadRequest)
 		return
 	}
-	var cleanup func(torrent *storage.Entry) error
-
-	if removeFromDebrid {
-		cleanup = func(t *storage.Entry) error {
-			exists, _ := s.manager.EntryExists(t.InfoHash)
-			if exists {
-				// Remove the entry from manager fully, which will handle removing from debrid and deleting the entry
-				return s.manager.DeleteEntry(t.InfoHash, true)
-			}
-			go s.manager.RemoveTorrentPlacements(t)
-			return nil
-		}
-	}
-
-	if err := s.manager.Queue().Delete(hash, cleanup); err != nil {
+	if err := s.manager.DeleteQueueEntry(hash, removeFromDebrid); err != nil {
 		s.logger.Error().Err(err).Str("hash", hash).Msg("Failed to delete entry from queue")
 		http.Error(w, "Failed to delete entry from queue", http.StatusInternalServerError)
 		return
@@ -453,19 +653,7 @@ func (s *Server) handleDeleteTorrents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hashes := strings.Split(hashesStr, ",")
-	var cleanup func(torrent *storage.Entry) error
-	if removeFromDebrid {
-		cleanup = func(t *storage.Entry) error {
-			exists, _ := s.manager.EntryExists(t.InfoHash)
-			if exists {
-				// Remove the entry from manager fully, which will handle removing from debrid and deleting the entry
-				return s.manager.DeleteEntry(t.InfoHash, true)
-			}
-			go s.manager.RemoveTorrentPlacements(t)
-			return nil
-		}
-	}
-	if err := s.manager.Queue().DeleteWhere("", config.ProtocolAll, "", hashes, cleanup); err != nil {
+	if err := s.manager.DeleteQueueEntries(hashes, removeFromDebrid); err != nil {
 		s.logger.Error().Err(err).Msg("Failed to delete torrents")
 		http.Error(w, "Failed to delete torrents", http.StatusInternalServerError)
 		return
@@ -477,78 +665,106 @@ func (s *Server) handleDeleteTorrents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	arrStorage := s.manager.Arr()
 	cfg := config.Get()
-	cfg.Arrs = arrStorage.SyncToConfig()
-
-	// Create response with API token info
-	type ConfigResponse struct {
-		*config.Config
-		APIToken     string `json:"api_token,omitempty"`
-		AuthUsername string `json:"auth_username,omitempty"`
-	}
-
-	response := &ConfigResponse{Config: cfg}
-
-	// AddOrUpdate API token and auth information
-	auth := cfg.GetAuth()
-	if auth != nil {
-		if auth.APIToken != "" {
-			response.APIToken = auth.APIToken
-		}
-		response.AuthUsername = auth.Username
+	response, err := newConfigResponse(cfg, arrStorage.SyncToConfig())
+	if err != nil {
+		s.logger.Error().Err(err).Msg("Failed to prepare configuration response")
+		http.Error(w, "Failed to prepare configuration response", http.StatusInternalServerError)
+		return
 	}
 
 	utils.JSONResponse(w, response, http.StatusOK)
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	// Decode the incoming config update
-	var newConfig config.Config
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	if s.restartPending {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "A configuration restart is already in progress", http.StatusConflict)
+		return
+	}
+
+	body, err := readConfigRequest(r.Body)
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to decode config update request")
 		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	// Basic validation
-	if newConfig.BindAddress == "" {
-		newConfig.BindAddress = "0.0.0.0"
+	if r.Method == http.MethodPost {
+		w.Header().Set("Deprecation", "true")
+		w.Header().Set("Warning", `299 - "POST /api/config is deprecated; use PUT for replacement or PATCH for partial updates"`)
 	}
-	if newConfig.Port == "" {
-		newConfig.Port = "8282"
-	}
-
-	// Preserve fields that shouldn't be overwritten by frontend
-	currentConfig := config.Get()
-	newConfig.Auth = currentConfig.GetAuth()
-
-	// Filter out empty or incomplete arrs
-	validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
-	for _, a := range newConfig.Arrs {
-		if a.Name != "" && a.Host != "" && a.Token != "" {
-			validArrs = append(validArrs, a)
+	var clientErr error
+	result, err := config.Update(func(draft *config.Config) error {
+		newConfig, decodeErr := decodeConfigUpdate(r.Method, bytes.NewReader(body), draft)
+		if decodeErr != nil {
+			clientErr = decodeErr
+			return decodeErr
 		}
-	}
-	newConfig.Arrs = validArrs
+		if restoreErr := restoreConfigSecrets(newConfig, draft); restoreErr != nil {
+			clientErr = restoreErr
+			return restoreErr
+		}
 
-	// Sync arr storage with the new configuration
-	s.manager.Arr().SyncFromConfig(newConfig.Arrs)
+		if newConfig.BindAddress == "" {
+			newConfig.BindAddress = config.DefaultBindAddress
+		}
+		if newConfig.Port == "" {
+			newConfig.Port = config.DefaultPort
+		}
 
-	// Save the updated config. This also applies defaults to newConfig, so the
-	// restart comparison below sees a fully-normalized config on both sides.
-	if err := newConfig.Save(); err != nil {
+		// These fields are managed outside the settings form. Preserve the
+		// latest snapshot values so a concurrent auth change cannot be lost.
+		newConfig.Auth = draft.Auth
+		newConfig.UseAuth = draft.UseAuth
+		newConfig.EnableWebdavAuth = draft.EnableWebdavAuth
+
+		validArrs := make([]config.Arr, 0, len(newConfig.Arrs))
+		for _, a := range newConfig.Arrs {
+			if a.Name != "" && a.Host != "" && a.Token != "" {
+				validArrs = append(validArrs, a)
+			}
+		}
+		newConfig.Arrs = validArrs
+
+		if validateErr := validateConfigUpdate(newConfig); validateErr != nil {
+			clientErr = validateErr
+			return validateErr
+		}
+		*draft = *newConfig
+		return nil
+	})
+	if err != nil {
+		if clientErr != nil {
+			s.logger.Warn().Err(clientErr).Msg("Rejected configuration update")
+			http.Error(w, "Invalid configuration: "+clientErr.Error(), http.StatusBadRequest)
+			return
+		}
 		s.logger.Error().Err(err).Msg("Failed to save config")
 		http.Error(w, "Error saving config: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// Only restart when a field that needs it actually changed (HTTP bind,
-	// debrid/usenet clients, or the mount). For everything else, apply the new
-	// config live so users aren't disrupted by a full restart on every save.
-	restarted := config.Get().RequiresRestart(&newConfig)
-	if restarted {
+	strmChanged := result.Previous.AppURL != result.Desired.AppURL ||
+		!reflect.DeepEqual(result.Previous.Strm, result.Desired.Strm)
+
+	if result.RestartRequired {
+		// Reject any follow-up update until the new server instance is running.
+		// Otherwise a request in the restart window could merge against the old
+		// in-memory config and accidentally overwrite the just-saved document.
+		s.restartPending = true
 		go s.Restart()
 	} else {
-		config.Get().ApplyRuntime(&newConfig)
+		// Only update dependent live state after the snapshot is durable and
+		// published. Cold updates are applied by the replacement process.
+		if err := logger.SetLevel(result.Active.LogLevel); err != nil {
+			s.logger.Error().Err(err).Msg("Failed to apply log level after live update")
+		}
+		s.manager.Arr().SyncFromConfig(result.Active.Arrs)
+		if strmChanged && s.manager.Strm() != nil {
+			s.manager.Strm().SweepAsync("config_change")
+		}
 		// Reschedule/reapply the repair sweep if its settings changed.
 		if svc := s.manager.Repair(); svc != nil {
 			if err := svc.ApplyConfig(); err != nil {
@@ -557,7 +773,29 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	utils.JSONResponse(w, map[string]any{"status": "success", "restarted": restarted}, http.StatusOK)
+	utils.JSONResponse(w, map[string]any{"status": "success", "restarted": result.RestartRequired}, http.StatusOK)
+}
+
+func (s *Server) handleStrmRegenerate(w http.ResponseWriter, _ *http.Request) {
+	if !config.Get().Strm.Active() {
+		http.Error(w, "STRM is disabled or has no export path", http.StatusBadRequest)
+		return
+	}
+	if s.manager.Strm() == nil || !s.manager.Strm().SweepAsync("manual_regenerate") {
+		http.Error(w, "STRM regeneration could not be scheduled", http.StatusServiceUnavailable)
+		return
+	}
+	utils.JSONResponse(w, map[string]string{"status": "started"}, http.StatusAccepted)
+}
+
+func validateConfigUpdate(candidate *config.Config) error {
+	if err := candidate.Validate(); err != nil {
+		return err
+	}
+	if err := candidate.ValidateDeployment(); err != nil {
+		return fmt.Errorf("deployment safety check: %w", err)
+	}
+	return nil
 }
 
 func (s *Server) handleGetRepairConfig(w http.ResponseWriter, r *http.Request) {
@@ -596,11 +834,18 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	cfg := config.Get()
-	cfg.Repair = req
-	if err := cfg.Save(); err != nil {
+	result, err := config.Update(func(draft *config.Config) error {
+		draft.Repair = req
+		return nil
+	})
+	if err != nil {
 		s.logger.Error().Err(err).Msg("Failed to save repair config")
 		http.Error(w, "Failed to save config: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if result.RestartRequired {
+		s.logger.Error().Msg("Repair-only update unexpectedly requires restart")
+		http.Error(w, "Repair settings were saved but require a restart", http.StatusConflict)
 		return
 	}
 
@@ -612,7 +857,7 @@ func (s *Server) handleUpdateRepairConfig(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	utils.JSONResponse(w, cfg.Repair, http.StatusOK)
+	utils.JSONResponse(w, result.Active.Repair, http.StatusOK)
 }
 
 func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
@@ -624,12 +869,34 @@ func (s *Server) handleRepairStatus(w http.ResponseWriter, r *http.Request) {
 	utils.JSONResponse(w, svc.Status(), http.StatusOK)
 }
 
+// normalizeContentVerificationOptions makes a deep verification run safe by
+// default. It is detect-only unless the caller explicitly asks for repair, and
+// an omitted protocol narrows to NZB instead of spending time probing torrents
+// that cannot use the content verifier.
+func normalizeContentVerificationOptions(verifyContent bool, autoRepair *bool, protocolScope string) (*bool, string, error) {
+	if !verifyContent {
+		return autoRepair, protocolScope, nil
+	}
+	if protocolScope == "torrent" {
+		return autoRepair, protocolScope, errors.New("verify_content requires protocol nzb or all")
+	}
+	if protocolScope == "" {
+		protocolScope = "nzb"
+	}
+	if autoRepair == nil {
+		detectOnly := false
+		autoRepair = &detectOnly
+	}
+	return autoRepair, protocolScope, nil
+}
+
 func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		IgnoreLastChecked bool   `json:"ignore_last_checked,omitempty"`
 		Force             bool   `json:"force,omitempty"`
 		AutoRepair        *bool  `json:"auto_repair,omitempty"`
 		UnrestrictLink    bool   `json:"unrestrict_link,omitempty"`
+		VerifyContent     bool   `json:"verify_content,omitempty"`
 		Protocol          string `json:"protocol,omitempty"`
 	}
 	if r.Body != nil && r.ContentLength != 0 {
@@ -663,6 +930,13 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 	case "0", "false", "no", "off":
 		unrestrictLink = false
 	}
+	verifyContent := req.VerifyContent
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("verify_content"))) {
+	case "1", "true", "yes", "on":
+		verifyContent = true
+	case "0", "false", "no", "off":
+		verifyContent = false
+	}
 	protocolScope := strings.ToLower(strings.TrimSpace(req.Protocol))
 	if queryProtocol := strings.TrimSpace(r.URL.Query().Get("protocol")); queryProtocol != "" {
 		protocolScope = strings.ToLower(queryProtocol)
@@ -676,6 +950,11 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid protocol; expected all, torrent, or nzb", http.StatusBadRequest)
 		return
 	}
+	autoRepair, protocolScope, err := normalizeContentVerificationOptions(verifyContent, autoRepair, protocolScope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	svc := s.manager.Repair()
 	if svc == nil {
@@ -686,6 +965,7 @@ func (s *Server) handleRunRepair(w http.ResponseWriter, r *http.Request) {
 		IgnoreLastChecked: ignoreLastChecked,
 		AutoRepair:        autoRepair,
 		UnrestrictLink:    unrestrictLink,
+		VerifyContent:     verifyContent,
 		ProtocolScope:     protocolScope,
 	})
 	if err != nil {
@@ -964,36 +1244,67 @@ func (s *Server) handleRefreshAPIToken(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleUpdateAuth(w http.ResponseWriter, r *http.Request) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	if s.restartPending {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "A configuration restart is already in progress", http.StatusConflict)
+		return
+	}
+
 	var req struct {
 		Username        string `json:"username"`
 		Password        string `json:"password"`
 		ConfirmPassword string `json:"confirm_password"`
 	}
-	if err := json.ConfigDefault.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := utils.DecodeJSONRequestBounded(
+		w,
+		r,
+		&req,
+		utils.MaxControlRequestBytes,
+	); err != nil {
+		if utils.IsRequestTooLarge(err) {
+			http.Error(w, "Request is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
-	}
-
-	cfg := config.Get()
-	auth := cfg.GetAuth()
-	if auth == nil {
-		auth = &config.Auth{}
 	}
 
 	// Check if trying to disable authentication (both empty)
 	if req.Username == "" && req.Password == "" {
-		// Disable authentication
-		cfg.UseAuth = false
-		auth.Username = ""
-		auth.Password = ""
-		if err := cfg.SaveAuth(auth); err != nil {
-			s.logger.Error().Err(err).Msg("Failed to save auth config")
-			http.Error(w, "Failed to save authentication settings", http.StatusInternalServerError)
-			return
-		}
-		if err := cfg.Save(); err != nil {
+		authAlreadyDisabledErr := errors.New("authentication is already disabled")
+		authRemoteDisableErr := errors.New("authentication cannot be disabled on a non-loopback listener")
+		_, err := config.Update(func(draft *config.Config) error {
+			if !draft.UseAuth {
+				return authAlreadyDisabledErr
+			}
+			if !isLoopbackBindAddress(draft.BindAddress) {
+				return authRemoteDisableErr
+			}
+			if draft.Auth == nil {
+				return errors.New("authentication is not configured")
+			}
+			draft.UseAuth = false
+			draft.Auth.Username = ""
+			draft.Auth.Password = ""
+			draft.Auth.SessionVersion++
+			if draft.Auth.SessionVersion == 0 {
+				draft.Auth.SessionVersion = 1
+			}
+			return nil
+		})
+		if err != nil {
+			if errors.Is(err, authAlreadyDisabledErr) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if errors.Is(err, authRemoteDisableErr) {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
 			s.logger.Error().Err(err).Msg("Failed to save config")
-			http.Error(w, "Failed to save configuration", http.StatusInternalServerError)
+			http.Error(w, "Failed to save authentication settings", http.StatusInternalServerError)
 			return
 		}
 
@@ -1003,44 +1314,31 @@ func (s *Server) handleUpdateAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate required fields
-	if req.Username == "" {
-		http.Error(w, "Username is required", http.StatusBadRequest)
-		return
-	}
-	if req.Password == "" {
-		http.Error(w, "Password is required", http.StatusBadRequest)
-		return
-	}
 	if req.Password != req.ConfirmPassword {
 		http.Error(w, "Passwords do not match", http.StatusBadRequest)
 		return
 	}
 
-	// Hash the password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err := config.ValidateAuthCredentials(req.Username, req.Password); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	remoteAuthBootstrapErr := errors.New(
+		"authentication must be enabled from the host with --set-auth before remote access",
+	)
+	_, err := config.Update(func(draft *config.Config) error {
+		if !draft.UseAuth && !isLoopbackBindAddress(draft.BindAddress) {
+			return remoteAuthBootstrapErr
+		}
+		return draft.ApplyAuthCredentials(req.Username, req.Password)
+	})
 	if err != nil {
-		s.logger.Error().Err(err).Msg("Failed to hash password")
-		http.Error(w, "Failed to process password", http.StatusInternalServerError)
-		return
-	}
-
-	// Update auth settings
-	auth.Username = req.Username
-	auth.Password = string(hashedPassword)
-	cfg.UseAuth = true
-
-	// Save auth config
-	if err := cfg.SaveAuth(auth); err != nil {
-		s.logger.Error().Err(err).Msg("Failed to save auth config")
+		if errors.Is(err, remoteAuthBootstrapErr) {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		s.logger.Error().Err(err).Msg("Failed to save authentication settings")
 		http.Error(w, "Failed to save authentication settings", http.StatusInternalServerError)
-		return
-	}
-
-	// Save main config
-	if err := cfg.Save(); err != nil {
-		s.logger.Error().Err(err).Msg("Failed to save config")
-		http.Error(w, "Failed to save configuration", http.StatusInternalServerError)
 		return
 	}
 

@@ -1,9 +1,10 @@
 {
-  "name": "decypharr",
+  "name": "tessarr",
   "version": "1.0.0",
   "description": "Media management tool",
   "scripts": {
-    "build-css": "npx @tailwindcss/cli --input pkg/server/assets/styles.css --output ./pkg/server/assets/build/css/styles.css --minify",
+    "test": "node --test",
+    "build-css": "tailwindcss --input pkg/server/assets/styles.css --output ./pkg/server/assets/build/css/styles.css --minify",
     "minify-js": "node scripts/minify-js.js",
     "download-assets": "node scripts/download-assets.js",
     "build": "npm run build-css && npm run minify-js",
@@ -11,10 +12,12 @@
     "dev": "npm run build && air"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.0.0",
-    "clean-css": "^5.3.3",
+    "@tailwindcss/cli": "4.3.1",
     "daisyui": "^5.4.2",
-    "tailwindcss": "^4.0.0",
+    "tailwindcss": "4.3.1",
     "terser": "^5.24.0"
+  },
+  "overrides": {
+    "@parcel/watcher": "2.6.0"
   }
 }

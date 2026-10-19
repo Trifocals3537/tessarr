@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 
-	"github.com/sirrobot01/decypharr/internal/crypto"
-	"github.com/sirrobot01/decypharr/internal/nntp"
-	"github.com/sirrobot01/decypharr/pkg/usenet/types"
+	"github.com/Trifocals3537/tessarr/internal/crypto"
+	"github.com/Trifocals3537/tessarr/internal/nntp"
+	"github.com/Trifocals3537/tessarr/pkg/usenet/types"
 )
 
 // rarReader provides a continuous stream across RAR volumes
@@ -50,7 +51,7 @@ func (r *rarReader) Read(p []byte) (int, error) {
 		if r.currentSegmentData == nil || r.currentSegmentOffset >= len(r.currentSegmentData) {
 			if err := r.loadNextSegment(); err != nil {
 				if totalRead > 0 {
-					return totalRead, nil
+					return totalRead, err
 				}
 				return 0, err
 			}
@@ -68,7 +69,17 @@ func (r *rarReader) Read(p []byte) (int, error) {
 
 // Skip efficiently skips n bytes without downloading unnecessary data
 func (r *rarReader) Skip(n int64) error {
-	if n <= 0 {
+	if n < 0 {
+		return fmt.Errorf("negative RAR data size")
+	}
+	var remaining int64
+	for _, volume := range r.volumes {
+		remaining += volume.Size
+	}
+	if r.position > remaining || n > remaining-r.position {
+		return io.ErrUnexpectedEOF
+	}
+	if n == 0 {
 		return nil
 	}
 
@@ -142,7 +153,11 @@ func (r *rarReader) loadNextSegment() error {
 		// Download segment using manager
 		var data []byte
 		err := r.manager.ExecuteWithFailover(r.ctx, func(conn *nntp.Connection) error {
-			d, e := conn.GetDecodedBody(segment.MessageID)
+			d, meta, e := conn.GetDecodedBodyWithMetadata(segment.MessageID)
+			if e == nil && (meta == nil || int64(len(d)) != segment.Bytes || meta.Size != volume.Size ||
+				meta.Begin != segment.StartOffset+1 || meta.End != segment.EndOffset+1) {
+				return fmt.Errorf("article yEnc geometry does not match RAR volume offsets")
+			}
 			data = d
 			return e
 		})
@@ -217,10 +232,7 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 		// Read header
 		header, headerSize, dataSize, err := p.readRAR5HeaderFromStream(stream)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			break
+			return nil, fmt.Errorf("failed to read RAR5 header: %w", err)
 		}
 
 		// Check for encryption header - this means headers are encrypted
@@ -230,7 +242,7 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 			// Parse encryption header to get salt and kdfCount
 			encHeader, err := crypto.ParseEncryptionHeader(header.Data)
 			if err != nil {
-				break
+				return nil, err
 			}
 
 			// If no password provided, we can't continue
@@ -259,20 +271,14 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 				// Read IV (16 bytes)
 				iv := make([]byte, crypto.BlockSize)
 				if _, err := io.ReadFull(stream, iv); err != nil {
-					if err == io.EOF {
-						break
-					}
-					break
+					return nil, fmt.Errorf("failed to read encrypted RAR5 IV: %w", err)
 				}
 				result.EncryptionIV = iv
 
 				// Read encrypted header
 				encHeader, encHeaderSize, encDataSize, err := p.readAndDecryptRAR5Header(stream, encryptionKey, iv)
 				if err != nil {
-					if err == io.EOF {
-						break
-					}
-					break
+					return nil, fmt.Errorf("failed to read encrypted RAR5 header: %w", err)
 				}
 
 				// Parse the decrypted header
@@ -281,11 +287,14 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 					_, offsetInVol := stream.AbsoluteToVolumeOffset(headerPos + int64(encHeaderSize))
 
 					file := p.parseRAR5FileHeader(encHeader.Data, volumeIndex, volumeName, offsetInVol, encDataSize, password)
-					if file != nil {
-						// Note: file.IsEncrypted is now set correctly from extra area parsing
-						// Headers being encrypted does NOT mean data is encrypted
-						result.Files = append(result.Files, file)
+					if file == nil {
+						return nil, fmt.Errorf("invalid encrypted RAR5 file header")
 					}
+					file.SplitBefore = encHeader.Flags&RAR5HeaderFlagSplitBefore != 0
+					file.SplitAfter = encHeader.Flags&RAR5HeaderFlagSplitAfter != 0
+					// Headers being encrypted does NOT mean data is encrypted;
+					// file.IsEncrypted is set from the file's extra area instead.
+					result.Files = append(result.Files, file)
 				}
 
 				// Skip data section
@@ -293,10 +302,7 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 					// Data is also encrypted, need to account for padding
 					paddedSize := ((encDataSize + crypto.BlockSize - 1) / crypto.BlockSize) * crypto.BlockSize
 					if err := stream.Skip(paddedSize); err != nil {
-						if err == io.EOF {
-							break
-						}
-						break
+						return nil, fmt.Errorf("failed to skip encrypted RAR5 data: %w", err)
 					}
 				}
 
@@ -317,17 +323,17 @@ func (p *RARParser) parseRAR5Stream(stream *rarReader, volumeIndex int, volumeNa
 			// Use the volumeIndex parameter passed to this function, not the stream's volume index
 			// because each stream only contains one volume
 			file := p.parseRAR5FileHeader(header.Data, volumeIndex, volumeName, offsetInVol, dataSize, password)
-			if file != nil {
-				result.Files = append(result.Files, file)
+			if file == nil {
+				return nil, fmt.Errorf("invalid RAR5 file header")
 			}
+			file.SplitBefore = header.Flags&RAR5HeaderFlagSplitBefore != 0
+			file.SplitAfter = header.Flags&RAR5HeaderFlagSplitAfter != 0
+			result.Files = append(result.Files, file)
 		}
 
 		// Skip the data section to get to the next header
 		if dataSize > 0 {
 			if err := stream.Skip(dataSize); err != nil {
-				if err == io.EOF {
-					break
-				}
 				return nil, fmt.Errorf("failed to skip data section: %w", err)
 			}
 		}
@@ -469,7 +475,7 @@ func (p *RARParser) readRAR5HeaderFromStream(stream *rarReader) (*rar5HeaderData
 		return nil, 0, 0, err
 	}
 
-	// Parse CRC (first 4 bytes) - we don't verify it, just skip
+	// CRC covers the size vint and the entire header, including the extra area.
 	pos := 4
 
 	// Read header size vint from buffer, continuing to read more if needed
@@ -513,6 +519,12 @@ func (p *RARParser) readRAR5HeaderFromStream(stream *rarReader) (*rar5HeaderData
 		if err != nil {
 			return nil, 0, 0, err
 		}
+	}
+	checksum := crc32.NewIEEE()
+	_, _ = checksum.Write(initialBuf[4:pos])
+	_, _ = checksum.Write(headerContent)
+	if checksum.Sum32() != binary.LittleEndian.Uint32(initialBuf[:4]) {
+		return nil, 0, 0, fmt.Errorf("RAR5 header CRC mismatch")
 	}
 
 	// Now parse the header content from memory (no more Read calls!)
@@ -653,10 +665,7 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 		// Read RAR4 header
 		header, err := p.readRAR4HeaderFromStream(stream)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			break
+			return nil, fmt.Errorf("failed to read RAR4 header: %w", err)
 		}
 
 		// Data offset is immediately after the header
@@ -670,23 +679,19 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 			// Use the volumeIndex parameter passed to this function, not the stream's volume index
 			// because each stream only contains one volume
 			file := p.parseRAR4FileHeader(header, volumeIndex, volumeName, offsetInVol)
-			if file != nil {
-				// Clamp PackedSize to the remaining bytes in the volume
-				// RAR4 headers often report the TOTAL packed size of the file, not just the part in this volume
-				// We must limit it to what's actually available in this volume
-				remainingInVolume := volumeSize - offsetInVol
-				if file.PackedSize > remainingInVolume {
-					file.PackedSize = remainingInVolume
-					// Also update the volume part size
-					if len(file.VolumeParts) > 0 {
-						file.VolumeParts[0].PackedSize = remainingInVolume
-						file.VolumeParts[0].UnpackedSize = remainingInVolume // Treat as stored stream
-					}
-				}
-
-				files = append(files, file)
-				dataSkipSize = file.PackedSize
+			if file == nil {
+				return nil, fmt.Errorf("invalid RAR4 file header")
 			}
+			if file.PackedSize < 0 || offsetInVol > volumeSize || file.PackedSize > volumeSize-offsetInVol {
+				return nil, fmt.Errorf("truncated RAR4 member: packed data extends beyond volume")
+			}
+			files = append(files, file)
+			dataSkipSize = file.PackedSize
+		} else if header.Flags&RAR4HeaderFlagLongBlock != 0 {
+			if len(header.Data) < 4 {
+				return nil, fmt.Errorf("invalid RAR4 long block")
+			}
+			dataSkipSize = int64(binary.LittleEndian.Uint32(header.Data))
 		}
 
 		// Skip the file data section (PackedSize) to get to the next header
@@ -697,9 +702,6 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 
 		if skipTotal > 0 {
 			if err := stream.Skip(skipTotal); err != nil {
-				if err == io.EOF {
-					break
-				}
 				return nil, fmt.Errorf("failed to skip RAR4 data section: %w", err)
 			}
 		}
@@ -715,71 +717,26 @@ func (p *RARParser) parseRAR4Stream(stream *rarReader, volumeIndex int, volumeNa
 
 // readRAR4HeaderFromStream reads a single RAR 4.x header from stream
 func (p *RARParser) readRAR4HeaderFromStream(stream *rarReader) (*rar4Header, error) {
-	var header rar4Header
-
-	// Read header CRC (2 bytes)
-	if err := binary.Read(stream, binary.LittleEndian, &header.CRC); err != nil {
+	var raw [7]byte
+	if _, err := io.ReadFull(stream, raw[:]); err != nil {
 		return nil, err
 	}
-
-	// Read header type (1 byte)
-	if err := binary.Read(stream, binary.LittleEndian, &header.Type); err != nil {
-		return nil, err
+	header := &rar4Header{
+		CRC: binary.LittleEndian.Uint16(raw[:2]), Type: raw[2],
+		Flags: binary.LittleEndian.Uint16(raw[3:5]), HeadSize: binary.LittleEndian.Uint16(raw[5:7]),
 	}
-
-	// Read header flags (2 bytes)
-	if err := binary.Read(stream, binary.LittleEndian, &header.Flags); err != nil {
-		return nil, err
-	}
-
-	// Read header size (2 bytes)
-	if err := binary.Read(stream, binary.LittleEndian, &header.HeadSize); err != nil {
-		return nil, err
-	}
-
-	// Check for zero padding (common at end of RAR files)
-	// If we read all zeros, Type will be 0 and HeadSize will be 0
-	if header.HeadSize == 0 && header.Type == 0 {
-		return nil, io.EOF
-	}
-
-	// Validate header size - minimum is 7 bytes
 	if header.HeadSize < 7 {
-		return nil, fmt.Errorf("invalid RAR4 header size: %d (minimum is 7)", header.HeadSize)
-	}
-
-	// Check for marker block or archive header which might have HeadSize of exactly 7
-	// For these blocks, there's no additional data
-	if header.HeadSize == 7 && (header.Type == RAR4HeaderTypeMarker || header.Type == RAR4HeaderTypeArchive) {
-		// This is valid for marker/archive blocks with minimal headers
-		return &header, nil
-	}
-
-	// CRITICAL FIX: Do NOT strip AddSize from the header data.
-	// In RAR4 format, LONG_BLOCK means PackedSize(4) + UnpackedSize(4) are present.
-	// These fields are part of the header body and must be read into header.Data
-	// so that parseRAR4FileHeader can read them correctly.
-
-	baseHeaderSize := 7
-
-	// Sanity check
-	const maxHeaderSize = uint16(65535)
-	if header.HeadSize > maxHeaderSize {
 		return nil, fmt.Errorf("invalid RAR4 header size: %d", header.HeadSize)
 	}
-
-	// Read remaining header data
-	remainingSize := int(header.HeadSize) - baseHeaderSize
-	if remainingSize < 0 {
-		return nil, fmt.Errorf("invalid RAR4 header size calculation: remaining=%d", remainingSize)
+	header.Data = make([]byte, int(header.HeadSize)-7)
+	if _, err := io.ReadFull(stream, header.Data); err != nil {
+		return nil, err
 	}
-
-	if remainingSize > 0 {
-		header.Data = make([]byte, remainingSize)
-		if _, err := io.ReadFull(stream, header.Data); err != nil {
-			return nil, err
-		}
+	checksum := crc32.NewIEEE()
+	_, _ = checksum.Write(raw[2:])
+	_, _ = checksum.Write(header.Data)
+	if uint16(checksum.Sum32()) != header.CRC {
+		return nil, fmt.Errorf("RAR4 header CRC mismatch")
 	}
-
-	return &header, nil
+	return header, nil
 }

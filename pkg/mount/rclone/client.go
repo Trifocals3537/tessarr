@@ -1,6 +1,8 @@
 package rclone
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,10 +10,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/sirrobot01/decypharr/internal/config"
-	"github.com/sirrobot01/decypharr/internal/retry"
-	"github.com/sirrobot01/decypharr/internal/utils"
-	"golang.org/x/net/context"
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/retry"
+	"github.com/Trifocals3537/tessarr/internal/utils"
 )
 
 // mountWithRetry attempts to mount with retry logic using avast/retry-go
@@ -23,6 +24,7 @@ func (m *Manager) mountWithRetry(ctx context.Context, maxRetries int) error {
 		retry.Attempts(uint(maxRetries)+1),
 		retry.Delay(config.DefaultRetryDelay),
 		retry.DelayType(retry.FixedDelay),
+		retry.Context(ctx),
 		retry.LastErrorOnly(true),
 		retry.RetryIf(func(err error) bool {
 			return true // Always retry on error
@@ -47,14 +49,6 @@ func (m *Manager) performMount(ctx context.Context) error {
 		return nil
 	}
 
-	// Clean up any stale mount first
-	if mountInfo != nil && !mountInfo.Mounted {
-		err := m.forceUnmount(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
 	// Create rclone config for this provider
 	if err := m.createConfig(); err != nil {
 		return fmt.Errorf("failed to create rclone config: %w", err)
@@ -69,8 +63,8 @@ func (m *Manager) performMount(ctx context.Context) error {
 		"AllowNonEmpty": true,
 		"AllowOther":    true,
 		"DebugFUSE":     false,
-		"DeviceName":    "decypharr",
-		"VolumeName":    "decypharr",
+		"DeviceName":    "tessarr",
+		"VolumeName":    "tessarr",
 	}
 
 	if cfg.Rclone.AsyncRead != nil {
@@ -190,37 +184,42 @@ func (m *Manager) performMount(ctx context.Context) error {
 	return nil
 }
 
-// unmount is the internal unmount function
-func (m *Manager) unmount(ctx context.Context) {
+// unmount is the internal unmount function. A successful RC unmount is already
+// authoritative; forcing an unmount again would fail on a clean mount point and
+// prevent recovery from reaching the remount step.
+func (m *Manager) unmount(ctx context.Context) error {
 	mountInfo := m.getMountInfo()
 
 	if mountInfo == nil || !mountInfo.Mounted {
 		m.logger.Info().Msg("Mount not found or already unmounted")
-		return
+		return nil
 	}
 
 	m.logger.Info().Msg("Unmounting")
 
 	// Try RC unmount first
 
-	err := m.client.Unmount(context.Background(), mountInfo.LocalPath)
+	err := m.client.Unmount(ctx, mountInfo.LocalPath)
 
 	// If RC unmount fails or server is not ready, try force unmount
 	if err != nil {
 		m.logger.Warn().Err(err).Msg("RC unmount failed, trying force unmount")
-		if err := m.forceUnmount(ctx); err != nil {
-			m.logger.Error().Err(err).Msg("Force unmount failed")
-			// Don't return error here, update the state anyway
+		if forceErr := m.forceUnmount(ctx); forceErr != nil {
+			combined := errors.Join(err, forceErr)
+			m.updateMountInfo(func(info *MountInfo) {
+				info.Error = combined.Error()
+			})
+			return combined
 		}
 	}
 
-	// Update mount info
-	mountInfo.Mounted = false
-	mountInfo.Error = ""
-	if err != nil {
-		mountInfo.Error = err.Error()
-	}
+	m.updateMountInfo(func(info *MountInfo) {
+		info.Mounted = false
+		info.MountedAt = ""
+		info.Error = ""
+	})
 	m.logger.Info().Msg("Unmount completed")
+	return nil
 }
 
 // createConfig creates an rclone config entry for the provider

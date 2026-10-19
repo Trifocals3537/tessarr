@@ -19,6 +19,8 @@ auth.json
 .ven/
 .env
 node_modules/
+.cache/
+.deploy/
 .venv/
 .stignore
 .stfolder/**

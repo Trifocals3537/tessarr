@@ -554,7 +554,7 @@ const file_nzb_proto_rawDesc = "" +
 	"\x06is_bad\x18\x14 \x01(\bR\x05isBad\x12\x18\n" +
 	"\astorage\x18\x15 \x01(\tR\astorage\x12!\n" +
 	"\ffail_message\x18\x16 \x01(\tR\vfailMessage\x12\x1a\n" +
-	"\bpassword\x18\x17 \x01(\tR\bpasswordB,Z*github.com/sirrobot01/decypharr/pkg/usenetb\x06proto3"
+	"\bpassword\x18\x17 \x01(\tR\bpasswordB-Z+github.com/Trifocals3537/tessarr/pkg/usenetb\x06proto3"
 
 var (
 	file_nzb_proto_rawDescOnce sync.Once
