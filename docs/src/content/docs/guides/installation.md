@@ -6,7 +6,7 @@ description: Install Tessarr as a native Linux service or with Docker.
 ## Native Linux (Recommended)
 
 Download the archive for your architecture from this fork's
-[GitHub Releases](https://github.com/Trifocals3537/decypharr/releases).
+[GitHub Releases](https://github.com/Trifocals3537/tessarr/releases).
 Linux hosts need FUSE support and a compatible FUSE runtime (commonly
 `libfuse2` on Ubuntu and Debian). Install rclone only if you plan to use the
 rclone mount backend.

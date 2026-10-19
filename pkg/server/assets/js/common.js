@@ -427,8 +427,8 @@ class TessarrUtils {
                     const betaBuild = channel === 'beta' &&
                         version.match(/^\d+\.\d+\.\d+-beta\.\d+\.([0-9a-f]{7})$/i);
                     releaseLink.href = betaBuild
-                        ? `https://github.com/Trifocals3537/decypharr/commit/${betaBuild[1]}`
-                        : `https://github.com/Trifocals3537/decypharr/releases/tag/v${encodeURIComponent(version)}`;
+                        ? `https://github.com/Trifocals3537/tessarr/commit/${betaBuild[1]}`
+                        : `https://github.com/Trifocals3537/tessarr/releases/tag/v${encodeURIComponent(version)}`;
                     releaseLink.target = '_blank';
                     releaseLink.rel = 'noopener noreferrer';
                     releaseLink.className =
