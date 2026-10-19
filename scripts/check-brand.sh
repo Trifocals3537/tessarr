@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # Legacy identifiers are allowed only where compatibility, migration, or
-# attribution requires their exact spelling. The current GitHub repository URL
-# is also permitted; its name is independent of the Tessarr application name.
+# attribution requires their exact spelling.
 git rev-parse --is-inside-work-tree >/dev/null
 
 failed=0
@@ -11,23 +10,6 @@ failed=0
 allowed_legacy_reference() {
     local path="$1"
     local content="$2"
-    case "$path" in
-        README.md|Dockerfile|packaging/systemd/tessarr.service|\
-        docs/astro.config.mjs|docs/src/components/Header.astro|\
-        docs/src/content/docs/index.mdx|\
-        docs/src/content/docs/guides/installation.md|\
-        docs/src/content/docs/guides/configuration.md|\
-        docs/src/content/docs/help/troubleshooting.md|\
-        pkg/server/templates/layout.html|pkg/server/assets/js/common.js|\
-        pkg/server/assets/build/js/common.js|scripts/version-info.test.mjs)
-            # Permit only the verified repository address on these lines,
-            # keeping the check active for unrelated legacy product wording.
-            local without_repo_url="${content//https:\/\/github.com\/Trifocals3537\/decypharr/}"
-            if [[ "$content" != "$without_repo_url" && "${without_repo_url,,}" != *decypharr* ]]; then
-                return 0
-            fi
-            ;;
-    esac
     case "$path" in
         docs/src/content/docs/guides/migration-from-decypharr.md|\
         internal/migration/legacy.go|internal/migration/legacy_test.go|\

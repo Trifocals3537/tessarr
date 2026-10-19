@@ -32,7 +32,7 @@ Usenet streaming.
 
 Native binaries are the primary deployment path for seedboxes and other
 user-managed Linux hosts. Download the archive for your architecture from this
-fork's [GitHub Releases](https://github.com/Trifocals3537/decypharr/releases),
+fork's [GitHub Releases](https://github.com/Trifocals3537/tessarr/releases),
 verify it with the published `SHA256SUMS`, and install it:
 
 ```bash

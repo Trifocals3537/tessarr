@@ -32,7 +32,7 @@ test('continuous beta version links to its source commit', async t => {
     const version = '2.6.0-beta.140.5d9f4ae';
     const badge = await renderVersion(t, version, 'beta');
     assert.equal(badge.children.length, 1);
-    assert.equal(badge.children[0].href, 'https://github.com/Trifocals3537/decypharr/commit/5d9f4ae');
+    assert.equal(badge.children[0].href, 'https://github.com/Trifocals3537/tessarr/commit/5d9f4ae');
     assert.equal(badge.children[0].textContent, version);
     assert.equal(badge.children[0].rel, 'noopener noreferrer');
 });
@@ -41,7 +41,7 @@ for (const [version, channel] of [['2.6.0', 'stable'], ['2.6.0-beta.1', 'beta'],
     test(`${channel} release version retains its release link`, async t => {
         const badge = await renderVersion(t, version, channel);
         assert.equal(badge.children.length, 1);
-        assert.equal(badge.children[0].href, `https://github.com/Trifocals3537/decypharr/releases/tag/v${version}`);
+        assert.equal(badge.children[0].href, `https://github.com/Trifocals3537/tessarr/releases/tag/v${version}`);
         assert.equal(badge.children[0].textContent, version);
     });
 }
