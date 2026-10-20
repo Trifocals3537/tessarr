@@ -161,9 +161,9 @@ A failure to persist a single entry's health update is logged but never aborts t
 
 ### Durable Arr recovery
 
-Recovery is backend-only and supports Sonarr and Radarr. It is inspired by
-upstream beta's exact-binding and mutation-intent approach, without replacing
-this fork's storage, mount, or UI.
+Recovery is backend-only and supports Sonarr and Radarr. It uses exact Arr
+bindings and durable mutation records within Tessarr's storage, mount, and UI
+architecture.
 
 - Before any deletion, Tessarr saves the old Arr file ID, path, size, and
   media identities to a synchronously flushed `repair_recoveries.db` store.

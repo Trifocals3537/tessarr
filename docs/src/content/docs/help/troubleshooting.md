@@ -625,7 +625,7 @@ configuration is verified.
 
 If you can't resolve the issue:
 
-1. **Report a reproducible issue in this fork:** https://github.com/Trifocals3537/tessarr/issues
+1. **Report a reproducible Tessarr issue:** https://github.com/Trifocals3537/tessarr/issues
 2. **Provide:**
     - Tessarr version (`/version`)
     - Relevant logs (with `log_level: debug`)

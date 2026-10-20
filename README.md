@@ -31,8 +31,8 @@ Usenet streaming.
 ### Native Linux
 
 Native binaries are the primary deployment path for seedboxes and other
-user-managed Linux hosts. Download the archive for your architecture from this
-fork's [GitHub Releases](https://github.com/Trifocals3537/tessarr/releases),
+user-managed Linux hosts. Download the archive for your architecture from
+[Tessarr's GitHub Releases](https://github.com/Trifocals3537/tessarr/releases),
 verify it with the published `SHA256SUMS`, and install it:
 
 ```bash
@@ -140,7 +140,7 @@ for verification and managed-host guidance.
 
 ## Documentation
 
-See the [documentation source](docs/src/content/docs/) while the fork's
+See the [documentation source](docs/src/content/docs/) while Tessarr's
 standalone documentation site is being prepared.
 
 See the [changelog](CHANGELOG.md) for the upcoming release and upgrade notes.
