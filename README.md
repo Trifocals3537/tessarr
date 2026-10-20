@@ -31,8 +31,8 @@ Usenet streaming.
 ### Native Linux
 
 Native binaries are the primary deployment path for seedboxes and other
-user-managed Linux hosts. Download the archive for your architecture from this
-fork's [GitHub Releases](https://github.com/Trifocals3537/tessarr/releases),
+user-managed Linux hosts. Download the archive for your architecture from
+[Tessarr's GitHub Releases](https://github.com/Trifocals3537/tessarr/releases),
 verify it with the published `SHA256SUMS`, and install it:
 
 ```bash
@@ -140,10 +140,10 @@ for verification and managed-host guidance.
 
 ## Documentation
 
-See the [documentation source](docs/src/content/docs/) while the fork's
+See the [documentation source](docs/src/content/docs/) while Tessarr's
 standalone documentation site is being prepared.
 
-See the [changelog](CHANGELOG.md) for the upcoming release and upgrade notes.
+See the [changelog](CHANGELOG.md) for release and upgrade notes.
 
 ## Contributing
 
@@ -154,7 +154,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 Tessarr began as a fork of
 [Decypharr](https://github.com/sirrobot01/decypharr) and remains grateful for
 that project's foundation. Tessarr is now independently named, packaged, and
-maintained. Existing installations can use the
+maintained in a standalone repository. Earlier pull requests, reviews, and
+release records are preserved in the
+[history archive](https://github.com/Trifocals3537/tessarr-history).
+Existing installations can use the
 [offline migration guide](docs/src/content/docs/guides/migration-from-decypharr.md)
 to copy and verify their state without altering the original installation.
 
