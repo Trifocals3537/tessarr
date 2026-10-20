@@ -22,8 +22,8 @@ env:
 jobs:
   prepare:
     name: Prepare release metadata
-    # The repository ID remains stable when the Tessarr repository is renamed.
-    if: github.repository_id == '1173113218'
+    # Only the standalone Tessarr repository may publish releases.
+    if: github.repository_id == '1426317456'
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.metadata.outputs.version }}

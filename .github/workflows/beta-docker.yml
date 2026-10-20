@@ -21,9 +21,9 @@ env:
 jobs:
   build:
     name: Build and publish beta image
-    # The repository ID remains stable when the Tessarr repository is renamed.
+    # Only the standalone Tessarr repository may publish beta images.
     if: >-
-      github.repository_id == '1173113218' &&
+      github.repository_id == '1426317456' &&
       github.ref == 'refs/heads/beta'
     runs-on: ubuntu-24.04
     steps:
