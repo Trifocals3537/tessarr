@@ -3,12 +3,39 @@ package tessarr
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/stateowner"
 )
+
+func TestStartRejectsSecondOwnerBeforeRestartRecovery(t *testing.T) {
+	oldPath := config.GetMainPath()
+	t.Cleanup(func() { _ = config.SetConfigPath(oldPath) })
+	root := t.TempDir()
+	if err := config.SetConfigPath(root); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := stateowner.Acquire(root, ".tessarr-process.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	artifact := filepath.Join(root, "config-restart-transaction.json")
+	if err := os.WriteFile(artifact, []byte("invalid recovery sentinel"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Start(context.Background()); !errors.Is(err, stateowner.ErrInUse) {
+		t.Fatalf("startup reached recovery before ownership: %v", err)
+	}
+	if got, err := os.ReadFile(artifact); err != nil || string(got) != "invalid recovery sentinel" {
+		t.Fatalf("rejected startup modified restart state: %q %v", got, err)
+	}
+}
 
 type serviceFunc func(context.Context) error
 

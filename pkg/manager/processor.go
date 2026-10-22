@@ -646,9 +646,7 @@ func (m *Manager) processAction(ctx context.Context, entry *storage.Entry) error
 			Err(err).
 			Str("name", entry.Name).
 			Msg("Error running post-download action")
-		entry.MarkAsError(err)
-		_ = m.queue.Update(entry)
-		return nil
+		return err
 	}
 	return nil
 }
