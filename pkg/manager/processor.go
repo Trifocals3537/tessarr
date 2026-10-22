@@ -525,7 +525,10 @@ func (m *Manager) processQueuedTorrent(ctx context.Context, entry *storage.Entry
 	// Update entry progress
 	entry.Progress = debridTorrent.Progress / 100.0
 	entry.Speed = debridTorrent.Speed
-	entry.Size = debridTorrent.GetSize()
+	entry.Size = torrentSizeForEntry(entry, debridTorrent)
+	if entry.FileScopeRestricted {
+		entry.Bytes = entry.Size
+	}
 	entry.Seeders = debridTorrent.Seeders
 	entry.UpdatedAt = observedAt
 
@@ -811,16 +814,8 @@ func preserveMaterializedTorrentTitle(entry *storage.Entry, remote *debridTypes.
 
 func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTypes.Torrent) {
 	torrent.ActiveProvider = debridTorrent.Debrid
-	size := debridTorrent.GetSize()
-	if torrent.FileScopeRestricted {
-		size = 0
-		for _, file := range torrent.Files {
-			if file != nil && !file.Deleted {
-				size += file.Size
-			}
-		}
-	}
-	if size > 0 || torrent.Size <= 0 {
+	size := torrentSizeForEntry(torrent, debridTorrent)
+	if torrent.FileScopeRestricted || size > 0 || torrent.Size <= 0 {
 		torrent.Bytes = size
 		torrent.Size = size
 	}
@@ -831,6 +826,19 @@ func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTyp
 		torrent.OriginalFilename = debridTorrent.OriginalFilename
 	}
 	torrent.UpdatedAt = time.Now()
+}
+
+func torrentSizeForEntry(entry *storage.Entry, remote *debridTypes.Torrent) int64 {
+	if !entry.FileScopeRestricted {
+		return remote.GetSize()
+	}
+	var size int64
+	for _, file := range entry.Files {
+		if file != nil && !file.Deleted {
+			size += file.Size
+		}
+	}
+	return size
 }
 
 // SendToDebrid submits a magnet to debrid service(s) - replaces debrid.Parse
