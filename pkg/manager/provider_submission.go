@@ -129,6 +129,32 @@ func submissionIdentity(remote *debridTypes.Torrent, hash, provider, id string) 
 	return nil
 }
 
+func getProviderTorrent(ctx context.Context, client debrid.Client, id string) (*debridTypes.Torrent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if contextual, ok := client.(debrid.ContextTorrentGetter); ok {
+		return contextual.GetTorrentContext(ctx, id)
+	}
+	// Legacy providers may not support cancellation. Only a read is allowed
+	// here; a late result cannot mutate manager state after cancellation.
+	type result struct {
+		torrent *debridTypes.Torrent
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		torrent, err := client.GetTorrent(id)
+		done <- result{torrent, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-done:
+		return r.torrent, r.err
+	}
+}
+
 // reconcileSubmission never creates remote work or deletes hash matches. An
 // empty/eventually-consistent listing is not proof that a timed-out POST failed.
 func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, entry *storage.Entry, intent *storage.ProviderSubmission) (*debridTypes.Torrent, error) {
@@ -143,7 +169,7 @@ func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, e
 		// A cleanup can have succeeded before a crash lost its acknowledgement.
 		// Do not replay DELETE against a potentially reused ID. Only an explicit
 		// typed absence from the original account permits routing to continue.
-		_, err := client.GetTorrent(intent.ProviderID)
+		_, err := getProviderTorrent(ctx, client, intent.ProviderID)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -157,34 +183,54 @@ func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, e
 		}
 		return m.sendToDebrid(ctx, req, entry)
 	}
-	listed, err := getProviderTorrents(ctx, client)
-	if err != nil {
-		return nil, pendingSubmission(err)
-	}
-	matches := make(map[string]*debridTypes.Torrent)
-	for _, torrent := range listed {
-		if torrent == nil || !strings.EqualFold(torrent.InfoHash, entry.InfoHash) || strings.TrimSpace(torrent.Id) == "" || (intent.ProviderID != "" && torrent.Id != intent.ProviderID) {
-			continue
-		}
-		if torrent.Debrid != "" && torrent.Debrid != intent.Provider {
-			return nil, pendingSubmission(fmt.Errorf("provider listing changed account identity"))
-		}
-		matches[torrent.Id] = torrent
-	}
-	if len(matches) != 1 {
-		return nil, pendingSubmission(fmt.Errorf("provider reconciliation found %d matching IDs; inspect the original provider account", len(matches)))
-	}
 	var observed *debridTypes.Torrent
-	for _, torrent := range matches {
-		observed = torrent.Copy()
-	}
-	if intent.ProviderID == "" {
-		intent.ProviderID, intent.Recovered = observed.Id, true
-		if err := m.submissionStep(entry, func() error {
-			return m.storage.RecordProviderSubmissionID(entry, intent.Attempt, intent.ProviderID, true)
-		}); err != nil {
+	var err error
+	if intent.ProviderID != "" && !intent.Recovered {
+		// Library listings omit active transfers on several providers. Read
+		// the acknowledged ID before CheckStatus, which can select files or
+		// restart a transfer. Missing hashes must not inherit our expected hash.
+		observed, err = getProviderTorrent(ctx, client, intent.ProviderID)
+		if err != nil {
+			return nil, pendingSubmission(err)
+		}
+		if observed == nil || !strings.EqualFold(observed.InfoHash, entry.InfoHash) {
+			return nil, pendingSubmission(fmt.Errorf("provider lookup did not confirm the expected content hash"))
+		}
+		if err := submissionIdentity(observed, entry.InfoHash, intent.Provider, intent.ProviderID); err != nil {
 			return nil, err
 		}
+	} else {
+		listed, err := getProviderTorrents(ctx, client)
+		if err != nil {
+			return nil, pendingSubmission(err)
+		}
+		matches := make(map[string]*debridTypes.Torrent)
+		for _, torrent := range listed {
+			if torrent == nil || !strings.EqualFold(torrent.InfoHash, entry.InfoHash) || strings.TrimSpace(torrent.Id) == "" || (intent.ProviderID != "" && torrent.Id != intent.ProviderID) {
+				continue
+			}
+			if torrent.Debrid != "" && torrent.Debrid != intent.Provider {
+				return nil, pendingSubmission(fmt.Errorf("provider listing changed account identity"))
+			}
+			matches[torrent.Id] = torrent
+		}
+		if len(matches) != 1 {
+			return nil, pendingSubmission(fmt.Errorf("provider reconciliation found %d matching IDs; inspect the original provider account", len(matches)))
+		}
+		for _, torrent := range matches {
+			observed = torrent.Copy()
+		}
+		if intent.ProviderID == "" {
+			intent.ProviderID, intent.Recovered = observed.Id, true
+			if err := m.submissionStep(entry, func() error {
+				return m.storage.RecordProviderSubmissionID(entry, intent.Attempt, intent.ProviderID, true)
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	stub := &debridTypes.Torrent{Id: intent.ProviderID, InfoHash: entry.InfoHash, Debrid: intent.Provider,
 		Magnet: req.Magnet, Arr: req.Arr, Name: entry.Name, DownloadUncached: intent.DownloadUncached, Files: make(map[string]debridTypes.File)}

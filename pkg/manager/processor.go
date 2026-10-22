@@ -83,11 +83,29 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 	}
 	debridTorrent, err := m.sendToDebrid(reservation.Context(), importReq, torrent)
 	if err != nil {
+		if unavailable := m.workflowAvailable(); unavailable != nil {
+			// Releasing this reservation must not leave a queued row hidden
+			// behind a transient storage failure that later appears healthy.
+			m.recordWorkflowFault(unavailable)
+			return errors.Join(err, unavailable)
+		}
+		if reservation.Context().Err() != nil && m.ctx.Err() == nil && m.workflowAvailable() == nil {
+			// The HTTP caller may disconnect after the provider accepted work.
+			// Keep the existing capacity reservation and durable intent, but let
+			// the service worker reconcile under its own lifecycle context.
+			job := NewJob(JobTypeTorrent, importReq)
+			job.ID, job.Entry = torrent.InfoHash, torrent
+			if resumeErr := m.submitReservedJob(reservation, job); resumeErr == nil {
+				return fmt.Errorf("provider submission interrupted; recovery queued: %w", err)
+			} else {
+				err = errors.Join(err, resumeErr)
+			}
+		}
 		if isTooManyActiveDownloads(err) && !errors.Is(err, ErrProviderSubmissionPending) {
 			m.logger.Warn().Msgf("Too many active downloads, marking as queued: %s", importReq.Magnet.Name)
 			return m.queueTorrentRetry(importReq, reservation)
 		}
-		if reservation.Context().Err() == nil && m.workflowAvailable() == nil {
+		if m.ctx.Err() == nil && m.workflowAvailable() == nil {
 			if saveErr := m.queue.commitOutcome(torrent, storage.QueueOutcome{Kind: storage.QueueOutcomeFailed, Err: err}); saveErr != nil {
 				m.recordWorkflowFault(saveErr)
 				return errors.Join(err, saveErr)

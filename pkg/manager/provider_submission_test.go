@@ -468,6 +468,7 @@ func TestProviderSubmissionRecoversAcrossRealProcessCrash(t *testing.T) {
 			}
 			provider.delete = func(string) error { t.Fatal("restart deleted existing work"); return nil }
 			provider.check = func(*debridTypes.Torrent) (*debridTypes.Torrent, error) { return remote.Copy(), nil }
+			provider.get = func(string) (*debridTypes.Torrent, error) { return remote.Copy(), nil }
 			if err := m.recoverInterruptedDownloads(context.Background()); err != nil {
 				t.Fatal(err)
 			}

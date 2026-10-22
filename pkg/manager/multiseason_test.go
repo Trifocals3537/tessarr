@@ -39,7 +39,7 @@ func TestMultiSeasonChildrenCompleteThroughWorkflowCheckpoint(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !current.IsComplete || current.State != storage.EntryStatePausedUP || current.LastError != "" {
+		if !current.IsComplete || current.IsDownloading || current.State != storage.EntryStatePausedUP || current.LastError != "" {
 			t.Fatalf("season %s has incomplete checkpoint: %+v", child.Name, current)
 		}
 	}

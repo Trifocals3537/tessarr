@@ -38,6 +38,12 @@ type ContextTorrentLister interface {
 	GetTorrentsContext(context.Context) ([]*types.Torrent, error)
 }
 
+// ContextTorrentGetter reads one transfer, including active work, without
+// selecting files, restarting it, or otherwise mutating provider state.
+type ContextTorrentGetter interface {
+	GetTorrentContext(context.Context, string) (*types.Torrent, error)
+}
+
 // ContextDownloadLinkRefresher is the optional cancellation-aware account
 // link-cache refresh capability used by scheduled provider maintenance.
 type ContextDownloadLinkRefresher interface {

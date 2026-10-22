@@ -284,13 +284,17 @@ func premiumizeTransferStatusError(name, status string) error {
 }
 
 func (pm *Premiumize) GetTorrent(torrentID string) (*types.Torrent, error) {
-	transfers, err := pm.listTransfers()
+	return pm.GetTorrentContext(context.Background(), torrentID)
+}
+
+func (pm *Premiumize) GetTorrentContext(ctx context.Context, torrentID string) (*types.Torrent, error) {
+	transfers, err := pm.listTransfersContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	for _, tr := range transfers {
 		if tr.ID == torrentID {
-			return pm.transferToTorrent(tr, "")
+			return pm.transferToTorrentContext(ctx, tr, "")
 		}
 	}
 	return nil, customerror.TorrentNotFoundError
