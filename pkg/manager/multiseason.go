@@ -3,7 +3,6 @@ package manager
 import (
 	"crypto/md5"
 	"fmt"
-	"maps"
 	"regexp"
 	"sort"
 	"strconv"
@@ -107,13 +106,28 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 			AddedOn:                 time.Now(),
 			Providers:               make(map[string]*storage.ProviderEntry),
 			Files:                   seasonFiles,
+			FileScopeRestricted:     true,
+			SkipMultiSeason:         true,
 		}
 
 		// Copy placement
 		if torrent.IsTorrent() && torrent.OutputName != "" {
 			seasonTorrent.OutputName = storage.NewTorrentOutputName(seasonTorrent.Name, seasonTorrent.InfoHash)
 		}
-		maps.Copy(seasonTorrent.Providers, torrent.Providers)
+		for name, placement := range torrent.Providers {
+			if placement == nil {
+				continue
+			}
+			copy := *placement
+			copy.Files = make(map[string]*storage.ProviderFile, len(seasonFiles))
+			for fileName := range seasonFiles {
+				if file := placement.Files[fileName]; file != nil {
+					fileCopy := *file
+					copy.Files[fileName] = &fileCopy
+				}
+			}
+			seasonTorrent.Providers[name] = &copy
+		}
 		seasonResults = append(seasonResults, seasonTorrent)
 	}
 	return seasonResults

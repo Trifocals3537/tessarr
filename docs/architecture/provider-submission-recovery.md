@@ -77,6 +77,19 @@ queue retirement, season splitting, and copied placement snapshots. All manager
 provider-deletion paths check it, including deferred cleanup. Resolving such a
 fence requires explicit ownership review; automatic clearing is not supported.
 
+Saved submission IDs also check the durable placement-account restriction before
+any recovery lookup or status operation, including cleanup reconciliation before
+the queue placement has been published. Conflicting historical account evidence
+keeps recovery blocked even when current credentials match the latest intent.
+Legacy read-only getters and listers contain panics inside their compatibility
+goroutines and return a sanitized error, including late returns after cancellation.
+
+Season children persist a restricted file scope. Provider refresh matches only
+their original canonical files by stable provider ID or path; it cannot add other
+seasons, replace the child's title, or inflate its size to the parent transfer.
+Readiness requires every scoped file and its link, while unrelated seasons do not
+block the child. Child placement maps are independent copies limited to that scope.
+
 Fresh acknowledged attempts retain the existing bounded rollback behavior.
 Cleanup intent is durable before DELETE, and successful cleanup is checkpointed
 before another provider may be attempted. Failed cleanup stops fallback.

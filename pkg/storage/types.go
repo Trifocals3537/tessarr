@@ -102,6 +102,9 @@ type Entry struct {
 
 	// Files (from debrid cache)
 	Files map[string]*File `msgpack:"files" json:"files"` // filename -> File details
+	// FileScopeRestricted pins a synthetic season child to its canonical files.
+	// A provider refresh must never expand it back into the parent transfer.
+	FileScopeRestricted bool `msgpack:"file_scope_restricted,omitempty" json:"-"`
 
 	State TorrentState `msgpack:"state" json:"state"` // This is for QBitTorrent compatibility
 	// Provider State (from active providerEntry)
@@ -380,6 +383,9 @@ func (e *Entry) AddTorrentProvider(debridTorrent *debridTypes.Torrent) (*Provide
 	for _, f := range debridTorrent.GetFiles() {
 		canonicalName := canonicalNames[f.Name]
 		if canonicalName == "" {
+			if e.FileScopeRestricted {
+				continue
+			}
 			return nil, fmt.Errorf("provider file %q has no canonical identity", f.Name)
 		}
 		if _, exists := providerEntry.Files[canonicalName]; exists {
@@ -447,6 +453,9 @@ func (e *Entry) reconcileTorrentFiles(remote *debridTypes.Torrent) (map[string]s
 		canonicalNames[file.Name] = file.Name
 	}
 	if len(e.Files) == 0 {
+		if e.FileScopeRestricted {
+			return nil, ErrIncompleteProviderFileScope
+		}
 		return canonicalNames, nil
 	}
 
@@ -559,7 +568,20 @@ func (e *Entry) reconcileTorrentFiles(remote *debridTypes.Torrent) (map[string]s
 		}
 	}
 
-	canChangeLocalIdentity := !torrentArtifactsMayExist(e)
+	if e.FileScopeRestricted {
+		for name, file := range e.Files {
+			if file == nil || (!file.Deleted && canonicalToRemote[name] == "") {
+				return nil, fmt.Errorf("%w: %q", ErrIncompleteProviderFileScope, name)
+			}
+		}
+		for name := range remoteFiles {
+			if remoteToCanonical[name] == "" {
+				delete(remoteFiles, name)
+				delete(canonicalNames, name)
+			}
+		}
+	}
+	canChangeLocalIdentity := !e.FileScopeRestricted && !torrentArtifactsMayExist(e)
 	renames := make(map[string]string)
 	for oldName, newName := range canonicalToRemote {
 		if canChangeLocalIdentity && oldName != newName {

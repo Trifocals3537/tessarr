@@ -374,8 +374,10 @@ type EntryProto struct {
 	HandoffReason  string `protobuf:"bytes,48,opt,name=handoff_reason,json=handoffReason,proto3" json:"handoff_reason,omitempty"`
 	// Original request policy: inherit, allow, or deny. Empty is a legacy row.
 	AdmissionUncachedPolicy string `protobuf:"bytes,49,opt,name=admission_uncached_policy,json=admissionUncachedPolicy,proto3" json:"admission_uncached_policy,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Synthetic season children retain their exact file scope across refresh.
+	FileScopeRestricted bool `protobuf:"varint,50,opt,name=file_scope_restricted,json=fileScopeRestricted,proto3" json:"file_scope_restricted,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *EntryProto) Reset() {
@@ -749,6 +751,13 @@ func (x *EntryProto) GetAdmissionUncachedPolicy() string {
 		return x.AdmissionUncachedPolicy
 	}
 	return ""
+}
+
+func (x *EntryProto) GetFileScopeRestricted() bool {
+	if x != nil {
+		return x.FileScopeRestricted
+	}
+	return false
 }
 
 type EntryItemProto struct {
@@ -1363,7 +1372,7 @@ const file_pkg_storage_storage_proto_rawDesc = "" +
 	"\n" +
 	"FilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x120\n" +
-	"\x05value\x18\x02 \x01(\v2\x1a.storage.ProviderFileProtoR\x05value:\x028\x01\"\xb9\x0f\n" +
+	"\x05value\x18\x02 \x01(\v2\x1a.storage.ProviderFileProtoR\x05value:\x028\x01\"\xed\x0f\n" +
 	"\n" +
 	"EntryProto\x12\x1a\n" +
 	"\bprotocol\x18\x01 \x01(\tR\bprotocol\x12\x1b\n" +
@@ -1420,7 +1429,8 @@ const file_pkg_storage_storage_proto_rawDesc = "" +
 	"\x0fclient_endpoint\x18. \x01(\tR\x0eclientEndpoint\x12'\n" +
 	"\x0fterminal_checks\x18/ \x01(\x05R\x0eterminalChecks\x12%\n" +
 	"\x0ehandoff_reason\x180 \x01(\tR\rhandoffReason\x12:\n" +
-	"\x19admission_uncached_policy\x181 \x01(\tR\x17admissionUncachedPolicy\x1aY\n" +
+	"\x19admission_uncached_policy\x181 \x01(\tR\x17admissionUncachedPolicy\x122\n" +
+	"\x15file_scope_restricted\x182 \x01(\bR\x13fileScopeRestricted\x1aY\n" +
 	"\x0eProvidersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x121\n" +
 	"\x05value\x18\x02 \x01(\v2\x1b.storage.ProviderEntryProtoR\x05value:\x028\x01\x1aL\n" +

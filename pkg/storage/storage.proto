@@ -113,6 +113,8 @@ message EntryProto {
   string handoff_reason = 48;
   // Original request policy: inherit, allow, or deny. Empty is a legacy row.
   string admission_uncached_policy = 49;
+  // Synthetic season children retain their exact file scope across refresh.
+  bool file_scope_restricted = 50;
 }
 
 // ============================================================================

@@ -11,6 +11,7 @@ import (
 	"github.com/Trifocals3537/tessarr/internal/config"
 	"github.com/Trifocals3537/tessarr/internal/customerror"
 	"github.com/Trifocals3537/tessarr/internal/request"
+	"github.com/Trifocals3537/tessarr/internal/workflow"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
 	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
@@ -183,8 +184,12 @@ func getProviderTorrent(ctx context.Context, client debrid.Client, id string) (*
 	}
 	done := make(chan result, 1)
 	go func() {
-		torrent, err := client.GetTorrent(id)
-		done <- result{torrent, err}
+		var torrent *debridTypes.Torrent
+		outcome := workflow.Run(ctx, func(context.Context) (err error) {
+			torrent, err = client.GetTorrent(id)
+			return err
+		})
+		done <- result{torrent, outcome.Err}
 	}()
 	select {
 	case <-ctx.Done():
@@ -203,6 +208,11 @@ func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, e
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if intent.ProviderID != "" {
+		if err := m.verifyPlacementAccount(client, intent.ProviderID); err != nil {
+			return nil, err
+		}
 	}
 	if intent.Phase == storage.SubmissionCleanup {
 		// A cleanup can have succeeded before a crash lost its acknowledgement.

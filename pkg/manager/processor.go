@@ -724,6 +724,18 @@ func applyCompletedTorrentFiles(entry *storage.Entry, torrent *debridTypes.Torre
 	if entry == nil || torrent == nil || torrent.Status != debridTypes.TorrentStatusDownloaded {
 		return false, nil
 	}
+	scoped, scopeErr := entry.ScopeTorrentSnapshot(torrent)
+	if scopeErr != nil {
+		if !errors.Is(scopeErr, storage.ErrIncompleteProviderFileScope) {
+			return false, scopeErr
+		}
+		if err := applyIncompleteDebridTorrentState(entry, torrent); err != nil {
+			return false, err
+		}
+		entry.Status = debridTypes.TorrentStatusDownloading
+		return false, nil
+	}
+	torrent = scoped
 	if !isComplete(torrent.Files) {
 		if err := applyIncompleteDebridTorrentState(entry, torrent); err != nil {
 			return false, err
@@ -799,7 +811,16 @@ func preserveMaterializedTorrentTitle(entry *storage.Entry, remote *debridTypes.
 
 func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTypes.Torrent) {
 	torrent.ActiveProvider = debridTorrent.Debrid
-	if size := debridTorrent.GetSize(); size > 0 || torrent.Size <= 0 {
+	size := debridTorrent.GetSize()
+	if torrent.FileScopeRestricted {
+		size = 0
+		for _, file := range torrent.Files {
+			if file != nil && !file.Deleted {
+				size += file.Size
+			}
+		}
+	}
+	if size > 0 || torrent.Size <= 0 {
 		torrent.Bytes = size
 		torrent.Size = size
 	}
