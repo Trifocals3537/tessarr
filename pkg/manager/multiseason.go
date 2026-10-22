@@ -83,7 +83,8 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 			size += file.Size
 		}
 
-		// Create a season-specific managed torrent
+		// Claim the child before queue publication, including the wait for mount
+		// files. Startup recovery clears the claim if the parent is interrupted.
 		seasonTorrent := &storage.Entry{
 			Protocol:         torrent.Protocol,
 			InfoHash:         seasonInfo.InfoHash,
@@ -96,6 +97,7 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 			SavePath:         torrent.SavePath,
 			Status:           debridTypes.TorrentStatusDownloading,
 			State:            storage.EntryStateDownloading,
+			IsDownloading:    true,
 			ActiveProvider:   torrent.ActiveProvider,
 			Action:           torrent.Action,
 			CreatedAt:        time.Now(),

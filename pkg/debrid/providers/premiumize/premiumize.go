@@ -284,13 +284,17 @@ func premiumizeTransferStatusError(name, status string) error {
 }
 
 func (pm *Premiumize) GetTorrent(torrentID string) (*types.Torrent, error) {
-	transfers, err := pm.listTransfers()
+	return pm.GetTorrentContext(context.Background(), torrentID)
+}
+
+func (pm *Premiumize) GetTorrentContext(ctx context.Context, torrentID string) (*types.Torrent, error) {
+	transfers, err := pm.listTransfersContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	for _, tr := range transfers {
 		if tr.ID == torrentID {
-			return pm.transferToTorrent(tr, "")
+			return pm.transferToTorrentContext(ctx, tr, "")
 		}
 	}
 	return nil, customerror.TorrentNotFoundError
@@ -410,10 +414,6 @@ func (pm *Premiumize) GetTorrentsContext(ctx context.Context) ([]*types.Torrent,
 	return torrents, nil
 }
 
-func (pm *Premiumize) listTransfers() ([]premiumizeTransfer, error) {
-	return pm.listTransfersContext(context.Background())
-}
-
 func (pm *Premiumize) listTransfersContext(ctx context.Context) ([]premiumizeTransfer, error) {
 	var data transferListResponse
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pm.endpoint("/api/transfer/list"), nil)
@@ -424,10 +424,6 @@ func (pm *Premiumize) listTransfersContext(ctx context.Context) ([]premiumizeTra
 		return nil, err
 	}
 	return data.Transfers, nil
-}
-
-func (pm *Premiumize) transferToTorrent(tr premiumizeTransfer, fallbackInfoHash string) (*types.Torrent, error) {
-	return pm.transferToTorrentContext(context.Background(), tr, fallbackInfoHash)
 }
 
 func (pm *Premiumize) transferToTorrentContext(ctx context.Context, tr premiumizeTransfer, fallbackInfoHash string) (*types.Torrent, error) {

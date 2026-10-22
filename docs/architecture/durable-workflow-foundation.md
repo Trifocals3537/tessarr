@@ -8,6 +8,10 @@ format, provider behavior, and deployment platforms. A transactional database
 replacement, durable external-effect outbox, and generic persisted worker leases
 are subsequent milestones; this change does not claim to implement them.
 
+Queue-backed provider creation now has a scoped intent/reconciliation boundary
+in the same append-log stores. See [provider submission recovery](provider-submission-recovery.md)
+for its crash behavior, account fencing, and deliberately unresolved outcomes.
+
 ## Invariants
 
 - Only one process may mutate a configuration directory, storage directory, or
