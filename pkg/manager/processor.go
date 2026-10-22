@@ -224,8 +224,13 @@ func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentSt
 	// placement succeeds applyDebridTorrentToEntry replaces it with the actual
 	// provider. This preserves explicit qBittorrent routing across a restart.
 	torrent.ActiveProvider = importReq.SelectedDebrid
+	torrent.AdmissionUncachedPolicy = storage.UncachedPolicyInherit
 	if importReq.DownloadUncached != nil {
 		torrent.DownloadUncached = *importReq.DownloadUncached
+		torrent.AdmissionUncachedPolicy = storage.UncachedPolicyDeny
+		if *importReq.DownloadUncached {
+			torrent.AdmissionUncachedPolicy = storage.UncachedPolicyAllow
+		}
 	}
 	torrent.OutputName = storage.NewTorrentOutputName(torrent.Name, torrent.InfoHash)
 	torrent.ContentPath = torrent.DownloadPath()
@@ -364,6 +369,9 @@ func freshUncachedProviderStatusProbe(torrent *debridTypes.Torrent) *debridTypes
 func (m *Manager) processQueuedTorrent(ctx context.Context, entry *storage.Entry) error {
 	defer m.processingEntries.Delete(entry.InfoHash)
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.verifySubmissionAccount(entry); err != nil {
 		return err
 	}
 	placement := entry.GetActiveProvider()
@@ -517,7 +525,10 @@ func (m *Manager) processQueuedTorrent(ctx context.Context, entry *storage.Entry
 	// Update entry progress
 	entry.Progress = debridTorrent.Progress / 100.0
 	entry.Speed = debridTorrent.Speed
-	entry.Size = debridTorrent.GetSize()
+	entry.Size = torrentSizeForEntry(entry, debridTorrent)
+	if entry.FileScopeRestricted {
+		entry.Bytes = entry.Size
+	}
 	entry.Seeders = debridTorrent.Seeders
 	entry.UpdatedAt = observedAt
 
@@ -716,6 +727,18 @@ func applyCompletedTorrentFiles(entry *storage.Entry, torrent *debridTypes.Torre
 	if entry == nil || torrent == nil || torrent.Status != debridTypes.TorrentStatusDownloaded {
 		return false, nil
 	}
+	scoped, scopeErr := entry.ScopeTorrentSnapshot(torrent)
+	if scopeErr != nil {
+		if !errors.Is(scopeErr, storage.ErrIncompleteProviderFileScope) {
+			return false, scopeErr
+		}
+		if err := applyIncompleteDebridTorrentState(entry, torrent); err != nil {
+			return false, err
+		}
+		entry.Status = debridTypes.TorrentStatusDownloading
+		return false, nil
+	}
+	torrent = scoped
 	if !isComplete(torrent.Files) {
 		if err := applyIncompleteDebridTorrentState(entry, torrent); err != nil {
 			return false, err
@@ -791,7 +814,8 @@ func preserveMaterializedTorrentTitle(entry *storage.Entry, remote *debridTypes.
 
 func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTypes.Torrent) {
 	torrent.ActiveProvider = debridTorrent.Debrid
-	if size := debridTorrent.GetSize(); size > 0 || torrent.Size <= 0 {
+	size := torrentSizeForEntry(torrent, debridTorrent)
+	if torrent.FileScopeRestricted || size > 0 || torrent.Size <= 0 {
 		torrent.Bytes = size
 		torrent.Size = size
 	}
@@ -802,6 +826,19 @@ func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTyp
 		torrent.OriginalFilename = debridTorrent.OriginalFilename
 	}
 	torrent.UpdatedAt = time.Now()
+}
+
+func torrentSizeForEntry(entry *storage.Entry, remote *debridTypes.Torrent) int64 {
+	if !entry.FileScopeRestricted {
+		return remote.GetSize()
+	}
+	var size int64
+	for _, file := range entry.Files {
+		if file != nil && !file.Deleted {
+			size += file.Size
+		}
+	}
+	return size
 }
 
 // SendToDebrid submits a magnet to debrid service(s) - replaces debrid.Parse
@@ -816,6 +853,7 @@ func (m *Manager) sendToDebrid(ctx context.Context, importRequest *ImportRequest
 	if err := m.validateTorrentImportRequest(importRequest); err != nil {
 		return nil, err
 	}
+	var resolved *resolvedSubmissionRejection
 	if entry != nil {
 		if entry.QueueIncarnation == "" {
 			if err := m.submissionStep(entry, func() error {
@@ -836,7 +874,10 @@ func (m *Manager) sendToDebrid(ctx context.Context, importRequest *ImportRequest
 			return nil, err
 		}
 		if prior != nil && prior.Phase != storage.SubmissionRejected {
-			return m.reconcileSubmission(ctx, importRequest, entry, prior)
+			remote, err := m.reconcileSubmission(ctx, importRequest, entry, prior)
+			if !errors.As(err, &resolved) {
+				return remote, err
+			}
 		}
 	}
 	clients := m.FilterDebrid(func(c common.Client) bool {
@@ -852,6 +893,11 @@ func (m *Manager) sendToDebrid(ctx context.Context, importRequest *ImportRequest
 
 	errs := make([]error, 0, len(clients)*2)
 	cacheMisses := make(map[string]bool, len(clients))
+	if resolved != nil {
+		errs = append(errs, fmt.Errorf("%s submission: %w", resolved.provider, resolved.cause))
+		cacheMisses[resolved.provider] = !resolved.uncached && isTorrentNotCachedError(resolved.cause)
+		m.recordSubmissionRejection(resolved.provider, importRequest.Magnet.InfoHash, importRequest.Magnet.Name, resolved.cause)
+	}
 
 	// Cached-first is a property of the complete provider set, not each
 	// provider in isolation. Trying one provider with uncached downloads enabled
@@ -866,6 +912,9 @@ func (m *Manager) sendToDebrid(ctx context.Context, importRequest *ImportRequest
 			}
 			providerConfig := db.Config()
 			providerName := providerConfig.Name
+			if resolved != nil && providerName == resolved.provider && (pass == 0 || resolved.uncached) {
+				continue
+			}
 			if providerName == "" {
 				providerName = providerConfig.Provider
 			}

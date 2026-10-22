@@ -3,7 +3,6 @@ package manager
 import (
 	"crypto/md5"
 	"fmt"
-	"maps"
 	"regexp"
 	"sort"
 	"strconv"
@@ -86,32 +85,49 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 		// Claim the child before queue publication, including the wait for mount
 		// files. Startup recovery clears the claim if the parent is interrupted.
 		seasonTorrent := &storage.Entry{
-			Protocol:         torrent.Protocol,
-			InfoHash:         seasonInfo.InfoHash,
-			Name:             seasonInfo.Name,
-			OriginalFilename: torrent.OriginalFilename,
-			Size:             size,
-			Bytes:            size,
-			Magnet:           torrent.Magnet,
-			Category:         torrent.Category,
-			SavePath:         torrent.SavePath,
-			Status:           debridTypes.TorrentStatusDownloading,
-			State:            storage.EntryStateDownloading,
-			IsDownloading:    true,
-			ActiveProvider:   torrent.ActiveProvider,
-			Action:           torrent.Action,
-			CreatedAt:        time.Now(),
-			UpdatedAt:        time.Now(),
-			AddedOn:          time.Now(),
-			Providers:        make(map[string]*storage.ProviderEntry),
-			Files:            seasonFiles,
+			Protocol:                torrent.Protocol,
+			InfoHash:                seasonInfo.InfoHash,
+			Name:                    seasonInfo.Name,
+			OriginalFilename:        torrent.OriginalFilename,
+			Size:                    size,
+			Bytes:                   size,
+			Magnet:                  torrent.Magnet,
+			Category:                torrent.Category,
+			SavePath:                torrent.SavePath,
+			Status:                  debridTypes.TorrentStatusDownloading,
+			State:                   storage.EntryStateDownloading,
+			IsDownloading:           true,
+			ActiveProvider:          torrent.ActiveProvider,
+			Action:                  torrent.Action,
+			DownloadUncached:        torrent.DownloadUncached,
+			AdmissionUncachedPolicy: torrent.AdmissionUncachedPolicy,
+			CreatedAt:               time.Now(),
+			UpdatedAt:               time.Now(),
+			AddedOn:                 time.Now(),
+			Providers:               make(map[string]*storage.ProviderEntry),
+			Files:                   seasonFiles,
+			FileScopeRestricted:     true,
+			SkipMultiSeason:         true,
 		}
 
 		// Copy placement
 		if torrent.IsTorrent() && torrent.OutputName != "" {
 			seasonTorrent.OutputName = storage.NewTorrentOutputName(seasonTorrent.Name, seasonTorrent.InfoHash)
 		}
-		maps.Copy(seasonTorrent.Providers, torrent.Providers)
+		for name, placement := range torrent.Providers {
+			if placement == nil {
+				continue
+			}
+			copy := *placement
+			copy.Files = make(map[string]*storage.ProviderFile, len(seasonFiles))
+			for fileName := range seasonFiles {
+				if file := placement.Files[fileName]; file != nil {
+					fileCopy := *file
+					copy.Files[fileName] = &fileCopy
+				}
+			}
+			seasonTorrent.Providers[name] = &copy
+		}
 		seasonResults = append(seasonResults, seasonTorrent)
 	}
 	return seasonResults

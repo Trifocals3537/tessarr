@@ -11,6 +11,7 @@ import (
 	"github.com/Trifocals3537/tessarr/internal/config"
 	"github.com/Trifocals3537/tessarr/internal/customerror"
 	"github.com/Trifocals3537/tessarr/internal/request"
+	"github.com/Trifocals3537/tessarr/internal/workflow"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
 	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
@@ -40,6 +41,17 @@ func definiteSubmissionRejection(err error) bool {
 }
 
 func (m *Manager) verifySubmissionAccount(entry *storage.Entry) error {
+	if placement := entry.GetActiveProvider(); placement != nil && m.storage != nil {
+		account := ""
+		if m.clients != nil {
+			if client := m.ProviderClient(entry.ActiveProvider); client != nil {
+				account = submissionAccount(client.Config())
+			}
+		}
+		if err := m.storage.CheckProviderPlacementAccount(entry.ActiveProvider, placement.ID, account); err != nil {
+			return pendingSubmission(err)
+		}
+	}
 	if entry.QueueIncarnation == "" {
 		return nil // Legacy work predates the submission protocol.
 	}
@@ -55,6 +67,34 @@ func (m *Manager) verifySubmissionAccount(entry *storage.Entry) error {
 		return pendingSubmission(fmt.Errorf("the original provider account is unavailable or has changed"))
 	}
 	return nil
+}
+
+func (m *Manager) verifyPlacementAccount(client debrid.Client, id string) error {
+	if m.storage == nil {
+		return nil
+	}
+	if err := m.storage.CheckProviderPlacementAccount(client.Config().Name, id, submissionAccount(client.Config())); err != nil {
+		return pendingSubmission(err)
+	}
+	return nil
+}
+
+// A recovered, acknowledged refusal has completed its durable rollback. Feed
+// the result into cached-first routing without creating the same attempt again.
+type resolvedSubmissionRejection struct {
+	provider string
+	uncached bool
+	cause    error
+}
+
+func (r *resolvedSubmissionRejection) Error() string { return r.cause.Error() }
+func (r *resolvedSubmissionRejection) Unwrap() error { return r.cause }
+
+func (m *Manager) rejectAcknowledgedSubmission(entry *storage.Entry, intent *storage.ProviderSubmission, client debrid.Client, cause error) error {
+	if err := m.rollbackQueuedProviderTorrent(entry, client, intent.ProviderID); err != nil {
+		return pendingSubmission(errors.Join(cause, err))
+	}
+	return &resolvedSubmissionRejection{provider: intent.Provider, uncached: intent.DownloadUncached, cause: cause}
 }
 
 func (m *Manager) submissionStep(entry *storage.Entry, change func() error) error {
@@ -144,8 +184,12 @@ func getProviderTorrent(ctx context.Context, client debrid.Client, id string) (*
 	}
 	done := make(chan result, 1)
 	go func() {
-		torrent, err := client.GetTorrent(id)
-		done <- result{torrent, err}
+		var torrent *debridTypes.Torrent
+		outcome := workflow.Run(ctx, func(context.Context) (err error) {
+			torrent, err = client.GetTorrent(id)
+			return err
+		})
+		done <- result{torrent, outcome.Err}
 	}()
 	select {
 	case <-ctx.Done():
@@ -164,6 +208,11 @@ func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, e
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if intent.ProviderID != "" {
+		if err := m.verifyPlacementAccount(client, intent.ProviderID); err != nil {
+			return nil, err
+		}
 	}
 	if intent.Phase == storage.SubmissionCleanup {
 		// A cleanup can have succeeded before a crash lost its acknowledgement.
@@ -243,7 +292,18 @@ func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, e
 		}
 	} else {
 		remote, err = checkProviderStatus(ctx, client, stub)
+		if ctx.Err() != nil {
+			return nil, pendingSubmission(ctx.Err())
+		}
+		if remote != nil {
+			if identityErr := submissionIdentity(remote, entry.InfoHash, intent.Provider, intent.ProviderID); identityErr != nil {
+				return nil, identityErr
+			}
+		}
 		if err != nil {
+			if definiteSubmissionRejection(err) || errors.Is(err, debridTypes.ErrTerminalProviderTorrent) {
+				return nil, m.rejectAcknowledgedSubmission(entry, intent, client, err)
+			}
 			return nil, pendingSubmission(err)
 		}
 	}
@@ -256,6 +316,9 @@ func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, e
 	remote.DownloadUncached = intent.DownloadUncached
 	remote.Arr = req.Arr
 	if err := m.validateResolvedTorrentNames(remote, req.Action); err != nil {
+		if !intent.Recovered {
+			return nil, m.rejectAcknowledgedSubmission(entry, intent, client, err)
+		}
 		return nil, pendingSubmission(err)
 	}
 	if err := m.bindSubmission(entry, intent, remote); err != nil {

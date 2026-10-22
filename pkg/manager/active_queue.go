@@ -204,13 +204,25 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 	}
 
 	downloadUncached := entry.DownloadUncached
+	policy := &downloadUncached
+	switch entry.AdmissionUncachedPolicy {
+	case storage.UncachedPolicyInherit:
+		policy = nil
+	case storage.UncachedPolicyAllow:
+		downloadUncached = true
+	case storage.UncachedPolicyDeny:
+		downloadUncached = false
+	case "": // Legacy records retain their persisted effective boolean.
+	default:
+		return nil, fmt.Errorf("invalid queued uncached policy %q", entry.AdmissionUncachedPolicy)
+	}
 	req := NewTorrentRequest(
 		entry.ActiveProvider,
 		downloadFolderForEntry(m.config.DownloadFolder, entry),
 		magnet,
 		m.arr.GetOrCreate(entry.Category),
 		entry.Action,
-		&downloadUncached,
+		policy,
 		entry.CallbackURL,
 		ImportTypeAPI,
 		entry.SkipMultiSeason,

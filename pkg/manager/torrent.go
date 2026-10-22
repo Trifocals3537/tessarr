@@ -10,6 +10,7 @@ import (
 
 	"github.com/Trifocals3537/tessarr/internal/config"
 	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/internal/workflow"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
 	"github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
@@ -139,8 +140,12 @@ func getProviderTorrents(ctx context.Context, client debrid.Client) ([]*types.To
 	}
 	resultCh := make(chan result, 1)
 	go func() {
-		torrents, err := client.GetTorrents()
-		resultCh <- result{torrents: torrents, err: err}
+		var torrents []*types.Torrent
+		outcome := workflow.Run(ctx, func(context.Context) (err error) {
+			torrents, err = client.GetTorrents()
+			return err
+		})
+		resultCh <- result{torrents: torrents, err: outcome.Err}
 	}()
 	select {
 	case <-ctx.Done():
