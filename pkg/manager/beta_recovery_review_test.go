@@ -231,3 +231,47 @@ func TestSeasonChildReadinessRequiresOnlyItsOwnCompleteFiles(t *testing.T) {
 		})
 	}
 }
+
+func TestSeasonChildRecoveryPreservesSizeDuringIncompleteProviderPolling(t *testing.T) {
+	for _, status := range []debridTypes.TorrentStatus{debridTypes.TorrentStatusQueued, debridTypes.TorrentStatusDownloading} {
+		t.Run(string(status), func(t *testing.T) {
+			root := t.TempDir()
+			remote := &debridTypes.Torrent{Id: "42", InfoHash: strings.Repeat("a", 40), Debrid: "torbox", Name: "Example Complete Series", Status: status, Size: 300, Progress: 50}
+			provider := &routingTestClient{cfg: config.Debrid{Name: "torbox"}, check: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) { return remote.Copy(), nil }}
+			m, req := submissionTestManager(t, root, provider)
+			parent := newTorrentQueueEntry(req, debridTypes.TorrentStatusDownloaded)
+			parent.ActiveProvider = "torbox"
+			parent.Providers = map[string]*storage.ProviderEntry{"torbox": {Provider: "torbox", ID: "42"}}
+			child := convertToMultiSeason(parent, []SeasonInfo{{InfoHash: strings.Repeat("b", 40), Name: "Example S01", Files: []*storage.File{{Name: "s1.mkv", Size: 100}}}})[0]
+			child.Files["deleted.mkv"] = &storage.File{Name: "deleted.mkv", Size: 900, Deleted: true}
+			if err := m.queue.Add(child); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.storage.Close(); err != nil {
+				t.Fatal(err)
+			}
+			restarted, _ := submissionTestManager(t, root, provider)
+			restarted.processingEntries = xsync.NewMap[string, struct{}]()
+			if err := restarted.recoverInterruptedDownloads(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			current, err := restarted.queue.GetTorrent(child.InfoHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.IsDownloading || !current.FileScopeRestricted {
+				t.Fatal("fixture did not resume a scoped child")
+			}
+			if err := restarted.processQueuedTorrent(t.Context(), current); err != nil {
+				t.Fatal(err)
+			}
+			polled, err := restarted.queue.GetTorrent(child.InfoHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if polled.Size != 100 || polled.Bytes != 100 || polled.Name != child.Name || polled.IsComplete {
+				t.Fatalf("incomplete parent polling changed child metadata: size=%d bytes=%d name=%s complete=%t", polled.Size, polled.Bytes, polled.Name, polled.IsComplete)
+			}
+		})
+	}
+}
