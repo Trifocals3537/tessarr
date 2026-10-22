@@ -12,8 +12,9 @@ Each queue hash has one current intent in the existing `storage_state` append
 log. It contains a version, attempt UUID, durable queue incarnation, configured
 provider name, primary-account fingerprint, effective uncached policy, phase,
 and an optional provider ID. Credentials, magnets, and provider response bodies
-are not stored in the intent. The fingerprint covers the provider type and
-primary API key; changing that account blocks automatic reconciliation.
+are not stored in the intent. The account tag is a versioned, domain-separated
+HMAC authenticated by the primary API key; changing that account blocks
+automatic reconciliation. It is not a password verifier.
 
 The intent is synchronized before creating remote work. A returned ID is
 synchronized before checking status or publishing a queue placement. The queue

@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -22,9 +23,12 @@ func submissionAccount(cfg config.Debrid) string {
 	if provider == "" {
 		provider = cfg.Name
 	}
-	// Only the primary key creates/lists torrents. Download keys and tuning
-	// changes do not change this account. Never persist the key itself.
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(provider+"\x00"+cfg.APIKey)))
+	// Authenticate a domain-separated account identity with the primary API
+	// key. This is an account-binding MAC, not a password verifier. Download
+	// keys and tuning changes do not change the account used for creation.
+	mac := hmac.New(sha256.New, []byte(cfg.APIKey))
+	_, _ = mac.Write([]byte("tessarr/provider-submission-account/v1\x00" + provider))
+	return fmt.Sprintf("hmac-sha256-v1:%x", mac.Sum(nil))
 }
 
 func pendingSubmission(err error) error {

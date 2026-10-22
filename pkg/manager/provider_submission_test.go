@@ -97,6 +97,26 @@ func submittedTestTorrent(hash, id string) *debridTypes.Torrent {
 		Files: map[string]debridTypes.File{"Example.mkv": {Id: "file", Name: "Example.mkv", Size: 100, Link: "https://example.invalid/media"}}}
 }
 
+func TestSubmissionAccountTagPinsPrimaryKeyAndProvider(t *testing.T) {
+	cfg := config.Debrid{Name: "primary", Provider: "torbox", APIKey: "fixture-original-key"}
+	tag := submissionAccount(cfg)
+	if !strings.HasPrefix(tag, "hmac-sha256-v1:") || strings.Contains(tag, cfg.APIKey) {
+		t.Fatal("account tag is unversioned or exposes the credential")
+	}
+	cfg.DownloadAPIKeys, cfg.Workers = []string{"different-download-key"}, 17
+	if submissionAccount(cfg) != tag {
+		t.Fatal("download-only settings changed creation identity")
+	}
+	cfg.APIKey = "fixture-new-key"
+	if submissionAccount(cfg) == tag {
+		t.Fatal("credential rotation retained old account authority")
+	}
+	cfg.APIKey, cfg.Provider = "fixture-original-key", "realdebrid"
+	if submissionAccount(cfg) == tag {
+		t.Fatal("a different provider retained old account authority")
+	}
+}
+
 func TestProviderSubmissionTimeoutReconcilesWithoutCreateOrDelete(t *testing.T) {
 	for _, matches := range []int{0, 1, 2} {
 		t.Run(string(rune('0'+matches)), func(t *testing.T) {
