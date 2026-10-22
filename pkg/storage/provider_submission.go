@@ -233,9 +233,6 @@ func (s *Storage) RecordProviderSubmissionID(expected *Entry, attempt, id string
 				return err
 			}
 		}
-		if err := s.bindPlacementAccount(intent.Provider, id, intent.Account); err != nil {
-			return err
-		}
 		intent.ProviderID, intent.Recovered = id, recovered
 		return s.saveSubmission(intent)
 	})

@@ -75,7 +75,6 @@ type Storage struct {
 	migrationCleanupMu     sync.Mutex
 	torrentSourcesMu       sync.Mutex
 	torrentSourceBytes     int64
-	providerPlacementMu    sync.Mutex // Lifecycle gate precedes this mutex; never held across provider calls.
 }
 
 func createItemStores(baseDir string, baseConfig hybrid.Config) (map[string]*hybrid.Store, error) {
@@ -164,11 +163,6 @@ func NewStorage(dbPath string) (*Storage, error) {
 		mainEntries:      newMainEntryLifecycle(),
 		dir:              dbPath,
 		logger:           log,
-	}
-
-	if err := s.recoverProviderPlacementAccounts(); err != nil {
-		_ = s.Close()
-		return nil, fmt.Errorf("recover provider placement accounts: %w", err)
 	}
 
 	needsEntryItemRecovery, err := s.beginEntryItemSession()
