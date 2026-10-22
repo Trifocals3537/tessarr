@@ -414,10 +414,6 @@ func (pm *Premiumize) GetTorrentsContext(ctx context.Context) ([]*types.Torrent,
 	return torrents, nil
 }
 
-func (pm *Premiumize) listTransfers() ([]premiumizeTransfer, error) {
-	return pm.listTransfersContext(context.Background())
-}
-
 func (pm *Premiumize) listTransfersContext(ctx context.Context) ([]premiumizeTransfer, error) {
 	var data transferListResponse
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pm.endpoint("/api/transfer/list"), nil)
@@ -428,10 +424,6 @@ func (pm *Premiumize) listTransfersContext(ctx context.Context) ([]premiumizeTra
 		return nil, err
 	}
 	return data.Transfers, nil
-}
-
-func (pm *Premiumize) transferToTorrent(tr premiumizeTransfer, fallbackInfoHash string) (*types.Torrent, error) {
-	return pm.transferToTorrentContext(context.Background(), tr, fallbackInfoHash)
 }
 
 func (pm *Premiumize) transferToTorrentContext(ctx context.Context, tr premiumizeTransfer, fallbackInfoHash string) (*types.Torrent, error) {
