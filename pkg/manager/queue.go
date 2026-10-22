@@ -87,6 +87,7 @@ func NewNZBRequest(name, downloadFolder string, nzbContent []byte, arr *arr.Arr,
 }
 
 type Queue struct {
+	outcomes           queueOutcomeStore
 	storage            *storage.Storage
 	logger             zerolog.Logger
 	removeStalledAfter time.Duration
@@ -119,6 +120,7 @@ func newQueue(storage *storage.Storage, removeStalledAfterStr string, lifecycles
 		}
 	}
 
+	q.outcomes = storage
 	return q
 }
 

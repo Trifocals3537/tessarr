@@ -11,6 +11,34 @@ import (
 	"time"
 )
 
+// ErrLocked means another owner holds the advisory lock.
+var ErrLocked = errors.New("state is already in use")
+
+// TryAcquire acquires a rooted exclusive lock without waiting. Lock files are
+// permanent coordination entries: callers must never unlink them on release.
+func TryAcquire(rooted *os.Root, name string, perm os.FileMode) (*Lock, error) {
+	if rooted == nil || name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+		return nil, fmt.Errorf("invalid rooted lock name %q", name)
+	}
+	file, err := openVerified(rooted, name, perm)
+	if err != nil {
+		return nil, err
+	}
+	locked, err := tryExclusive(file)
+	if err != nil || !locked {
+		closeErr := file.Close()
+		if err == nil {
+			err = ErrLocked
+		}
+		return nil, errors.Join(err, closeErr)
+	}
+	lock := &Lock{file: file, locked: true}
+	if err := verifyOpened(rooted, name, file, nil); err != nil {
+		return nil, errors.Join(err, lock.Close())
+	}
+	return lock, nil
+}
+
 // Lock owns both the locked file descriptor and its advisory lock. The file is
 // opened through an os.Root so acquisition never re-resolves an absolute path.
 type Lock struct {
@@ -47,7 +75,11 @@ func AcquireContext(ctx context.Context, rooted *os.Root, name string, perm os.F
 			return nil, fmt.Errorf("lock rooted file %q: %w", name, lockErr)
 		}
 		if locked {
-			return &Lock{file: file, locked: true}, nil
+			lock := &Lock{file: file, locked: true}
+			if err := verifyOpened(rooted, name, file, nil); err != nil {
+				return nil, errors.Join(err, lock.Close())
+			}
+			return lock, nil
 		}
 
 		timer := time.NewTimer(retryDelay)

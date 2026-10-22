@@ -83,25 +83,30 @@ func convertToMultiSeason(torrent *storage.Entry, seasons []SeasonInfo) []*stora
 			size += file.Size
 		}
 
-		// Create a season-specific managed torrent
+		// Claim the child before queue publication, including the wait for mount
+		// files. Startup recovery clears the claim if the parent is interrupted.
 		seasonTorrent := &storage.Entry{
-			Protocol:         torrent.Protocol,
-			InfoHash:         seasonInfo.InfoHash,
-			Name:             seasonInfo.Name,
-			OriginalFilename: torrent.OriginalFilename,
-			Size:             size,
-			Bytes:            size,
-			Magnet:           torrent.Magnet,
-			Category:         torrent.Category,
-			SavePath:         torrent.SavePath,
-			Status:           debridTypes.TorrentStatusDownloading,
-			ActiveProvider:   torrent.ActiveProvider,
-			Action:           torrent.Action,
-			CreatedAt:        time.Now(),
-			UpdatedAt:        time.Now(),
-			AddedOn:          time.Now(),
-			Providers:        make(map[string]*storage.ProviderEntry),
-			Files:            seasonFiles,
+			Protocol:                torrent.Protocol,
+			InfoHash:                seasonInfo.InfoHash,
+			Name:                    seasonInfo.Name,
+			OriginalFilename:        torrent.OriginalFilename,
+			Size:                    size,
+			Bytes:                   size,
+			Magnet:                  torrent.Magnet,
+			Category:                torrent.Category,
+			SavePath:                torrent.SavePath,
+			Status:                  debridTypes.TorrentStatusDownloading,
+			State:                   storage.EntryStateDownloading,
+			IsDownloading:           true,
+			ActiveProvider:          torrent.ActiveProvider,
+			Action:                  torrent.Action,
+			DownloadUncached:        torrent.DownloadUncached,
+			AdmissionUncachedPolicy: torrent.AdmissionUncachedPolicy,
+			CreatedAt:               time.Now(),
+			UpdatedAt:               time.Now(),
+			AddedOn:                 time.Now(),
+			Providers:               make(map[string]*storage.ProviderEntry),
+			Files:                   seasonFiles,
 		}
 
 		// Copy placement

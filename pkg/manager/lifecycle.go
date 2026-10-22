@@ -69,6 +69,12 @@ func (m *Manager) ReadinessStatus() RuntimeStatus {
 	}
 	status.MountReady = !status.MountConfigured || mount.IsReady()
 	status.Ready = status.Phase == LifecyclePhaseReady && status.MountReady
+	if status.Phase == LifecyclePhaseReady && m.workflowAvailable() != nil {
+		status.Phase = LifecyclePhaseDegraded
+		status.Ready = false
+		status.Message = "workflow persistence is unavailable"
+		return status
+	}
 	if status.Phase == LifecyclePhaseReady && !status.MountReady {
 		status.Phase = LifecyclePhaseDegraded
 		status.Message = "media mount is not ready"
