@@ -48,6 +48,10 @@ incomplete, inconsistent, or failed snapshots remain unresolved. In particular,
 an empty listing is not proof that a timed-out create failed.
 Later queued polling and uncached Arr handoff also reject destructive cleanup
 authorization derived only from a recovered hash match.
+That negative cleanup fence is keyed by configured provider and ID and survives
+queue retirement, season splitting, and copied placement snapshots. All manager
+provider-deletion paths check it, including deferred cleanup. Resolving such a
+fence requires explicit ownership review; automatic clearing is not supported.
 
 Fresh acknowledged attempts retain the existing bounded rollback behavior.
 Cleanup intent is durable before DELETE, and successful cleanup is checkpointed

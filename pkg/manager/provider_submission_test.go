@@ -187,6 +187,47 @@ func TestProviderCreateHTTPFailureIsNotReplayedByTransport(t *testing.T) {
 	}
 }
 
+func TestRecoveredPlacementCannotBeDeletedThroughSeasonChildren(t *testing.T) {
+	deletes := 0
+	provider := &routingTestClient{cfg: config.Debrid{Name: "torbox"}, delete: func(string) error { deletes++; return nil }}
+	m, req := submissionTestManager(t, t.TempDir(), provider)
+	parent := submissionTestEntry(t, m, req)
+	intent, _, err := m.storage.BeginProviderSubmission(parent, "torbox", submissionAccount(provider.cfg), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.storage.RecordProviderSubmissionID(parent, intent.Attempt, "matched", true); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := m.storage.BindProviderSubmission(parent, intent.Attempt, submittedTestTorrent(parent.InfoHash, "matched"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshSubmissionEntry(parent, bound)
+	child := convertToMultiSeason(parent, []SeasonInfo{{SeasonNumber: 1, InfoHash: strings.Repeat("b", 40), Name: "Example S01", Files: []*storage.File{{Name: "Example.S01E01.mkv", Size: 100}}}})[0]
+	if err := m.queue.Add(child); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.queue.DeleteEntryOnly(parent.InfoHash); err != nil {
+		t.Fatal(err)
+	}
+	if child.GetActiveProvider() == nil || child.GetActiveProvider().ID != "matched" {
+		t.Fatal("producer did not inherit provider placement")
+	}
+	if err := m.RemoveFromProvider(child.GetActiveProvider()); !errors.Is(err, storage.ErrRecoveredProviderPlacement) {
+		t.Fatal("season cleanup acquired unowned placement", err)
+	}
+	if err := m.deleteProviderTorrent(provider, "matched"); !errors.Is(err, storage.ErrRecoveredProviderPlacement) {
+		t.Fatal("rollback bypassed retired parent fence", err)
+	}
+	if deletes != 0 {
+		t.Fatalf("deleted an unowned provider placement %d times", deletes)
+	}
+	if err := m.deleteProviderTorrent(provider, "other"); err != nil || deletes != 1 {
+		t.Fatalf("unrelated cleanup was blocked: %d %v", deletes, err)
+	}
+}
+
 func TestPendingProviderSubmissionPinsAccountAndRejectsIncompleteHashMatch(t *testing.T) {
 	provider := &submissionTestProvider{routingTestClient: &routingTestClient{cfg: config.Debrid{Name: "torbox", APIKey: "original"}}}
 	m, req := submissionTestManager(t, t.TempDir(), provider)

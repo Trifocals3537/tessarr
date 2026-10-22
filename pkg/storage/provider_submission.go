@@ -14,6 +14,28 @@ import (
 )
 
 var ErrProviderSubmissionConflict = errors.New("provider submission requires reconciliation of its original queue incarnation")
+var ErrRecoveredProviderPlacement = errors.New("hash-recovered provider placement requires ownership review before cleanup")
+
+func recoveredPlacementKey(provider, id string) string {
+	return "recovered_submission_placement/" + hex.EncodeToString([]byte(normalizeMainEntryProvider(provider))) + "/" + hex.EncodeToString([]byte(id))
+}
+
+// IsRecoveredProviderPlacement follows a placement across season children,
+// copied snapshots and retired queue rows. A later acknowledgement or account
+// name reuse must not silently turn that negative fence into deletion authority.
+func (s *Storage) IsRecoveredProviderPlacement(provider, id string) (bool, error) {
+	data, err := s.storageState.Get(recoveredPlacementKey(provider, id))
+	if hybrid.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if string(data) != "unowned-v1" {
+		return false, fmt.Errorf("invalid recovered placement fence")
+	}
+	return true, nil
+}
 
 type ProviderSubmissionPhase string
 
@@ -202,6 +224,14 @@ func (s *Storage) RecordProviderSubmissionID(expected *Entry, attempt, id string
 	return s.withSubmission(expected, func(_ *Entry, intent *ProviderSubmission) error {
 		if intent == nil || intent.Attempt != attempt || intent.Phase != SubmissionPending || strings.TrimSpace(id) == "" || (intent.ProviderID != "" && (intent.ProviderID != id || intent.Recovered != recovered)) {
 			return ErrProviderSubmissionConflict
+		}
+		if recovered {
+			if err := s.storageState.Put(recoveredPlacementKey(intent.Provider, id), []byte("unowned-v1"), nil); err != nil {
+				return err
+			}
+			if err := s.storageState.Sync(); err != nil {
+				return err
+			}
 		}
 		intent.ProviderID, intent.Recovered = id, recovered
 		return s.saveSubmission(intent)

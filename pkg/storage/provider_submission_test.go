@@ -215,8 +215,38 @@ func TestHashRecoveredPlacementCannotAuthorizeUncachedArrCleanup(t *testing.T) {
 	if !FailedUncachedHandoff(current) {
 		t.Fatal("fixture did not reach destructive handoff eligibility")
 	}
-	if err := s.AuthorizeUncachedHandoff(current); !errors.Is(err, ErrProviderSubmissionConflict) {
+	if err := s.AuthorizeUncachedHandoff(current); !errors.Is(err, ErrRecoveredProviderPlacement) {
 		t.Fatal("hash match granted Arr cleanup ownership", err)
+	}
+}
+
+func TestRecoveredPlacementFenceSurvivesQueueRetirementAndRestart(t *testing.T) {
+	s, entry := submissionStorageFixture(t)
+	intent, _, err := s.BeginProviderSubmission(entry, "provider", "account", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordProviderSubmissionID(entry, intent.Attempt, "matched", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteQueued(entry.InfoHash, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewStorage(s.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	protected, err := reopened.IsRecoveredProviderPlacement("provider", "matched")
+	if err != nil || !protected {
+		t.Fatalf("retired placement lost ownership fence: %t %v", protected, err)
+	}
+	protected, err = reopened.IsRecoveredProviderPlacement("provider", "other")
+	if err != nil || protected {
+		t.Fatalf("fence expanded to unrelated ID: %t %v", protected, err)
 	}
 }
 
