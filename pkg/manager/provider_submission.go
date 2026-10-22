@@ -1,0 +1,342 @@
+package manager
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/customerror"
+	"github.com/Trifocals3537/tessarr/internal/request"
+	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
+	"github.com/Trifocals3537/tessarr/pkg/storage"
+)
+
+var ErrProviderSubmissionPending = errors.New("provider submission outcome uncertain; retry reconciles the existing attempt before submitting again")
+
+func submissionAccount(cfg config.Debrid) string {
+	provider := cfg.Provider
+	if provider == "" {
+		provider = cfg.Name
+	}
+	// Only the primary key creates/lists torrents. Download keys and tuning
+	// changes do not change this account. Never persist the key itself.
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(provider+"\x00"+cfg.APIKey)))
+}
+
+func pendingSubmission(err error) error {
+	return errors.Join(ErrProviderSubmissionPending, err)
+}
+
+func definiteSubmissionRejection(err error) bool {
+	return isTorrentNotCachedError(err) || isTooManyActiveDownloads(err) || isTorrentContentRejection(err)
+}
+
+func (m *Manager) verifySubmissionAccount(entry *storage.Entry) error {
+	if entry.QueueIncarnation == "" {
+		return nil // Legacy work predates the submission protocol.
+	}
+	intent, err := m.queue.storage.GetProviderSubmission(entry)
+	if err != nil {
+		return err
+	}
+	if intent == nil || intent.Phase == storage.SubmissionRejected {
+		return nil
+	}
+	client := m.ProviderClient(intent.Provider)
+	if client == nil || client.Config().Name != intent.Provider || submissionAccount(client.Config()) != intent.Account {
+		return pendingSubmission(fmt.Errorf("the original provider account is unavailable or has changed"))
+	}
+	return nil
+}
+
+func (m *Manager) submissionStep(entry *storage.Entry, change func() error) error {
+	if m.queue == nil || m.storage == nil {
+		return fmt.Errorf("provider submission storage is unavailable")
+	}
+	err := m.queue.lifecycle.withUpdate(entry, change)
+	if errors.Is(err, storage.ErrProviderSubmissionConflict) {
+		return pendingSubmission(err)
+	}
+	if err != nil {
+		m.recordWorkflowFault(err)
+	}
+	return err
+}
+
+func (m *Manager) bindSubmission(entry *storage.Entry, intent *storage.ProviderSubmission, remote *debridTypes.Torrent) error {
+	return m.submissionStep(entry, func() error {
+		updated, err := m.storage.BindProviderSubmission(entry, intent.Attempt, remote)
+		if err != nil {
+			return err
+		}
+		refreshSubmissionEntry(entry, updated)
+		return nil
+	})
+}
+
+func refreshSubmissionEntry(entry, updated *storage.Entry) {
+	updated.QueueGeneration = entry.QueueGeneration
+	updated.MainGeneration = entry.MainGeneration
+	updated.MainProviderSnapshot = entry.MainProviderSnapshot
+	updated.MainMutationProvider = entry.MainMutationProvider
+	updated.MainReimportIncarnation = entry.MainReimportIncarnation
+	*entry = *updated
+}
+
+// Normal provider polling may also request rollback after binding. Preserve the
+// same account/ID scope and never convert a recovered hash match into deletion
+// authority. Legacy queue placements keep their existing cleanup behavior.
+func (m *Manager) rollbackQueuedProviderTorrent(entry *storage.Entry, client debrid.Client, id string) error {
+	if entry.QueueIncarnation == "" {
+		return m.deleteProviderTorrent(client, id)
+	}
+	intent, err := m.queue.storage.GetProviderSubmission(entry)
+	if err != nil {
+		return err
+	}
+	if intent == nil {
+		return m.deleteProviderTorrent(client, id)
+	}
+	if intent.Recovered || client == nil || intent.Provider != client.Config().Name || intent.ProviderID != id || intent.Account != submissionAccount(client.Config()) {
+		return pendingSubmission(fmt.Errorf("automatic rollback lacks acknowledged provider ownership"))
+	}
+	if err := m.submissionStep(entry, func() error {
+		return m.storage.SetProviderSubmissionPhase(entry, intent.Attempt, storage.SubmissionCleanup)
+	}); err != nil {
+		return err
+	}
+	if err := m.deleteProviderTorrent(client, id); err != nil {
+		return pendingSubmission(err)
+	}
+	return m.submissionStep(entry, func() error {
+		return m.storage.SetProviderSubmissionPhase(entry, intent.Attempt, storage.SubmissionRejected)
+	})
+}
+
+func submissionIdentity(remote *debridTypes.Torrent, hash, provider, id string) error {
+	if remote == nil || remote.Id == "" || remote.Id != id || (remote.InfoHash != "" && !strings.EqualFold(remote.InfoHash, hash)) || (remote.Debrid != "" && remote.Debrid != provider) {
+		return pendingSubmission(fmt.Errorf("provider returned a different or incomplete transfer identity"))
+	}
+	remote.InfoHash, remote.Debrid = hash, provider
+	return nil
+}
+
+// reconcileSubmission never creates remote work or deletes hash matches. An
+// empty/eventually-consistent listing is not proof that a timed-out POST failed.
+func (m *Manager) reconcileSubmission(ctx context.Context, req *ImportRequest, entry *storage.Entry, intent *storage.ProviderSubmission) (*debridTypes.Torrent, error) {
+	client := m.ProviderClient(intent.Provider)
+	if client == nil || client.Config().Name != intent.Provider || submissionAccount(client.Config()) != intent.Account {
+		return nil, pendingSubmission(fmt.Errorf("the original provider account is unavailable or has changed"))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if intent.Phase == storage.SubmissionCleanup {
+		// A cleanup can have succeeded before a crash lost its acknowledgement.
+		// Do not replay DELETE against a potentially reused ID. Only an explicit
+		// typed absence from the original account permits routing to continue.
+		_, err := client.GetTorrent(intent.ProviderID)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !errors.Is(err, customerror.TorrentNotFoundError) {
+			return nil, pendingSubmission(fmt.Errorf("the prior rollback requires confirmed provider absence"))
+		}
+		if err := m.submissionStep(entry, func() error {
+			return m.storage.SetProviderSubmissionPhase(entry, intent.Attempt, storage.SubmissionRejected)
+		}); err != nil {
+			return nil, err
+		}
+		return m.sendToDebrid(ctx, req, entry)
+	}
+	listed, err := getProviderTorrents(ctx, client)
+	if err != nil {
+		return nil, pendingSubmission(err)
+	}
+	matches := make(map[string]*debridTypes.Torrent)
+	for _, torrent := range listed {
+		if torrent == nil || !strings.EqualFold(torrent.InfoHash, entry.InfoHash) || strings.TrimSpace(torrent.Id) == "" || (intent.ProviderID != "" && torrent.Id != intent.ProviderID) {
+			continue
+		}
+		if torrent.Debrid != "" && torrent.Debrid != intent.Provider {
+			return nil, pendingSubmission(fmt.Errorf("provider listing changed account identity"))
+		}
+		matches[torrent.Id] = torrent
+	}
+	if len(matches) != 1 {
+		return nil, pendingSubmission(fmt.Errorf("provider reconciliation found %d matching IDs; inspect the original provider account", len(matches)))
+	}
+	var observed *debridTypes.Torrent
+	for _, torrent := range matches {
+		observed = torrent.Copy()
+	}
+	if intent.ProviderID == "" {
+		intent.ProviderID, intent.Recovered = observed.Id, true
+		if err := m.submissionStep(entry, func() error {
+			return m.storage.RecordProviderSubmissionID(entry, intent.Attempt, intent.ProviderID, true)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	stub := &debridTypes.Torrent{Id: intent.ProviderID, InfoHash: entry.InfoHash, Debrid: intent.Provider,
+		Magnet: req.Magnet, Arr: req.Arr, Name: entry.Name, DownloadUncached: intent.DownloadUncached, Files: make(map[string]debridTypes.File)}
+	remote := observed
+	if intent.Recovered {
+		// A hash match proves content, not ownership of an in-progress create.
+		// Reuse only completed content; never select files or roll it back.
+		if remote.Status != debridTypes.TorrentStatusDownloaded {
+			return nil, pendingSubmission(fmt.Errorf("the matching provider transfer is not complete"))
+		}
+	} else {
+		remote, err = checkProviderStatus(ctx, client, stub)
+		if err != nil {
+			return nil, pendingSubmission(err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := submissionIdentity(remote, entry.InfoHash, intent.Provider, intent.ProviderID); err != nil {
+		return nil, err
+	}
+	remote.DownloadUncached = intent.DownloadUncached
+	remote.Arr = req.Arr
+	if err := m.validateResolvedTorrentNames(remote, req.Action); err != nil {
+		return nil, pendingSubmission(err)
+	}
+	if err := m.bindSubmission(entry, intent, remote); err != nil {
+		return nil, err
+	}
+	return remote, nil
+}
+
+// submitRoutedCandidate shares normal routing validation with the low-level
+// router, while queue-backed callers checkpoint each external-effect boundary.
+func (m *Manager) submitRoutedCandidate(ctx context.Context, client debrid.Client, candidate *debridTypes.Torrent, req *ImportRequest, entry *storage.Entry) (*debridTypes.Torrent, error) {
+	var intent *storage.ProviderSubmission
+	if entry != nil {
+		var created bool
+		if err := m.submissionStep(entry, func() (err error) {
+			intent, created, err = m.storage.BeginProviderSubmission(entry, client.Config().Name, submissionAccount(client.Config()), candidate.DownloadUncached)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+		if !created {
+			return m.reconcileSubmission(ctx, req, entry, intent)
+		}
+	}
+	createCtx := ctx
+	if intent != nil {
+		createCtx = request.WithMutationAttempt(ctx)
+	}
+	ack, err := submitProviderMagnet(createCtx, client, candidate)
+	if intent != nil {
+		id := candidate.Id
+		if ack != nil && ack.Id != "" {
+			id = ack.Id
+		}
+		if id != "" {
+			if saveErr := m.submissionStep(entry, func() error {
+				return m.storage.RecordProviderSubmissionID(entry, intent.Attempt, id, false)
+			}); saveErr != nil {
+				return nil, saveErr
+			}
+			intent.ProviderID = id
+		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if intent != nil {
+			return nil, pendingSubmission(ctxErr)
+		}
+		if ack != nil {
+			ctxErr = errors.Join(ctxErr, m.deleteProviderTorrent(client, ack.Id))
+		}
+		return nil, ctxErr
+	}
+	if err != nil || ack == nil || ack.Id == "" {
+		if err == nil {
+			err = fmt.Errorf("provider returned an incomplete submission response")
+		}
+		if intent != nil {
+			if intent.ProviderID != "" || !definiteSubmissionRejection(err) {
+				return nil, pendingSubmission(err)
+			}
+			if saveErr := m.submissionStep(entry, func() error {
+				return m.storage.SetProviderSubmissionPhase(entry, intent.Attempt, storage.SubmissionRejected)
+			}); saveErr != nil {
+				return nil, saveErr
+			}
+		}
+		return nil, err
+	}
+	if intent != nil {
+		if err := submissionIdentity(ack, entry.InfoHash, intent.Provider, intent.ProviderID); err != nil {
+			return nil, err
+		}
+	}
+	ack.Arr = req.Arr
+	remote, statusErr := checkProviderStatus(ctx, client, ack)
+	rollbackID := ack.Id
+	if intent == nil && remote != nil && remote.Id != "" {
+		rollbackID = remote.Id
+	}
+	rollback := func(cause error) error {
+		if intent != nil {
+			if saveErr := m.submissionStep(entry, func() error {
+				return m.storage.SetProviderSubmissionPhase(entry, intent.Attempt, storage.SubmissionCleanup)
+			}); saveErr != nil {
+				return saveErr
+			}
+		}
+		cleanupErr := m.deleteProviderTorrent(client, rollbackID)
+		if intent != nil {
+			if cleanupErr != nil {
+				return pendingSubmission(errors.Join(cause, cleanupErr))
+			}
+			if saveErr := m.submissionStep(entry, func() error {
+				return m.storage.SetProviderSubmissionPhase(entry, intent.Attempt, storage.SubmissionRejected)
+			}); saveErr != nil {
+				return saveErr
+			}
+		}
+		return errors.Join(cause, cleanupErr)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if intent != nil {
+			return nil, pendingSubmission(ctxErr)
+		}
+		return nil, rollback(ctxErr)
+	}
+	if intent != nil && remote != nil {
+		if err := submissionIdentity(remote, entry.InfoHash, intent.Provider, intent.ProviderID); err != nil {
+			return nil, err
+		}
+	}
+	if statusErr != nil {
+		if intent != nil && !definiteSubmissionRejection(statusErr) && !errors.Is(statusErr, debridTypes.ErrTerminalProviderTorrent) {
+			return nil, pendingSubmission(statusErr)
+		}
+		return nil, rollback(statusErr)
+	}
+	if remote == nil {
+		if intent != nil {
+			return nil, pendingSubmission(fmt.Errorf("provider returned no status snapshot"))
+		}
+		return nil, rollback(fmt.Errorf("provider returned nil after checking torrent %s status", ack.Name))
+	}
+	if err := m.validateResolvedTorrentNames(remote, req.Action); err != nil {
+		return nil, rollback(fmt.Errorf("provider returned an unsafe torrent name: %w", err))
+	}
+	if intent != nil {
+		remote.DownloadUncached = intent.DownloadUncached
+		if err := m.bindSubmission(entry, intent, remote); err != nil {
+			return nil, err
+		}
+	}
+	return remote, nil
+}

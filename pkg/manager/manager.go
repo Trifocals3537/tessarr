@@ -625,7 +625,13 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		if ctx.Err() != nil {
 			return
 		}
-		if isTooManyActiveDownloads(err) {
+		// A persistence fault may already have committed part of the provider
+		// checkpoint. Preserve that recoverable row instead of recording a new
+		// terminal failure through a different, still-healthy store.
+		if m.workflowAvailable() != nil {
+			return
+		}
+		if isTooManyActiveDownloads(err) && !errors.Is(err, ErrProviderSubmissionPending) {
 			if commitErr := m.commitJobOutcome(job, storage.QueueOutcome{Kind: storage.QueueOutcomeDeferred}); commitErr != nil {
 				return
 			}

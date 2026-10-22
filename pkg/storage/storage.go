@@ -47,6 +47,7 @@ type Storage struct {
 	mainCleanupSyncForTest func() error
 	queueRowSyncForTest    func() error
 	queueIntentSyncForTest func() error
+	submissionSyncForTest  func() error
 	// Per-key durability latches survive lifecycle-state eviction. Operations
 	// on each key are serialized by its lifecycle lock.
 	handoffPending   sync.Map

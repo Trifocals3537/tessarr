@@ -81,6 +81,13 @@ func (s *Storage) AuthorizeUncachedHandoff(expected *Entry) error {
 	if !FailedUncachedHandoff(current) {
 		return ErrQueuedDeletionIdentityMismatch
 	}
+	intent, err := s.submissionRaw(ref.key)
+	if err != nil {
+		return err
+	}
+	if intent != nil && intent.QueueIncarnation == current.QueueIncarnation && intent.Recovered && intent.Provider == current.ActiveProvider && intent.ProviderID == current.GetActiveProvider().ID {
+		return ErrProviderSubmissionConflict
+	}
 	want, err := handoffFingerprint(expected)
 	if err != nil {
 		return err
