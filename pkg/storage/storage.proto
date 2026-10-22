@@ -111,6 +111,8 @@ message EntryProto {
   string client_endpoint = 46;
   int32 terminal_checks = 47;
   string handoff_reason = 48;
+  // Original request policy: inherit, allow, or deny. Empty is a legacy row.
+  string admission_uncached_policy = 49;
 }
 
 // ============================================================================

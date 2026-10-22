@@ -16,6 +16,15 @@ are not stored in the intent. The account tag is a versioned, domain-separated
 HMAC authenticated by the primary API key; changing that account blocks
 automatic reconciliation. It is not a password verifier.
 
+Acknowledged and hash-recovered provider IDs also retain a durable account
+restriction keyed by configured provider and ID. Polling and every manager
+provider-deletion path check it, so copied placements and season children cannot
+use an old ID in a replacement account after their parent retires. Startup
+reconstructs these restrictions from earlier submission journals before cleanup
+can run. Conflicting recorded accounts remain blocked for ownership review;
+startup never invents an account binding from the current credentials. Legacy
+placements with no recorded submission evidence retain their existing behavior.
+
 The intent is synchronized before creating remote work. A returned ID is
 synchronized before checking status or publishing a queue placement. The queue
 placement is synchronized before the intent becomes bound. Recovery finalizes
@@ -49,6 +58,13 @@ listing. Hash-based recovery reuses only completed content and does not select
 files, create work, or grant rollback deletion authority. Empty, multiple,
 incomplete, inconsistent, or failed snapshots remain unresolved. In particular,
 an empty listing is not proof that a timed-out create failed.
+After an acknowledged ID passes identity checks, a definite cache miss, slot
+refusal, terminal state, or unsafe title may finish its owned, journaled rollback.
+Only a successful cleanup checkpoint permits fallback. Routing then skips the
+resolved attempt, tries other cached providers first, and preserves eligibility
+for an allowed uncached pass. Cancellation, inconsistent identity, transport
+errors, and uncertain cleanup still stop fallback. Hash-only recovery never gains
+this rollback authority.
 If an HTTP caller disconnects during submission, the accepted job keeps its
 bounded admission slot and passes to a service-owned worker for reconciliation.
 Service shutdown leaves recovery to startup; deletion fences prevent the
@@ -81,6 +97,14 @@ acceptance. Unresolved attempts deliberately remain blocked for inspection;
 automatic clearing and a dedicated operator-resolution UI are not implemented.
 Provider-side IDs and listing consistency remain part of the recovery contract.
 No release, deployment, data migration, or live-provider mutation is included.
+
+New queue rows separately preserve the admitted request's uncached policy as
+`inherit`, `allow`, or `deny`; the effective provider-attempt boolean remains
+independent. Restart therefore preserves inheritance instead of converting it
+to a denial. The appended protobuf field is optional for existing data: legacy
+rows retain their persisted boolean, and unknown policy values stop restoration.
+Older binaries ignore this field and the placement account restrictions, so a
+rollback requires reviewing outstanding requests and copied placements first.
 
 Tests cover real subprocess exits before create, after acceptance, after the ID
 checkpoint, and after binding; timeout recovery; account changes; zero, one,
