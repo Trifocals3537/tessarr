@@ -21,6 +21,7 @@ import (
 	"github.com/Trifocals3537/tessarr/internal/request"
 	"github.com/Trifocals3537/tessarr/internal/tlsconfig"
 	"github.com/Trifocals3537/tessarr/internal/utils"
+	"github.com/Trifocals3537/tessarr/internal/workflow"
 	"github.com/Trifocals3537/tessarr/pkg/arr"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
 	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
@@ -37,6 +38,7 @@ import (
 
 // Manager handles unified torrent management - replaces wire.Store completely
 type Manager struct {
+	workflowFault   atomic.Pointer[workflowFault]
 	storage         *storage.Storage
 	migrator        *Migrator
 	repair          *Repair
@@ -260,6 +262,7 @@ func New() *Manager {
 }
 
 func (m *Manager) resetLifecycle() {
+	m.workflowFault.Store(nil)
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	m.setLifecyclePhase(LifecyclePhaseInitializing, "manager is initializing")
 	m.backgroundMu.Lock()
@@ -317,7 +320,14 @@ func (m *Manager) startEntryBackground(parent context.Context, name string, entr
 		var workErr error
 		func() {
 			defer lease.Close()
-			workErr = work(lease.Context())
+			outcome := workflow.Run(lease.Context(), work)
+			workErr = outcome.Err
+			if outcome.Kind == workflow.Panicked {
+				m.logger.Error().Str("task", name).Bytes("stack", outcome.Stack).Msg("Scheduled workflow panicked")
+			}
+			if workErr != nil && lease.Context().Err() == nil && outcome.Kind != workflow.Canceled && !errors.Is(workErr, errDeleteQueueEntryOnJobFinish) {
+				_ = m.commitJobOutcome(&Job{Entry: entry}, storage.QueueOutcome{Kind: storage.QueueOutcomeFailed, Err: workErr})
+			}
 		}()
 
 		if errors.Is(workErr, errDeleteQueueEntryOnJobFinish) {
@@ -580,22 +590,30 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	if job == nil {
 		return
 	}
-	if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
-		m.waitForDownloadCompletion(ctx, job.Entry)
+	if m.workflowAvailable() != nil {
+		return
+	} // Preserve accepted work for recovery.
+	outcome := workflow.Run(ctx, func(workCtx context.Context) error {
+		if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
+			m.waitForDownloadCompletion(workCtx, job.Entry)
+			return nil
+		}
+		switch job.Type {
+		case JobTypeTorrent:
+			return m.processTorrentJob(workCtx, job)
+		case JobTypeNZB:
+			return m.processNZBJob(workCtx, job)
+		default:
+			return fmt.Errorf("unknown job type: %s", job.Type)
+		}
+	})
+	if outcome.Kind == workflow.Panicked {
+		m.logger.Error().Str("job_id", job.ID).Bytes("stack", outcome.Stack).Msg("Download workflow panicked")
+	}
+	if outcome.Kind == workflow.Canceled {
 		return
 	}
-
-	var err error
-	switch job.Type {
-	case JobTypeTorrent:
-		err = m.processTorrentJob(ctx, job)
-	case JobTypeNZB:
-		err = m.processNZBJob(ctx, job)
-	default:
-		err = fmt.Errorf("unknown job type: %s", job.Type)
-	}
-
-	if err != nil {
+	if err := outcome.Err; err != nil {
 		if errors.Is(err, errDeleteQueueEntryOnJobFinish) {
 			job.DeleteOnFinish = true
 			return
@@ -604,9 +622,8 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 			return
 		}
 		if isTooManyActiveDownloads(err) {
-			if job.Entry != nil {
-				job.Entry.Status = debridTypes.TorrentStatusQueued
-				_ = m.queue.Update(job.Entry)
+			if commitErr := m.commitJobOutcome(job, storage.QueueOutcome{Kind: storage.QueueOutcomeDeferred}); commitErr != nil {
+				return
 			}
 			if retryErr := m.jobQueue.Retry(job, 30*time.Second); retryErr != nil {
 				m.logger.Error().
@@ -614,16 +631,14 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 					Str("job_id", job.ID).
 					Msg("Failed to schedule active-download retry")
 				if job.Entry != nil {
-					job.Entry.MarkAsError(retryErr)
-					_ = m.queue.Update(job.Entry)
+					_ = m.commitJobOutcome(job, storage.QueueOutcome{Kind: storage.QueueOutcomeFailed, Err: retryErr})
 				}
 			}
 			return
 		}
 		m.logger.Error().Err(err).Str("job_id", job.ID).Str("type", string(job.Type)).Msg("Active download failed")
 		if job.Entry != nil {
-			job.Entry.MarkAsError(err)
-			_ = m.queue.Update(job.Entry)
+			_ = m.commitJobOutcome(job, storage.QueueOutcome{Kind: storage.QueueOutcomeFailed, Err: err})
 		}
 		return
 	}
@@ -1188,6 +1203,9 @@ func (m *Manager) GetMigrationJob(jobID string) (*storage.SwitcherJob, error) {
 
 // SubmitJob submits an import to the unified active-download queue.
 func (m *Manager) SubmitJob(job *Job) error {
+	if err := m.workflowAvailable(); err != nil {
+		return err
+	}
 	if m.jobQueue == nil {
 		return fmt.Errorf("active download queue not initialized")
 	}
@@ -1198,6 +1216,9 @@ func (m *Manager) SubmitJob(job *Job) error {
 }
 
 func (m *Manager) submitRestoredJob(ctx context.Context, job *Job) error {
+	if err := m.workflowAvailable(); err != nil {
+		return err
+	}
 	if m.jobQueue == nil {
 		return fmt.Errorf("%w: active download queue not initialized", ErrJobQueueClosed)
 	}
@@ -1211,6 +1232,9 @@ func (m *Manager) reserveJob(
 	ctx context.Context,
 	jobID string,
 ) (*jobReservation, error) {
+	if err := m.workflowAvailable(); err != nil {
+		return nil, err
+	}
 	if m.jobQueue == nil {
 		return nil, fmt.Errorf("%w: active download queue not initialized", ErrJobQueueClosed)
 	}

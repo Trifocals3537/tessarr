@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Trifocals3537/tessarr/internal/logger"
 	"github.com/Trifocals3537/tessarr/internal/safepath"
+	"github.com/Trifocals3537/tessarr/internal/stateowner"
 	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 	"github.com/rs/zerolog"
 	"google.golang.org/protobuf/proto"
@@ -33,6 +35,9 @@ var legacyStoreNames = []string{"repair_jobs", "repair_keys"}
 
 // Storage handles persistence using HybridStore
 type Storage struct {
+	owner        *stateowner.Owner
+	closeOnce    sync.Once
+	closeErr     error
 	entries      *hybrid.Store
 	queue        *hybrid.Store
 	entryItems   *hybrid.Store
@@ -123,6 +128,10 @@ func NewStorage(dbPath string) (*Storage, error) {
 	}
 
 	log := logger.New("storage")
+	owner, err := stateowner.Acquire(dbPath, ".tessarr-storage.lock")
+	if err != nil {
+		return nil, fmt.Errorf("open storage writer: %w", err)
+	}
 
 	dropLegacyStores(dbPath, log)
 
@@ -135,10 +144,11 @@ func NewStorage(dbPath string) (*Storage, error) {
 
 	itemStores, err := createItemStores(dbPath, baseConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create item stores: %w", err)
+		return nil, errors.Join(fmt.Errorf("failed to create item stores: %w", err), owner.Close())
 	}
 
 	s := &Storage{
+		owner:            owner,
 		entries:          itemStores["entries"],
 		queue:            itemStores["queue"],
 		entryItems:       itemStores["items"],
@@ -207,6 +217,11 @@ func NewStorage(dbPath string) (*Storage, error) {
 }
 
 func (s *Storage) Close() error {
+	s.closeOnce.Do(func() { s.closeErr = s.closeStores() })
+	return s.closeErr
+}
+
+func (s *Storage) closeStores() error {
 	var errs []error
 	if s.startupComplete {
 		if err := s.markEntryItemsClean(); err != nil {
@@ -233,8 +248,25 @@ func (s *Storage) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if err := s.owner.Close(); err != nil {
+		errs = append(errs, err)
+	}
 	if len(errs) > 0 {
-		return fmt.Errorf("errors closing storage: %v", errs)
+		return fmt.Errorf("errors closing storage: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+// DurabilityError exposes component health without inferring it from row
+// visibility. An indexed append may still be awaiting a successful fsync.
+func (s *Storage) DurabilityError() error {
+	for _, store := range []*hybrid.Store{s.entries, s.queue, s.entryItems, s.storageState,
+		s.repairState, s.repairRuns, s.repairRecoveries, s.entryTombstones, s.queueTombstones, s.migrationCleanup} {
+		if store != nil {
+			if err := store.DurabilityError(); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

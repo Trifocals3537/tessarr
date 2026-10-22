@@ -748,6 +748,7 @@ func addLifecycleTestEntry(t *testing.T, queue *Queue, id string) (*storage.Entr
 	entry := &storage.Entry{
 		InfoHash: id,
 		Name:     "release.mkv",
+		State:    storage.EntryStateDownloading,
 		Protocol: config.ProtocolTorrent,
 		SavePath: downloadRoot,
 	}

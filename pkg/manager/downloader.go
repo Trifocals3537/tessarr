@@ -154,7 +154,9 @@ func (d *Downloader) download(ctx context.Context, torrent *storage.Entry) error
 		}
 		// Parent has been fanned out into season entries; mark it complete so
 		// it leaves the downloading queue instead of getting re-processed.
-		d.completeEntry(torrent)
+		if err := d.completeEntry(torrent); err != nil {
+			return err
+		}
 		if torrent.Action == config.DownloadActionNone {
 			return errDeleteQueueEntryOnJobFinish
 		}
@@ -186,7 +188,9 @@ func (d *Downloader) process(ctx context.Context, entry *storage.Entry, mountPat
 	case config.DownloadActionStrm:
 		return d.processStrm(ctx, entry)
 	case config.DownloadActionNone:
-		d.completeEntry(entry)
+		if err := d.completeEntry(entry); err != nil {
+			return err
+		}
 		// The lifecycle lease held by this worker must close before deletion
 		// waits for active work, otherwise it would wait on itself.
 		return errDeleteQueueEntryOnJobFinish
@@ -195,16 +199,24 @@ func (d *Downloader) process(ctx context.Context, entry *storage.Entry, mountPat
 	}
 }
 
-func (d *Downloader) completeEntry(entry *storage.Entry) {
-	d.markAsCompleted(entry)
+func (d *Downloader) completeEntry(entry *storage.Entry) error {
+	if err := d.markAsCompleted(entry); err != nil {
+		return err
+	}
 	d.notifyCompleted(entry)
 	d.triggerArrRefresh(entry)
+	return nil
 }
 
-func (d *Downloader) markAsCompleted(entry *storage.Entry) {
-	// Mark as completed
-	entry.MarkAsCompleted(entry.DownloadPath())
-	_ = d.manager.queue.Update(entry)
+func (d *Downloader) markAsCompleted(entry *storage.Entry) error {
+	err := d.manager.queue.commitOutcome(entry, storage.QueueOutcome{
+		Kind: storage.QueueOutcomeCompleted, ContentPath: entry.DownloadPath(),
+	})
+	if err != nil {
+		d.manager.recordWorkflowFault(err)
+		return fmt.Errorf("persist completed download: %w", err)
+	}
+	return nil
 }
 
 func (d *Downloader) notifyCompleted(entry *storage.Entry) {
@@ -316,9 +328,7 @@ func (d *Downloader) processSymlink(ctx context.Context, entry *storage.Entry, m
 		}
 	}
 
-	d.completeEntry(entry)
-
-	return nil
+	return d.completeEntry(entry)
 }
 
 func (d *Downloader) createSymlinksWhenMountFilesAppear(ctx context.Context, entry *storage.Entry, files []*storage.File, mountPath string, symlinkDir string) ([]string, error) {
@@ -969,7 +979,9 @@ func (d *Downloader) processTorrentDownload(ctx context.Context, entry *storage.
 	if err := p.Wait(); err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
-	d.completeEntry(entry)
+	if err := d.completeEntry(entry); err != nil {
+		return err
+	}
 	d.logger.Info().Msgf("Downloaded all files for %s", entry.Name)
 	return nil
 }
@@ -1072,7 +1084,9 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, entry *storage.E
 		return fmt.Errorf("NZB download failed: %w", err)
 	}
 
-	d.completeEntry(entry)
+	if err := d.completeEntry(entry); err != nil {
+		return err
+	}
 	d.logger.Info().Msgf("Downloaded all NZB files for %s", entry.Name)
 	return nil
 }
@@ -1149,7 +1163,9 @@ func (d *Downloader) processStrm(ctx context.Context, torrent *storage.Entry) er
 			return fmt.Errorf("failed to create .strm file: %s: %v", strmFilePath, err)
 		}
 	}
-	d.completeEntry(torrent)
+	if err := d.completeEntry(torrent); err != nil {
+		return err
+	}
 	d.logger.Info().Str("destination", torrentSymlinkPath).Msgf("Created .strm files for %s", torrent.Name)
 	return nil
 }
