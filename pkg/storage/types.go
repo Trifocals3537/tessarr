@@ -21,13 +21,6 @@ import (
 type (
 	SwitcherStatus string
 	TorrentState   string
-	UncachedPolicy string
-)
-
-const (
-	UncachedPolicyInherit UncachedPolicy = "inherit"
-	UncachedPolicyAllow   UncachedPolicy = "allow"
-	UncachedPolicyDeny    UncachedPolicy = "deny"
 )
 
 const (
@@ -140,9 +133,6 @@ type Entry struct {
 	DownloadUncached bool                  `msgpack:"download_uncached,omitempty" json:"download_uncached,omitempty"` // Force uncached download
 	CallbackURL      string                `msgpack:"callback_url,omitempty" json:"callback_url,omitempty"`           // Callback URL for completion
 	SkipMultiSeason  bool                  `msgpack:"skip_multi_season,omitempty" json:"skip_multi_season,omitempty"` // Skip multi-season detection
-	// AdmissionUncachedPolicy preserves the original request independently of
-	// the effective provider attempt. Empty identifies a legacy boolean record.
-	AdmissionUncachedPolicy UncachedPolicy `msgpack:"admission_uncached_policy,omitempty" json:"-"`
 
 	// Error tracking
 	LastError     string     `msgpack:"last_error,omitempty" json:"last_error,omitempty"`           // Last error message

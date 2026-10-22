@@ -87,9 +87,6 @@ func (m *Manager) deleteProviderTorrent(client common.Client, torrentID string) 
 	if client == nil || torrentID == "" {
 		return nil
 	}
-	if err := m.verifyPlacementAccount(client, torrentID); err != nil {
-		return err
-	}
 	if m.storage != nil {
 		protected, err := m.storage.IsRecoveredProviderPlacement(client.Config().Name, torrentID)
 		if err != nil {
