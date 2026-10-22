@@ -30,9 +30,11 @@ are subsequent milestones; this change does not claim to implement them.
   checkpoint succeeds. Optional notification delivery remains best effort.
 - Synchronization failures are visible through readiness and block further
   writes to the affected store until synchronization succeeds. A failed workflow
-  outcome checkpoint latches manager admission closed until a successful restart
-  reconstructs work from durable state. Readable indexed bytes are not evidence
-  that a failed checkpoint was durably committed.
+  outcome checkpoint, or storage unavailability preventing accepted work from
+  starting, latches manager admission closed until a successful restart
+  reconstructs work from durable state. A later successful periodic sync alone
+  cannot clear that recovery requirement. Readable indexed bytes are not
+  evidence that a failed checkpoint was durably committed.
 
 ## Ownership boundaries
 

@@ -590,9 +590,13 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	if job == nil {
 		return
 	}
-	if m.workflowAvailable() != nil {
+	if err := m.workflowAvailable(); err != nil {
+		// The worker will release this admission on return. Keep recovery
+		// latched even if a later sync succeeds: queued rows are reconstructed
+		// at startup, not by the normal provider-status scheduler.
+		m.recordWorkflowFault(err)
 		return
-	} // Preserve accepted work for recovery.
+	}
 	outcome := workflow.Run(ctx, func(workCtx context.Context) error {
 		if job.Entry != nil && job.Request == nil && job.DebridTorrent == nil && job.NZBMeta == nil && !job.ResumeExisting {
 			m.waitForDownloadCompletion(workCtx, job.Entry)

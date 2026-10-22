@@ -69,7 +69,7 @@ func (m *Manager) recordWorkflowFault(err error) {
 		return
 	}
 	if m.workflowFault.CompareAndSwap(nil, &workflowFault{}) {
-		m.logger.Error().Err(err).Msg("Workflow checkpoint failed; new admissions suspended until restart")
+		m.logger.Error().Err(err).Msg("Workflow persistence failed; new admissions suspended until restart")
 	}
 }
 

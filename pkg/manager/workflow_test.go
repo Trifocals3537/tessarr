@@ -3,7 +3,9 @@ package manager
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +16,100 @@ import (
 	"github.com/Trifocals3537/tessarr/pkg/storage"
 	"github.com/rs/zerolog"
 )
+
+func TestUnavailableStorageLatchesAcceptedWorkUntilRestartRecovery(t *testing.T) {
+	var calls atomic.Int32
+	provider := &routingTestClient{cfg: config.Debrid{Name: "torbox"}, submit: func(*debridTypes.Torrent) (*debridTypes.Torrent, error) {
+		calls.Add(1)
+		return nil, errors.New("fixture provider failure")
+	}}
+	m, root := newAsyncAdmissionTestManager(t, provider, 1)
+	dbPath := filepath.Join(config.GetMainPath(), "db")
+	m.jobQueue.Close()
+
+	// Hold an accepted job immediately before the manager's availability check.
+	// Closing/reopening the store exercises health loss and recovery through its
+	// public API; hybrid tests separately cover periodic fsync failure/retry.
+	started, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseJob := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseJob)
+	m.jobQueue = NewJobQueueWithCapacity(m.ctx, 1, 8, func(ctx context.Context, job *Job) {
+		close(started)
+		<-release
+		m.processJob(ctx, job)
+	}, m.entryLifecycle)
+	m.setLifecyclePhase(LifecyclePhaseReady, "ready")
+	request := asyncAdmissionTestRequest(root, "first", nil)
+	entry := newTorrentQueueEntry(request, debridTypes.TorrentStatusQueued)
+	if err := m.queue.Add(entry); err != nil {
+		t.Fatal(err)
+	}
+	job := NewJob(JobTypeTorrent, request)
+	job.ID, job.Entry = entry.InfoHash, entry
+	if err := m.SubmitJob(job); err != nil {
+		t.Fatal(err)
+	}
+	awaitAsyncAdmissionValue(t, started, "accepted job dispatch")
+	if err := m.storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	releaseJob()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.jobQueue.OutstandingCount() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if m.jobQueue.OutstandingCount() != 0 {
+		t.Fatal("unavailable job did not drain")
+	}
+	m.jobQueue.Close()
+
+	reopened, err := storage.NewStorage(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		m.jobQueue.Close()
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened storage: %v", err)
+		}
+	})
+	m.storage = reopened
+	m.queue = newLifecycleTestQueue(reopened, m.entryLifecycle)
+	if err := reopened.DurabilityError(); err != nil {
+		t.Fatal("storage did not recover", err)
+	}
+	if status := m.ReadinessStatus(); status.Ready || status.Phase != LifecyclePhaseDegraded {
+		t.Fatalf("storage recovery hid accepted work requiring restart: %+v", status)
+	}
+	if err := m.AdmitNewTorrent(context.Background(), asyncAdmissionTestRequest(root, "second", nil)); !errors.Is(err, ErrWorkflowUnavailable) {
+		t.Fatalf("admission resumed without recovering accepted work: %v", err)
+	}
+	current, err := m.queue.GetTorrent(entry.InfoHash)
+	if err != nil || current.Status != debridTypes.TorrentStatusQueued || current.QueueIncarnation != entry.QueueIncarnation {
+		t.Fatalf("accepted row was not preserved: %+v %v", current, err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("unavailable job reached the provider")
+	}
+
+	// Rebuild the process-local queue after draining the old worker, as startup
+	// recovery does. Only this lifecycle reset may clear the recovery latch.
+	m.cancel()
+	m.entryLifecycle = newEntryLifecycle()
+	m.queue = newLifecycleTestQueue(reopened, m.entryLifecycle)
+	m.resetLifecycle()
+	m.jobQueue = NewJobQueueWithCapacity(m.ctx, 1, 8, m.processJob, m.entryLifecycle)
+	m.queue.removePendingJobs = m.jobQueue.DeleteJobs
+	m.restoreActiveDownloadJobs(m.ctx)
+	waitForQueuedEntryState(t, m.queue, entry.InfoHash, storage.EntryStateError)
+	if calls.Load() != 1 {
+		t.Fatalf("restart resumed provider work %d times, want one", calls.Load())
+	}
+	if err := m.workflowAvailable(); err != nil {
+		t.Fatal("successful reconstruction retained recovery latch", err)
+	}
+}
 
 type failingOutcomeStore struct {
 	calls atomic.Int32
