@@ -16,6 +16,7 @@
   },
   "overrides": {
     "devalue": "5.9.4",
-    "postcss-nested": "7.0.2"
+    "postcss-nested": "7.0.2",
+    "vite": "8.1.6"
   }
 }

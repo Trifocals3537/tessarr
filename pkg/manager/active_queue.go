@@ -30,7 +30,9 @@ func (m *Manager) recoverInterruptedDownloads(ctx context.Context) error {
 	}
 	// Unlike ListFilter, propagate a failed scan instead of starting workers
 	// with a partially recovered (or apparently empty) queue.
-	entries, err := m.queue.storage.FilterQueued(interrupted)
+	entries, err := m.queue.storage.FilterQueued(func(entry *storage.Entry) bool {
+		return entry.State == storage.EntryStateDownloading || entry.State == storage.EntryStateError
+	})
 	if err != nil {
 		return err
 	}
@@ -47,6 +49,30 @@ func (m *Manager) recoverInterruptedDownloads(ctx context.Context) error {
 		}
 		if err != nil {
 			return fmt.Errorf("read interrupted download %s: %w", snapshot.InfoHash, err)
+		}
+		if entry.IsTorrent() && entry.QueueIncarnation != "" {
+			if err := m.verifySubmissionAccount(entry); err != nil {
+				if errors.Is(err, ErrProviderSubmissionPending) || errors.Is(err, storage.ErrProviderSubmissionConflict) {
+					entry.MarkAsError(err)
+					if err := m.queue.Update(entry); err != nil {
+						return err
+					}
+					recovered++
+					continue
+				}
+				return err
+			}
+			changed, err := m.queue.storage.RecoverProviderSubmission(entry)
+			if err != nil {
+				return fmt.Errorf("recover provider submission %s: %w", entry.InfoHash, err)
+			}
+			if changed {
+				entry, err = m.queue.GetTorrent(entry.InfoHash)
+				if err != nil {
+					return err
+				}
+				recovered++
+			}
 		}
 		if !interrupted(entry) {
 			continue
@@ -153,7 +179,17 @@ func (m *Manager) rebuildQueuedJob(ctx context.Context, entry *storage.Entry) (*
 }
 
 func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
-	if entry.ActiveProvider != "" && entry.GetActiveProvider() != nil {
+	resumeExisting := entry.ActiveProvider != "" && entry.GetActiveProvider() != nil
+	if entry.QueueIncarnation != "" && m.queue != nil && m.queue.storage != nil {
+		intent, err := m.queue.storage.GetProviderSubmission(entry)
+		if err != nil {
+			return nil, err
+		}
+		if intent != nil && (intent.Phase == storage.SubmissionPending || intent.Phase == storage.SubmissionCleanup) {
+			resumeExisting = false // Reconcile before status processing or rollback.
+		}
+	}
+	if resumeExisting {
 		return &Job{
 			ID:             entry.InfoHash,
 			Type:           JobTypeTorrent,
@@ -168,13 +204,25 @@ func (m *Manager) rebuildQueuedTorrentJob(entry *storage.Entry) (*Job, error) {
 	}
 
 	downloadUncached := entry.DownloadUncached
+	policy := &downloadUncached
+	switch entry.AdmissionUncachedPolicy {
+	case storage.UncachedPolicyInherit:
+		policy = nil
+	case storage.UncachedPolicyAllow:
+		downloadUncached = true
+	case storage.UncachedPolicyDeny:
+		downloadUncached = false
+	case "": // Legacy records retain their persisted effective boolean.
+	default:
+		return nil, fmt.Errorf("invalid queued uncached policy %q", entry.AdmissionUncachedPolicy)
+	}
 	req := NewTorrentRequest(
 		entry.ActiveProvider,
 		downloadFolderForEntry(m.config.DownloadFolder, entry),
 		magnet,
 		m.arr.GetOrCreate(entry.Category),
 		entry.Action,
-		&downloadUncached,
+		policy,
 		entry.CallbackURL,
 		ImportTypeAPI,
 		entry.SkipMultiSeason,

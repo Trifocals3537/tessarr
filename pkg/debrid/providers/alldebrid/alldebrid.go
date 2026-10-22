@@ -406,9 +406,13 @@ func allDebridFileID(torrentID, providerPath string) string {
 }
 
 func (ad *AllDebrid) GetTorrent(torrentId string) (*types.Torrent, error) {
+	return ad.GetTorrentContext(context.Background(), torrentId)
+}
+
+func (ad *AllDebrid) GetTorrentContext(ctx context.Context, torrentId string) (*types.Torrent, error) {
 	var res TorrentInfoResponse
 
-	resp, err := ad.doRequest("/magnet/status", map[string]string{"id": torrentId}, &res)
+	resp, err := ad.doRequestContext(ctx, "/magnet/status", map[string]string{"id": torrentId}, &res)
 	if err != nil {
 		return nil, err
 	}

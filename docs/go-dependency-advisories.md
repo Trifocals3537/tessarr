@@ -1,5 +1,22 @@
 # Go dependency advisory follow-up (2026-10-19)
 
+## October 21 toolchain follow-up
+
+The durable-workflow branch's unchanged vulnerability gate found the newly
+published [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809) in `crypto/x509`,
+reachable through the NNTP TLS handshake. The minimum Go version is now
+**1.26.10**, the patched release in the retained 1.26 series. The October 19
+results and explicit toolchain commands below are historical evidence; current
+validation must use the updated `go.mod` pin and the current advisory database.
+
+The docs audit also required Vite **8.1.6**. That patch is pinned through the docs
+override and lockfile, retaining the existing Astro version and unrelated locked
+dependencies. Its fixes include
+[GHSA-rq7h-c2jc-7f22](https://github.com/vitejs/vite/security/advisories/GHSA-rq7h-c2jc-7f22).
+Neither security gate is suppressed or relaxed.
+
+## October 19 dependency follow-up
+
 The release-readiness scan of beta `993ea2f7df5ea02840fb0401a6b66df0de1b50e9`
 reported ten advisories at module level, with none in imported packages or called
 symbols. This update removes all nine findings that have patched versions. The

@@ -1384,6 +1384,14 @@ func (s *Storage) writeQueue(entry *Entry, requireExisting bool) error {
 }
 
 func (s *Storage) writeQueueRaw(entry *Entry, requireExisting bool) error {
+	put := s.queue.Put
+	if requireExisting {
+		put = s.queue.PutExisting
+	}
+	return s.writeQueueRecord(entry, put)
+}
+
+func (s *Storage) writeQueueRecord(entry *Entry, put func(string, []byte, *hybrid.EntryMeta) error) error {
 	if err := s.revokeChangedHandoffAuthorization(entry); err != nil {
 		return fmt.Errorf("revoke changed handoff authorization: %w", err)
 	}
@@ -1407,16 +1415,13 @@ func (s *Storage) writeQueueRaw(entry *Entry, requireExisting bool) error {
 	}
 
 	key := strings.ToLower(entry.InfoHash)
-	if requireExisting {
-		if err := s.queue.PutExisting(key, data, meta); err != nil {
-			if hybrid.IsNotFound(err) {
-				return fmt.Errorf("%w: %s", ErrQueuedEntryNotFound, entry.InfoHash)
-			}
-			return err
+	if err := put(key, data, meta); err != nil {
+		if hybrid.IsNotFound(err) {
+			return fmt.Errorf("%w: %s", ErrQueuedEntryNotFound, entry.InfoHash)
 		}
-		return nil
+		return err
 	}
-	return s.queue.Put(key, data, meta)
+	return nil
 }
 
 // GetQueued retrieves a queued entry

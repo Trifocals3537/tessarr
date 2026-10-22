@@ -1,34 +1,31 @@
 package storage
 
 import (
-	"path/filepath"
+	"errors"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
-	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 )
 
 func TestRepairRecoveryIntentIsImmediatelyDurable(t *testing.T) {
 	config.SetConfigPath(t.TempDir())
 	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRepairRecoveryDurabilityCrashHelper$")
+	cmd.Env = append(os.Environ(), "TESSARR_REPAIR_RECOVERY_CRASH_PATH="+dir)
+	output, err := cmd.CombinedOutput()
+	var exited *exec.ExitError
+	if !errors.As(err, &exited) || exited.ExitCode() != 85 {
+		t.Fatalf("crash helper: %v %s", err, output)
+	}
 	s, err := NewStorage(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	job := &RepairRecovery{ID: "recovery", Original: BrokenFile{EntryName: "entry", ArrName: "radarr", ArrFileID: 10}, State: RecoveryAttention, SearchIntentAt: time.Now()}
-	if err := s.SaveRepairRecovery(job); err != nil {
-		t.Fatal(err)
-	}
-	// Open the append log before Close or a periodic sync could mask a missing
-	// durability boundary. This mirrors the hybrid store's crash-read tests.
-	reader, err := hybrid.New(hybrid.Config{DataPath: filepath.Join(dir, "repair_recoveries.db"), SyncInterval: -1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	if _, err := reader.Get(job.ID); err != nil {
+	if _, err := s.GetRepairRecovery("recovery"); err != nil {
 		t.Fatalf("intent not recoverable immediately: %v", err)
 	}
 	if err := s.PruneRepairRecoveries(time.Now().Add(time.Hour)); err != nil {
@@ -42,6 +39,23 @@ func TestRepairRecoveryIntentIsImmediatelyDurable(t *testing.T) {
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("entry filter ignored: %v %v", ids, err)
 	}
+}
+
+func TestRepairRecoveryDurabilityCrashHelper(t *testing.T) {
+	dir := os.Getenv("TESSARR_REPAIR_RECOVERY_CRASH_PATH")
+	if dir == "" {
+		return
+	}
+	config.SetConfigPath(dir)
+	s, err := NewStorage(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &RepairRecovery{ID: "recovery", Original: BrokenFile{EntryName: "entry", ArrName: "radarr", ArrFileID: 10}, State: RecoveryAttention, SearchIntentAt: time.Now()}
+	if err := s.SaveRepairRecovery(job); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(85) // Do not let Close add a final synchronization.
 }
 
 func TestRepairRecoveryReopensAndRejectsClosedStore(t *testing.T) {

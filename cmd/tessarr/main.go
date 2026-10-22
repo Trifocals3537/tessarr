@@ -12,6 +12,7 @@ import (
 	"github.com/Trifocals3537/tessarr/internal/config"
 	"github.com/Trifocals3537/tessarr/internal/logger"
 	"github.com/Trifocals3537/tessarr/internal/logsafe"
+	"github.com/Trifocals3537/tessarr/internal/stateowner"
 	"github.com/Trifocals3537/tessarr/internal/utils"
 	"github.com/Trifocals3537/tessarr/pkg/manager"
 	"github.com/Trifocals3537/tessarr/pkg/mount/dfs"
@@ -28,7 +29,14 @@ type serviceStarter interface {
 	Start(context.Context) error
 }
 
-func Start(ctx context.Context) error {
+func Start(ctx context.Context) (startErr error) {
+	// Hold ownership across configuration restart recovery and every in-process
+	// service restart. A second process must fail before mutating shared state.
+	owner, err := stateowner.Acquire(config.GetMainPath(), ".tessarr-process.lock")
+	if err != nil {
+		return fmt.Errorf("start Tessarr: %w", err)
+	}
+	defer func() { startErr = errors.Join(startErr, owner.Close()) }()
 	// Start the global cached time updater to reduce time.Now() syscall overhead
 	utils.StartGlobalCachedTime()
 	defer utils.StopGlobalCachedTime()

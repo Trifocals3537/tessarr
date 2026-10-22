@@ -62,13 +62,11 @@ func (m *Manager) AdmitNewTorrent(ctx context.Context, importReq *ImportRequest)
 	return nil
 }
 
-// AddNewTorrent submits a torrent to debrid before entering the active-download queue.
+// AddNewTorrent retains synchronous submission errors while recording recovery
+// input before the first provider operation.
 func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) error {
-	if importReq == nil || importReq.Magnet == nil {
-		return fmt.Errorf("magnet is required")
-	}
-	if importReq.Arr == nil {
-		return fmt.Errorf("arr is required")
+	if err := m.validateTorrentImportRequest(importReq); err != nil {
+		return err
 	}
 	reservation, err := m.reserveJob(ctx, importReq.Magnet.InfoHash)
 	if err != nil {
@@ -76,36 +74,48 @@ func (m *Manager) AddNewTorrent(ctx context.Context, importReq *ImportRequest) e
 	}
 	defer reservation.release()
 
-	debridTorrent, err := m.SendToDebrid(reservation.Context(), importReq)
+	torrent := newTorrentQueueEntry(importReq, debridTypes.TorrentStatusQueued)
+	if err := m.persistTorrentSource(importReq); err != nil {
+		return fmt.Errorf("persist torrent source before submission: %w", err)
+	}
+	if err := m.queue.Add(torrent); err != nil {
+		return errors.Join(fmt.Errorf("persist queue before submission: %w", err), m.pruneTorrentSourcesAfterFailedAdmission(importReq))
+	}
+	debridTorrent, err := m.sendToDebrid(reservation.Context(), importReq, torrent)
 	if err != nil {
-		if isTooManyActiveDownloads(err) {
+		if unavailable := m.workflowAvailable(); unavailable != nil {
+			// Releasing this reservation must not leave a queued row hidden
+			// behind a transient storage failure that later appears healthy.
+			m.recordWorkflowFault(unavailable)
+			return errors.Join(err, unavailable)
+		}
+		if reservation.Context().Err() != nil && m.ctx.Err() == nil && m.workflowAvailable() == nil {
+			// The HTTP caller may disconnect after the provider accepted work.
+			// Keep the existing capacity reservation and durable intent, but let
+			// the service worker reconcile under its own lifecycle context.
+			job := NewJob(JobTypeTorrent, importReq)
+			job.ID, job.Entry = torrent.InfoHash, torrent
+			if resumeErr := m.submitReservedJob(reservation, job); resumeErr == nil {
+				return fmt.Errorf("provider submission interrupted; recovery queued: %w", err)
+			} else {
+				err = errors.Join(err, resumeErr)
+			}
+		}
+		if isTooManyActiveDownloads(err) && !errors.Is(err, ErrProviderSubmissionPending) {
 			m.logger.Warn().Msgf("Too many active downloads, marking as queued: %s", importReq.Magnet.Name)
 			return m.queueTorrentRetry(importReq, reservation)
 		}
+		if m.ctx.Err() == nil && m.workflowAvailable() == nil {
+			if saveErr := m.queue.commitOutcome(torrent, storage.QueueOutcome{Kind: storage.QueueOutcomeFailed, Err: err}); saveErr != nil {
+				m.recordWorkflowFault(saveErr)
+				return errors.Join(err, saveErr)
+			}
+		}
 		return fmt.Errorf("failed to submit torrent to debrid: %w", err)
 	}
-
-	torrent := newTorrentQueueEntry(importReq, debridTypes.TorrentStatusQueued)
 	torrent.DownloadUncached = debridTorrent.DownloadUncached
 	if err := applyDebridTorrentToEntry(torrent, debridTorrent); err != nil {
 		return fmt.Errorf("apply submitted provider state: %w", err)
-	}
-
-	if err := m.persistTorrentSource(importReq); err != nil {
-		rollbackErr := m.deleteProviderTorrent(
-			m.ProviderClient(debridTorrent.Debrid),
-			debridTorrent.Id,
-		)
-		return errors.Join(
-			fmt.Errorf("persist torrent source before queueing: %w", err),
-			rollbackErr,
-		)
-	}
-	if err := m.queue.Add(torrent); err != nil {
-		return errors.Join(
-			fmt.Errorf("failed to add torrent to queue: %w", err),
-			m.pruneTorrentSourcesAfterFailedAdmission(importReq),
-		)
 	}
 
 	job := NewJob(JobTypeTorrent, importReq)
@@ -128,6 +138,9 @@ func (m *Manager) processTorrentJob(ctx context.Context, job *Job) error {
 		return nil
 	}
 	if job.ResumeExisting {
+		if err := m.verifySubmissionAccount(job.Entry); err != nil {
+			return err
+		}
 		job.Entry.Status = debridTypes.TorrentStatusDownloading
 		job.Entry.IsDownloading = false
 		_ = m.queue.Update(job.Entry)
@@ -139,7 +152,7 @@ func (m *Manager) processTorrentJob(ctx context.Context, job *Job) error {
 			m.waitForDownloadCompletion(ctx, job.Entry)
 			return nil
 		}
-		debridTorrent, err := m.SendToDebrid(ctx, job.Request)
+		debridTorrent, err := m.sendToDebrid(ctx, job.Request, job.Entry)
 		if err != nil {
 			return fmt.Errorf("failed to submit torrent to debrid: %w", err)
 		}
@@ -211,8 +224,13 @@ func newTorrentQueueEntry(importReq *ImportRequest, status debridTypes.TorrentSt
 	// placement succeeds applyDebridTorrentToEntry replaces it with the actual
 	// provider. This preserves explicit qBittorrent routing across a restart.
 	torrent.ActiveProvider = importReq.SelectedDebrid
+	torrent.AdmissionUncachedPolicy = storage.UncachedPolicyInherit
 	if importReq.DownloadUncached != nil {
 		torrent.DownloadUncached = *importReq.DownloadUncached
+		torrent.AdmissionUncachedPolicy = storage.UncachedPolicyDeny
+		if *importReq.DownloadUncached {
+			torrent.AdmissionUncachedPolicy = storage.UncachedPolicyAllow
+		}
 	}
 	torrent.OutputName = storage.NewTorrentOutputName(torrent.Name, torrent.InfoHash)
 	torrent.ContentPath = torrent.DownloadPath()
@@ -353,6 +371,9 @@ func (m *Manager) processQueuedTorrent(ctx context.Context, entry *storage.Entry
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := m.verifySubmissionAccount(entry); err != nil {
+		return err
+	}
 	placement := entry.GetActiveProvider()
 	if placement == nil {
 		m.logger.Error().Str("name", entry.Name).Msg("No active placement found for queued entry")
@@ -459,7 +480,7 @@ func (m *Manager) processQueuedTorrent(ctx context.Context, entry *storage.Entry
 	}
 	if err != nil && dbT != nil && dbT.Status == debridTypes.TorrentStatusError {
 		if dbT.Id != "" {
-			err = errors.Join(err, m.deleteProviderTorrent(client, dbT.Id))
+			err = errors.Join(err, m.rollbackQueuedProviderTorrent(entry, client, dbT.Id))
 		}
 		m.logger.Error().Err(err).Str("name", entry.Name).Msg("Error checking status")
 		entry.MarkAsError(err)
@@ -478,7 +499,7 @@ func (m *Manager) processQueuedTorrent(ctx context.Context, entry *storage.Entry
 	entry.TerminalChecks = 0
 
 	if err := m.validateResolvedTorrentNames(debridTorrent, entry.Action); err != nil {
-		err = errors.Join(err, m.deleteProviderTorrent(client, debridTorrent.Id))
+		err = errors.Join(err, m.rollbackQueuedProviderTorrent(entry, client, debridTorrent.Id))
 		m.logger.Error().Err(err).Str("name", entry.Name).Msg("Provider returned unsafe torrent name")
 		entry.MarkAsError(err)
 		_ = m.queue.Update(entry)
@@ -646,9 +667,7 @@ func (m *Manager) processAction(ctx context.Context, entry *storage.Entry) error
 			Err(err).
 			Str("name", entry.Name).
 			Msg("Error running post-download action")
-		entry.MarkAsError(err)
-		_ = m.queue.Update(entry)
-		return nil
+		return err
 	}
 	return nil
 }
@@ -705,6 +724,18 @@ func applyCompletedTorrentFiles(entry *storage.Entry, torrent *debridTypes.Torre
 	if entry == nil || torrent == nil || torrent.Status != debridTypes.TorrentStatusDownloaded {
 		return false, nil
 	}
+	scoped, scopeErr := entry.ScopeTorrentSnapshot(torrent)
+	if scopeErr != nil {
+		if !errors.Is(scopeErr, storage.ErrIncompleteProviderFileScope) {
+			return false, scopeErr
+		}
+		if err := applyIncompleteDebridTorrentState(entry, torrent); err != nil {
+			return false, err
+		}
+		entry.Status = debridTypes.TorrentStatusDownloading
+		return false, nil
+	}
+	torrent = scoped
 	if !isComplete(torrent.Files) {
 		if err := applyIncompleteDebridTorrentState(entry, torrent); err != nil {
 			return false, err
@@ -780,7 +811,16 @@ func preserveMaterializedTorrentTitle(entry *storage.Entry, remote *debridTypes.
 
 func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTypes.Torrent) {
 	torrent.ActiveProvider = debridTorrent.Debrid
-	if size := debridTorrent.GetSize(); size > 0 || torrent.Size <= 0 {
+	size := debridTorrent.GetSize()
+	if torrent.FileScopeRestricted {
+		size = 0
+		for _, file := range torrent.Files {
+			if file != nil && !file.Deleted {
+				size += file.Size
+			}
+		}
+	}
+	if size > 0 || torrent.Size <= 0 {
 		torrent.Bytes = size
 		torrent.Size = size
 	}
@@ -795,11 +835,42 @@ func applyDebridTorrentMetadata(torrent *storage.Entry, debridTorrent *debridTyp
 
 // SendToDebrid submits a magnet to debrid service(s) - replaces debrid.Parse
 func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest) (*debridTypes.Torrent, error) {
+	return m.sendToDebrid(ctx, importRequest, nil)
+}
+
+func (m *Manager) sendToDebrid(ctx context.Context, importRequest *ImportRequest, entry *storage.Entry) (*debridTypes.Torrent, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := m.validateTorrentImportRequest(importRequest); err != nil {
 		return nil, err
+	}
+	var resolved *resolvedSubmissionRejection
+	if entry != nil {
+		if entry.QueueIncarnation == "" {
+			if err := m.submissionStep(entry, func() error {
+				updated, err := m.storage.EnsureProviderSubmissionIdentity(entry)
+				if err == nil {
+					refreshSubmissionEntry(entry, updated)
+				}
+				return err
+			}); err != nil {
+				return nil, err
+			}
+		}
+		var prior *storage.ProviderSubmission
+		if err := m.submissionStep(entry, func() (err error) {
+			prior, err = m.storage.GetProviderSubmission(entry)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+		if prior != nil && prior.Phase != storage.SubmissionRejected {
+			remote, err := m.reconcileSubmission(ctx, importRequest, entry, prior)
+			if !errors.As(err, &resolved) {
+				return remote, err
+			}
+		}
 	}
 	clients := m.FilterDebrid(func(c common.Client) bool {
 		if importRequest.SelectedDebrid != "" && c.Config().Name != importRequest.SelectedDebrid {
@@ -814,6 +885,11 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 
 	errs := make([]error, 0, len(clients)*2)
 	cacheMisses := make(map[string]bool, len(clients))
+	if resolved != nil {
+		errs = append(errs, fmt.Errorf("%s submission: %w", resolved.provider, resolved.cause))
+		cacheMisses[resolved.provider] = !resolved.uncached && isTorrentNotCachedError(resolved.cause)
+		m.recordSubmissionRejection(resolved.provider, importRequest.Magnet.InfoHash, importRequest.Magnet.Name, resolved.cause)
+	}
 
 	// Cached-first is a property of the complete provider set, not each
 	// provider in isolation. Trying one provider with uncached downloads enabled
@@ -828,6 +904,9 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 			}
 			providerConfig := db.Config()
 			providerName := providerConfig.Name
+			if resolved != nil && providerName == resolved.provider && (pass == 0 || resolved.uncached) {
+				continue
+			}
 			if providerName == "" {
 				providerName = providerConfig.Provider
 			}
@@ -882,74 +961,19 @@ func (m *Manager) SendToDebrid(ctx context.Context, importRequest *ImportRequest
 				Bool("uncached_allowed", downloadUncachedAllowed).
 				Msg("Processing torrent")
 
-			dbt, err := submitProviderMagnet(ctx, db, debridTorrent)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				if dbt != nil && dbt.Id != "" {
-					ctxErr = errors.Join(ctxErr, m.deleteProviderTorrent(db, dbt.Id))
-				}
-				return nil, ctxErr
-			}
-			if err != nil || dbt == nil || dbt.Id == "" {
-				if err == nil {
-					err = fmt.Errorf("provider returned an incomplete submission response")
-				} else {
-					if pass == 0 && isTorrentNotCachedError(err) {
-						cacheMisses[providerName] = true
-					}
-					m.recordSubmissionRejection(
-						providerName,
-						importRequest.Magnet.InfoHash,
-						importRequest.Magnet.Name,
-						err,
-					)
-				}
-				errs = append(errs, fmt.Errorf("%s submission: %w", providerName, err))
-				continue
-			}
-			dbt.Arr = importRequest.Arr
-			_logger.Info().Str("id", dbt.Id).Msgf("Entry: %s submitted to %s", dbt.Name, providerName)
-
-			torrent, err := checkProviderStatus(ctx, db, dbt)
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				rollbackID := dbt.Id
-				if torrent != nil && torrent.Id != "" {
-					rollbackID = torrent.Id
-				}
-				return nil, errors.Join(ctxErr, m.deleteProviderTorrent(db, rollbackID))
-			}
+			torrent, err := m.submitRoutedCandidate(ctx, db, debridTorrent, importRequest, entry)
 			if err != nil {
+				if ctx.Err() != nil {
+					return nil, err
+				}
+				if entry != nil && (errors.Is(err, ErrProviderSubmissionPending) || obsoleteWorkflow(err) || m.workflowAvailable() != nil) {
+					return nil, err
+				}
 				if pass == 0 && isTorrentNotCachedError(err) {
 					cacheMisses[providerName] = true
 				}
-				m.recordSubmissionRejection(
-					providerName,
-					importRequest.Magnet.InfoHash,
-					importRequest.Magnet.Name,
-					err,
-				)
-				rollbackID := dbt.Id
-				if torrent != nil && torrent.Id != "" {
-					rollbackID = torrent.Id
-				}
-				rollbackErr := m.deleteProviderTorrent(db, rollbackID)
-				errs = append(errs, errors.Join(
-					fmt.Errorf("%s status check: %w", providerName, err),
-					rollbackErr,
-				))
-				continue
-			}
-			if torrent == nil {
-				statusErr := fmt.Errorf("%s returned nil after checking torrent %s status", providerName, dbt.Name)
-				rollbackErr := m.deleteProviderTorrent(db, dbt.Id)
-				errs = append(errs, errors.Join(statusErr, rollbackErr))
-				continue
-			}
-			if err := m.validateResolvedTorrentNames(torrent, importRequest.Action); err != nil {
-				rollbackErr := m.deleteProviderTorrent(db, torrent.Id)
-				errs = append(errs, errors.Join(
-					fmt.Errorf("%s returned an unsafe torrent name: %w", providerName, err),
-					rollbackErr,
-				))
+				m.recordSubmissionRejection(providerName, importRequest.Magnet.InfoHash, importRequest.Magnet.Name, err)
+				errs = append(errs, fmt.Errorf("%s submission: %w", providerName, err))
 				continue
 			}
 			return torrent, nil

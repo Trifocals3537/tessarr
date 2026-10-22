@@ -21,13 +21,17 @@ package hybrid
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/logger"
+	"github.com/Trifocals3537/tessarr/internal/stateowner"
 	"github.com/rs/zerolog"
 )
 
@@ -36,6 +40,7 @@ var (
 	ErrStoreClosed          = errors.New("store is closed")
 	ErrCorruptedData        = errors.New("corrupted data detected")
 	ErrCompactionInProgress = errors.New("compaction already in progress")
+	ErrDurability           = errors.New("storage durability is unavailable")
 	errKeyNotFound          = errors.New("key not found")
 )
 
@@ -79,6 +84,11 @@ type Store struct {
 	// State
 	closed     atomic.Bool
 	compacting atomic.Bool
+	owner      *stateowner.Owner
+	closeOnce  sync.Once
+	closeErr   error
+	// Protected by mu. Only a successful synchronization clears this fault.
+	durabilityErr error
 
 	// Background tasks
 	ctx    context.Context
@@ -127,6 +137,22 @@ func New(config Config) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid append log path: %w", err)
 	}
+	// The sidecar is independent of the log inode, which changes during
+	// compaction. Acquire before inspecting/recovering replacement artifacts.
+	// Fold case on every platform so aliases on case-insensitive volumes (also
+	// mounted from Linux) use the same protocol. On case-sensitive volumes this
+	// conservatively serializes distinct files differing only by letter case.
+	lockName := fmt.Sprintf(".tessarr-store-%x.lock", sha256.Sum256([]byte(strings.ToLower(filepath.Base(compactionPaths.canonical)))))
+	owner, err := stateowner.Acquire(compactionPaths.parent, lockName)
+	if err != nil {
+		return nil, fmt.Errorf("open append log writer: %w", err)
+	}
+	owned := false
+	defer func() {
+		if !owned {
+			_ = owner.Close()
+		}
+	}()
 	if err := recoverCompactionState(compactionPaths); err != nil {
 		return nil, fmt.Errorf("recover interrupted compaction: %w", err)
 	}
@@ -143,6 +169,7 @@ func New(config Config) (*Store, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Store{
+		owner:  owner,
 		config: config,
 		logger: logger.New("store"),
 		ctx:    ctx,
@@ -189,29 +216,25 @@ func New(config Config) (*Store, error) {
 	if config.AutoCompact {
 		s.startCompactionTask()
 	}
+	owned = true
 	return s, nil
 }
 
 // Close shuts down the store gracefully
 func (s *Store) Close() error {
-	if s.closed.Swap(true) {
-		return nil // Already closed
-	}
-
-	// Stop background tasks
-	s.cancel()
-	s.wg.Wait()
-
-	// Final sync
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	syncErr := s.syncLog()
-	if syncErr != nil {
-		s.logger.Warn().Err(syncErr).Msg("Failed to sync on close")
-	}
-	closeErr := s.log.Close()
-	return errors.Join(syncErr, closeErr)
+	s.closeOnce.Do(func() {
+		wasClosed := s.closed.Swap(true)
+		s.cancel()
+		s.wg.Wait()
+		s.mu.Lock()
+		if !wasClosed {
+			s.closeErr = errors.Join(s.syncLog(), s.log.Close())
+		}
+		s.mu.Unlock()
+		// Even a failed final sync must drain/close the writer before release.
+		s.closeErr = errors.Join(s.closeErr, s.owner.Close())
+	})
+	return s.closeErr
 }
 
 // Sync flushes all append-log writes completed before this call to durable
@@ -223,14 +246,43 @@ func (s *Store) Sync() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return ErrStoreClosed
+	}
 	return s.syncLog()
 }
 
 func (s *Store) syncLog() error {
+	var err error
 	if s.syncForTest != nil {
-		return s.syncForTest()
+		err = s.syncForTest()
+	} else {
+		err = s.log.Sync()
 	}
-	return s.log.Sync()
+	if err != nil {
+		s.durabilityErr = errors.Join(ErrDurability, err)
+	} else {
+		s.durabilityErr = nil
+	}
+	return s.durabilityErr
+}
+
+// DurabilityError reports whether a prior sync failed. Reads remain available;
+// mutations fail closed until an explicit or periodic Sync succeeds.
+func (s *Store) DurabilityError() error {
+	if s.closed.Load() {
+		return ErrStoreClosed
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.durabilityErr
+}
+
+func (s *Store) writableLocked() error {
+	if s.closed.Load() {
+		return ErrStoreClosed
+	}
+	return s.durabilityErr
 }
 
 // recover rebuilds the index from the append log
@@ -274,7 +326,12 @@ func (s *Store) startSyncTask() {
 				return
 			case <-ticker.C:
 				s.mu.Lock()
-				_ = s.syncLog()
+				if !s.closed.Load() {
+					previouslyHealthy := s.durabilityErr == nil
+					if err := s.syncLog(); err != nil && previouslyHealthy {
+						s.logger.Error().Err(err).Msg("Storage synchronization failed; mutations suspended")
+					}
+				}
 				s.mu.Unlock()
 			}
 		}
@@ -304,23 +361,34 @@ func (s *Store) startCompactionTask() {
 
 // Put stores a key-value pair with optional metadata
 func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
-	return s.put(key, value, meta, false)
+	return s.put(key, value, meta, false, false)
 }
 
 // PutExisting updates an existing key without creating it. The existence
 // check and append happen under the same store lock so a concurrent delete
 // cannot turn a stale update into a resurrected row.
 func (s *Store) PutExisting(key string, value []byte, meta *EntryMeta) error {
-	return s.put(key, value, meta, true)
+	return s.put(key, value, meta, true, false)
 }
 
-func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting bool) error {
+// PutExistingSynced publishes an existing row only after its append is synced.
+// Readers retain the previous value and metadata if sync fails, including after
+// a later successful Sync. Failed bytes may still reach disk: restart recovery
+// can observe that uncertain outcome, and callers must retain recovery inputs.
+func (s *Store) PutExistingSynced(key string, value []byte, meta *EntryMeta) error {
+	return s.put(key, value, meta, true, true)
+}
+
+func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting, syncBeforePublish bool) error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.writableLocked(); err != nil {
+		return err
+	}
 	if requireExisting && s.index.Get(key) == nil {
 		return fmt.Errorf("key %s: %w", key, errKeyNotFound)
 	}
@@ -346,6 +414,12 @@ func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting b
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
 
+	if syncBeforePublish {
+		if err := s.syncLog(); err != nil {
+			return fmt.Errorf("sync before publishing record: %w", err)
+		}
+	}
+
 	// Update index
 	s.index.Put(key, &IndexEntry{
 		Offset:    offset,
@@ -364,7 +438,7 @@ func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting b
 	s.cache.Remove(key)
 
 	s.stats.Writes.Add(1)
-	if s.config.SyncInterval == 0 {
+	if s.config.SyncInterval == 0 && !syncBeforePublish {
 		if err := s.syncLog(); err != nil {
 			return fmt.Errorf("sync appended record: %w", err)
 		}
@@ -399,12 +473,9 @@ func (s *Store) Get(key string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read from log: %w", err)
 	}
 
-	// Populate cache (upgrade to write lock)
-	s.mu.RUnlock()
-	s.mu.Lock()
+	// The cache has its own lock. Retain the store read lock so a concurrent
+	// publication or compaction cannot invalidate this value before insertion.
 	s.cache.Put(key, value)
-	s.mu.Unlock()
-	s.mu.RLock()
 
 	s.stats.CacheMisses.Add(1)
 	s.stats.Reads.Add(1)
@@ -437,6 +508,9 @@ func (s *Store) Delete(key string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.writableLocked(); err != nil {
+		return err
+	}
 
 	// Check if key exists
 	if s.index.Get(key) == nil {
@@ -663,8 +737,8 @@ func (s *Store) Compact() error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed.Load() {
-		return ErrStoreClosed
+	if err := s.writableLocked(); err != nil {
+		return err
 	}
 
 	paths, err := pathsForCompaction(s.log.path)

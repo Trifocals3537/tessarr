@@ -21,6 +21,13 @@ import (
 type (
 	SwitcherStatus string
 	TorrentState   string
+	UncachedPolicy string
+)
+
+const (
+	UncachedPolicyInherit UncachedPolicy = "inherit"
+	UncachedPolicyAllow   UncachedPolicy = "allow"
+	UncachedPolicyDeny    UncachedPolicy = "deny"
 )
 
 const (
@@ -95,6 +102,9 @@ type Entry struct {
 
 	// Files (from debrid cache)
 	Files map[string]*File `msgpack:"files" json:"files"` // filename -> File details
+	// FileScopeRestricted pins a synthetic season child to its canonical files.
+	// A provider refresh must never expand it back into the parent transfer.
+	FileScopeRestricted bool `msgpack:"file_scope_restricted,omitempty" json:"-"`
 
 	State TorrentState `msgpack:"state" json:"state"` // This is for QBitTorrent compatibility
 	// Provider State (from active providerEntry)
@@ -133,6 +143,9 @@ type Entry struct {
 	DownloadUncached bool                  `msgpack:"download_uncached,omitempty" json:"download_uncached,omitempty"` // Force uncached download
 	CallbackURL      string                `msgpack:"callback_url,omitempty" json:"callback_url,omitempty"`           // Callback URL for completion
 	SkipMultiSeason  bool                  `msgpack:"skip_multi_season,omitempty" json:"skip_multi_season,omitempty"` // Skip multi-season detection
+	// AdmissionUncachedPolicy preserves the original request independently of
+	// the effective provider attempt. Empty identifies a legacy boolean record.
+	AdmissionUncachedPolicy UncachedPolicy `msgpack:"admission_uncached_policy,omitempty" json:"-"`
 
 	// Error tracking
 	LastError     string     `msgpack:"last_error,omitempty" json:"last_error,omitempty"`           // Last error message
@@ -370,6 +383,9 @@ func (e *Entry) AddTorrentProvider(debridTorrent *debridTypes.Torrent) (*Provide
 	for _, f := range debridTorrent.GetFiles() {
 		canonicalName := canonicalNames[f.Name]
 		if canonicalName == "" {
+			if e.FileScopeRestricted {
+				continue
+			}
 			return nil, fmt.Errorf("provider file %q has no canonical identity", f.Name)
 		}
 		if _, exists := providerEntry.Files[canonicalName]; exists {
@@ -437,6 +453,9 @@ func (e *Entry) reconcileTorrentFiles(remote *debridTypes.Torrent) (map[string]s
 		canonicalNames[file.Name] = file.Name
 	}
 	if len(e.Files) == 0 {
+		if e.FileScopeRestricted {
+			return nil, ErrIncompleteProviderFileScope
+		}
 		return canonicalNames, nil
 	}
 
@@ -549,7 +568,20 @@ func (e *Entry) reconcileTorrentFiles(remote *debridTypes.Torrent) (map[string]s
 		}
 	}
 
-	canChangeLocalIdentity := !torrentArtifactsMayExist(e)
+	if e.FileScopeRestricted {
+		for name, file := range e.Files {
+			if file == nil || (!file.Deleted && canonicalToRemote[name] == "") {
+				return nil, fmt.Errorf("%w: %q", ErrIncompleteProviderFileScope, name)
+			}
+		}
+		for name := range remoteFiles {
+			if remoteToCanonical[name] == "" {
+				delete(remoteFiles, name)
+				delete(canonicalNames, name)
+			}
+		}
+	}
+	canChangeLocalIdentity := !e.FileScopeRestricted && !torrentArtifactsMayExist(e)
 	renames := make(map[string]string)
 	for oldName, newName := range canonicalToRemote {
 		if canChangeLocalIdentity && oldName != newName {

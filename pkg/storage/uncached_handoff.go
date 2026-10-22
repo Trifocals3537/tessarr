@@ -81,6 +81,13 @@ func (s *Storage) AuthorizeUncachedHandoff(expected *Entry) error {
 	if !FailedUncachedHandoff(current) {
 		return ErrQueuedDeletionIdentityMismatch
 	}
+	protected, err := s.IsRecoveredProviderPlacement(current.ActiveProvider, current.GetActiveProvider().ID)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return ErrRecoveredProviderPlacement
+	}
 	want, err := handoffFingerprint(expected)
 	if err != nil {
 		return err
@@ -172,6 +179,13 @@ func (s *Storage) ValidateTransferCleanup(e *Entry) error {
 	p := e.GetActiveProvider()
 	if p == nil || p.Provider == "" || p.ID == "" {
 		return fmt.Errorf("invalid active transfer placement")
+	}
+	protected, err := s.IsRecoveredProviderPlacement(p.Provider, p.ID)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return ErrRecoveredProviderPlacement
 	}
 	// Provider IDs can back library symlinks even for a different hash. Scan
 	// raw main snapshots rather than reentering this key's lifecycle lock.
