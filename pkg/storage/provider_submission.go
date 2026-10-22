@@ -238,8 +238,8 @@ func (s *Storage) BindProviderSubmission(expected *Entry, attempt string, remote
 		if intent == nil || intent.Attempt != attempt || (intent.Phase != SubmissionPending && intent.Phase != SubmissionBound) || remote == nil || intent.ProviderID == "" || remote.Id != intent.ProviderID || remote.Debrid != intent.Provider || !strings.EqualFold(remote.InfoHash, current.InfoHash) {
 			return ErrProviderSubmissionConflict
 		}
-		// Preserve canonical files until the normal authoritative file validator
-		// accepts the provider snapshot; only bind the transfer identity here.
+		// Preserve canonical files until normal validation accepts the provider
+		// snapshot; only bind the transfer identity here.
 		if _, err := current.UpdateTorrentProviderState(remote); err != nil {
 			return err
 		}
