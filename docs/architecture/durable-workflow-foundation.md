@@ -24,8 +24,10 @@ are subsequent milestones; this change does not claim to implement them.
   accounting while the durable row remains queued.
 - A job outcome updates a fresh queue snapshot under the existing storage gate,
   requires the same durable incarnation and an active downloading state, and
-  synchronizes the record before returning success. It never resurrects a row
-  or overwrites newer file/provider metadata.
+  synchronizes the record before publishing its value or metadata to readers.
+  A failed sync preserves the prior indexed state, even after periodic sync
+  restores storage health. It never resurrects a row or overwrites newer
+  file/provider metadata.
 - Completion notifications and Arr refresh begin only after the completion
   checkpoint succeeds. Optional notification delivery remains best effort.
 - Synchronization failures are visible through readiness and block further
@@ -59,16 +61,21 @@ errors because they can contain credentials or even unsafe formatting methods.
 
 The manager's `queueOutcomeStore` is a narrow repository contract. Its current
 implementation, `storage.CommitQueuedOutcome`, uses a single existing queue
-record and an explicit sync barrier. Outcomes cover failed work, provider-slot
-deferral, and completed output. The in-process generation fence is acquired
-before the storage gate; the durable incarnation is checked again inside it.
+record and the append log's `PutExistingSynced` publication barrier. The append,
+sync, and index/cache publication share one store lock, so queue scans and polling
+APIs cannot expose a completion whose checkpoint failed. Outcomes cover failed
+work, provider-slot deferral, and completed output. The in-process generation
+fence is acquired before the storage gate; the durable incarnation is checked
+again inside it.
 Terminal or deleting rows reject stale outcomes without degrading the service.
 No network operation is performed while either gate is held.
 
 An outcome checkpoint can fail after bytes reached the operating system. The
 caller must therefore treat that outcome as uncertain, suppress success side
 effects, and retain the existing source/ownership state. Startup recovery remains
-the authority for the next attempt. There is no exactly-once claim for external
+the authority for the next attempt. Failed bytes can survive a later sync and
+be recovered at restart; preserving the prior live view does not promise a
+rollback of the uncertain append. There is no exactly-once claim for external
 provider, Arr, or filesystem effects.
 
 ## Next milestones
@@ -94,7 +101,8 @@ provider, Arr, or filesystem effects.
 Required coverage includes real subprocess exclusion/crash release, compaction
 crash recovery, immediate recovery without a final Close/fsync, failed periodic
 sync and retry, outcome durability, stale generations and incarnations, deletion
-races, panic survival, canceled work, and suppressed completion side effects.
+races, panic survival, canceled work, suppressed completion side effects, and
+completion publication through cached reads, scans, metadata, and polling APIs.
 The existing cleanup/reopen/ownership matrices, provider and protocol fixtures,
 Windows/Linux suites, Linux race/static/vulnerability checks, and seedbox build
 remain release gates. Real FUSE canaries run on a capable isolated Linux runner.

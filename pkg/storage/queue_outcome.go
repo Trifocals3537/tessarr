@@ -25,7 +25,7 @@ type QueueOutcome struct {
 
 // CommitQueuedOutcome is a single-row durable transition boundary. It checks
 // the durable incarnation under the existing lifecycle lock, mutates only
-// outcome fields on a fresh snapshot, and returns only after fsync succeeds.
+// outcome fields on a fresh snapshot, and publishes only after fsync succeeds.
 // It never recreates a missing row or changes deletion/provider authorization.
 // Legacy rows with no incarnation remain protected by the manager generation
 // fence; they may transition only while the stored incarnation is also empty.
@@ -65,10 +65,7 @@ func (s *Storage) CommitQueuedOutcome(expected *Entry, outcome QueueOutcome) (*E
 	case QueueOutcomeCompleted:
 		current.MarkAsCompleted(outcome.ContentPath)
 	}
-	if err := s.writeQueueRaw(current, true); err != nil {
-		return nil, err
-	}
-	if err := s.SyncQueue(); err != nil {
+	if err := s.writeQueueRecord(current, s.queue.PutExistingSynced); err != nil {
 		return nil, err
 	}
 	return current, nil

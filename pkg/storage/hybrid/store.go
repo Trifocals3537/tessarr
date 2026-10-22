@@ -361,17 +361,25 @@ func (s *Store) startCompactionTask() {
 
 // Put stores a key-value pair with optional metadata
 func (s *Store) Put(key string, value []byte, meta *EntryMeta) error {
-	return s.put(key, value, meta, false)
+	return s.put(key, value, meta, false, false)
 }
 
 // PutExisting updates an existing key without creating it. The existence
 // check and append happen under the same store lock so a concurrent delete
 // cannot turn a stale update into a resurrected row.
 func (s *Store) PutExisting(key string, value []byte, meta *EntryMeta) error {
-	return s.put(key, value, meta, true)
+	return s.put(key, value, meta, true, false)
 }
 
-func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting bool) error {
+// PutExistingSynced publishes an existing row only after its append is synced.
+// Readers retain the previous value and metadata if sync fails, including after
+// a later successful Sync. Failed bytes may still reach disk: restart recovery
+// can observe that uncertain outcome, and callers must retain recovery inputs.
+func (s *Store) PutExistingSynced(key string, value []byte, meta *EntryMeta) error {
+	return s.put(key, value, meta, true, true)
+}
+
+func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting, syncBeforePublish bool) error {
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
@@ -406,6 +414,12 @@ func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting b
 		return fmt.Errorf("failed to append to log: %w", err)
 	}
 
+	if syncBeforePublish {
+		if err := s.syncLog(); err != nil {
+			return fmt.Errorf("sync before publishing record: %w", err)
+		}
+	}
+
 	// Update index
 	s.index.Put(key, &IndexEntry{
 		Offset:    offset,
@@ -424,7 +438,7 @@ func (s *Store) put(key string, value []byte, meta *EntryMeta, requireExisting b
 	s.cache.Remove(key)
 
 	s.stats.Writes.Add(1)
-	if s.config.SyncInterval == 0 {
+	if s.config.SyncInterval == 0 && !syncBeforePublish {
 		if err := s.syncLog(); err != nil {
 			return fmt.Errorf("sync appended record: %w", err)
 		}
@@ -459,12 +473,9 @@ func (s *Store) Get(key string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read from log: %w", err)
 	}
 
-	// Populate cache (upgrade to write lock)
-	s.mu.RUnlock()
-	s.mu.Lock()
+	// The cache has its own lock. Retain the store read lock so a concurrent
+	// publication or compaction cannot invalidate this value before insertion.
 	s.cache.Put(key, value)
-	s.mu.Unlock()
-	s.mu.RLock()
 
 	s.stats.CacheMisses.Add(1)
 	s.stats.Reads.Add(1)
