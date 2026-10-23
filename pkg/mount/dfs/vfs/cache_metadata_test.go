@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -104,6 +105,12 @@ func TestCacheMetadataAtomicReplacement(t *testing.T) {
 		got, err := os.ReadFile(path)
 		if err != nil || string(got) != contents {
 			t.Fatalf("metadata = %q, %v; want %q", got, err, contents)
+		}
+		if runtime.GOOS != "windows" {
+			info, err := os.Stat(path)
+			if err != nil || info.Mode().Perm() != 0o600 {
+				t.Fatalf("metadata should remain private after atomic publication: info=%v err=%v", info, err)
+			}
 		}
 	}
 	files, err := os.ReadDir(directory)

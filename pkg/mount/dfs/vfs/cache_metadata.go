@@ -42,10 +42,6 @@ func writeCacheMetadata(path string, data []byte) error {
 		return err
 	}
 	defer os.Remove(file.Name())
-	if err := file.Chmod(0o644); err != nil {
-		_ = file.Close()
-		return err
-	}
 	if _, err := file.Write(data); err != nil {
 		_ = file.Close()
 		return err
