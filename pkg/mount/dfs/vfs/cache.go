@@ -284,21 +284,28 @@ func (c *Cache) scanDiskCandidates() diskScanResult {
 			filename := strings.TrimSuffix(sub.Name(), ".json")
 			metaPath := filepath.Join(entryDir, sub.Name())
 			dataPath := filepath.Join(entryDir, filename)
-			key := buildCacheKey(entryName, filename)
-
-			var opens int32
-			var inMap bool
-			if item, ok := c.items.Load(key); ok {
-				opens = item.opens.Load()
-				inMap = true
-			}
-
 			// Read and parse metadata
 			var info ItemInfo
 			if err := decodeJSONFile(metaPath, &info); err != nil {
 				c.logger.Warn().Err(err).Str("path", metaPath).Msg("failed to read or parse cache metadata")
 				result.errors++
 				continue
+			}
+			if info.Filename != "" {
+				if !validCacheFilename(info.Filename) || filepath.Base(cacheMetadataPath(entryDir, info.Filename)) != sub.Name() {
+					c.logger.Warn().Str("path", metaPath).Msg("cache metadata filename identity mismatch")
+					result.errors++
+					continue
+				}
+				filename = info.Filename
+				dataPath = filepath.Join(entryDir, filename)
+			}
+			key := buildCacheKey(entryName, filename)
+			var opens int32
+			var inMap bool
+			if item, ok := c.items.Load(key); ok {
+				opens = item.opens.Load()
+				inMap = true
 			}
 
 			// Verify data file exists
@@ -504,7 +511,7 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 	}
 
 	cachePath := filepath.Join(itemDir, filename)
-	metaPath := filepath.Join(itemDir, filename+".json")
+	metaPath := cacheMetadataPath(itemDir, filename)
 
 	// Load existing metadata before constructing the buffer so its range
 	// tracker is seeded with anything the prior session persisted.
@@ -512,6 +519,13 @@ func (c *Cache) newItem(key, entryName, filename string, fileSize int64) (*Cache
 	if err := decodeJSONFile(metaPath, &info); err != nil && !os.IsNotExist(err) {
 		c.logger.Warn().Err(err).Str("key", key).Msg("corrupt metadata, resetting")
 		info = ItemInfo{}
+	}
+	if info.Filename != "" && info.Filename != filename {
+		c.logger.Warn().Str("key", key).Msg("cache metadata filename identity mismatch, resetting")
+		info = ItemInfo{}
+	}
+	if filepath.Base(metaPath) != filename+".json" {
+		info.Filename = filename
 	}
 
 	// Defend against a directory accidentally sitting at cachePath
@@ -1123,17 +1137,10 @@ func (item *CacheItem) flushMetadata(force bool) {
 		item.metaDirty.Store(true) // retry on the next tick
 		return
 	}
-	// Atomic write: write to temp file then rename to avoid corrupt reads
-	// from scanDiskCandidates racing with this write.
-	tmpPath := item.metaPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	// A fixed-length temporary sibling also fits when the metadata leaf is
+	// already at the filesystem's component limit.
+	if err := writeCacheMetadata(item.metaPath, data); err != nil {
 		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to write cache metadata")
-		item.metaDirty.Store(true) // retry on the next tick
-		return
-	}
-	if err := os.Rename(tmpPath, item.metaPath); err != nil {
-		item.cache.logger.Warn().Err(err).Str("key", item.key).Msg("failed to rename cache metadata")
-		_ = os.Remove(tmpPath)
 		item.metaDirty.Store(true) // retry on the next tick
 		return
 	}
@@ -1141,10 +1148,11 @@ func (item *CacheItem) flushMetadata(force bool) {
 
 // ItemInfo is persisted to disk
 type ItemInfo struct {
-	Size    int64         `json:"size"`
-	Rs      ranges.Ranges `json:"ranges"` // Downloaded regions
-	ModTime time.Time     `json:"mod_time"`
-	ATime   time.Time     `json:"atime"`
+	Filename string        `json:"filename,omitempty"` // Exact data leaf when the sidecar name must be shortened.
+	Size     int64         `json:"size"`
+	Rs       ranges.Ranges `json:"ranges"` // Downloaded regions
+	ModTime  time.Time     `json:"mod_time"`
+	ATime    time.Time     `json:"atime"`
 }
 
 // touch updates access time
