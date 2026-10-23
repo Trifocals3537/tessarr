@@ -26,11 +26,7 @@ func (m *Manager) RemoveFromProvider(providerEntry *storage.ProviderEntry) error
 	if client == nil {
 		return fmt.Errorf("provider client %q is not configured", providerEntry.Provider)
 	}
-	err := client.DeleteTorrent(providerEntry.ID)
-	if providerPlacementAlreadyAbsent(err) {
-		return nil
-	}
-	return err
+	return m.deleteProviderTorrent(client, providerEntry.ID)
 }
 
 func providerPlacementAlreadyAbsent(err error) bool {
@@ -90,6 +86,18 @@ func (m *Manager) RemoveTorrentPlacements(entries ...*storage.Entry) error {
 func (m *Manager) deleteProviderTorrent(client common.Client, torrentID string) error {
 	if client == nil || torrentID == "" {
 		return nil
+	}
+	if err := m.verifyPlacementAccount(client, torrentID); err != nil {
+		return err
+	}
+	if m.storage != nil {
+		protected, err := m.storage.IsRecoveredProviderPlacement(client.Config().Name, torrentID)
+		if err != nil {
+			return err
+		}
+		if protected {
+			return storage.ErrRecoveredProviderPlacement
+		}
 	}
 	err := client.DeleteTorrent(torrentID)
 	if providerPlacementAlreadyAbsent(err) {

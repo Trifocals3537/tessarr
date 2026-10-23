@@ -567,9 +567,13 @@ func terminalTorboxState(state string) bool {
 }
 
 func (tb *Torbox) GetTorrent(torrentId string) (*types.Torrent, error) {
+	return tb.GetTorrentContext(context.Background(), torrentId)
+}
+
+func (tb *Torbox) GetTorrentContext(ctx context.Context, torrentId string) (*types.Torrent, error) {
 	var res InfoResponse
 
-	resp, err := tb.doGet("/api/torrents/mylist", map[string]string{"id": torrentId}, &res)
+	resp, err := tb.doGetContext(ctx, "/api/torrents/mylist", map[string]string{"id": torrentId, "bypass_cache": "true"}, &res)
 	if err != nil {
 		return nil, err
 	}
@@ -583,6 +587,7 @@ func (tb *Torbox) GetTorrent(torrentId string) (*types.Torrent, error) {
 	}
 	t := &types.Torrent{
 		Id:               strconv.Itoa(data.Id),
+		InfoHash:         data.Hash,
 		Name:             data.Name,
 		Bytes:            data.Size,
 		Progress:         data.Progress * 100,

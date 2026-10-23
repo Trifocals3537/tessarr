@@ -706,9 +706,13 @@ func (r *RealDebrid) addMagnetContext(ctx context.Context, t *types.Torrent) (*t
 }
 
 func (r *RealDebrid) GetTorrent(torrentId string) (*types.Torrent, error) {
+	return r.GetTorrentContext(context.Background(), torrentId)
+}
+
+func (r *RealDebrid) GetTorrentContext(ctx context.Context, torrentId string) (*types.Torrent, error) {
 	var data torrentInfo
 
-	resp, err := r.doGet(fmt.Sprintf("/torrents/info/%s", torrentId), &data)
+	resp, err := r.doGetContext(ctx, fmt.Sprintf("/torrents/info/%s", torrentId), &data)
 	if err != nil {
 		return nil, err
 	}
@@ -721,6 +725,7 @@ func (r *RealDebrid) GetTorrent(torrentId string) (*types.Torrent, error) {
 		}
 		t := &types.Torrent{
 			Id:               data.ID,
+			InfoHash:         data.Hash,
 			Name:             data.Filename,
 			Bytes:            data.Bytes,
 			Progress:         data.Progress,

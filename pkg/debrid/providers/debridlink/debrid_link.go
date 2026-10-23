@@ -238,12 +238,16 @@ func (dl *DebridLink) IsAvailable(hashes []string) map[string]bool {
 }
 
 func (dl *DebridLink) GetTorrent(torrentId string) (*types.Torrent, error) {
+	return dl.GetTorrentContext(context.Background(), torrentId)
+}
+
+func (dl *DebridLink) GetTorrentContext(ctx context.Context, torrentId string) (*types.Torrent, error) {
 	if strings.TrimSpace(torrentId) == "" {
 		return nil, fmt.Errorf("torrent ID is empty")
 	}
 	var res torrentInfo
 
-	resp, err := dl.doGet("/seedbox/list", map[string]string{"ids": torrentId}, &res)
+	resp, err := dl.doGetContext(ctx, "/seedbox/list", map[string]string{"ids": torrentId}, &res)
 	if err != nil {
 		return nil, err
 	}

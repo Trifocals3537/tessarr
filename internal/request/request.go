@@ -36,6 +36,14 @@ var (
 
 const defaultMaxConnsPerHost = 32
 
+type mutationAttemptKey struct{}
+
+// WithMutationAttempt disables HTTP retries and redirects for an account-scoped
+// mutation. Its durable caller reconciles an ambiguous response before retrying.
+func WithMutationAttempt(ctx context.Context) context.Context {
+	return context.WithValue(ctx, mutationAttemptKey{}, true)
+}
+
 type ClientOption func(*Client)
 
 // Client represents an HTTP client with additional capabilities
@@ -211,6 +219,20 @@ func (c *Client) do(req *http.Request, excludedHeaders map[string]struct{}) (*ht
 		default:
 			c.rateLimiter.Take()
 		}
+	}
+	if single, _ := req.Context().Value(mutationAttemptKey{}).(bool); single {
+		// Share the configured TLS/proxy/traffic transport and connection pool,
+		// without changing the shared client's retry or redirect policy.
+		client := &http.Client{Transport: c.httpClient.Transport, Timeout: c.httpClient.Timeout, Jar: c.httpClient.Jar,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		resp, err := client.Do(req)
+		var requestErr *url.Error
+		if errors.As(err, &requestErr) {
+			// Provider URLs can carry account tokens in their query string.
+			// Preserve transport/cancellation classification without persisting it.
+			return resp, fmt.Errorf("provider mutation request failed: %w", requestErr.Err)
+		}
+		return resp, err
 	}
 
 	// Convert to a retryable request without copying replayable in-memory
