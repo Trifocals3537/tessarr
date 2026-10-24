@@ -13,6 +13,9 @@ class RepairManager {
         this.latestStatus = {};
         this.bind();
         this.loadAll();
+        this.loadCleanup();
+        this.cleanupTimer = setInterval(() => this.loadCleanup(), 15000);
+        window.addEventListener("pagehide", () => clearInterval(this.cleanupTimer), {once: true});
     }
 
     bind() {
@@ -22,6 +25,7 @@ class RepairManager {
         $('fixBrokenBtn')?.addEventListener('click', () => this.fixBroken());
         $('clearStateBtn')?.addEventListener('click', () => this.openClearStateModal());
         $('viewBrokenBtn')?.addEventListener('click', () => this.openBrokenModal());
+        $('refreshCleanupBtn')?.addEventListener('click', () => this.loadCleanup());
         $('refreshHistoryBtn')?.addEventListener('click', () => this.loadHistory());
         $('refreshBrokenBtn')?.addEventListener('click', () => this.loadBroken());
         $('clearHistoryBtn')?.addEventListener('click', () => this.clearHistory());
@@ -48,6 +52,72 @@ class RepairManager {
         await Promise.all([this.loadRepairConfig(), this.loadStatus(), this.loadHistory(), this.loadArrs()]);
     }
 
+    async loadCleanup() {
+        const list = document.getElementById('cleanupWorkList');
+        if (!list) return;
+        try {
+            const data = await this.fetchJSON(`${this.api}/cleanup/workflows`);
+            document.getElementById('cleanupStatus').textContent = data.total ? `${data.total} cleanup item(s) retained` : 'No pending cleanup.';
+            list.replaceChildren();
+            for (const item of data.active || []) {
+                const row = document.createElement('div');
+                row.className = 'bg-base-200 rounded-lg p-3 space-y-2';
+                const title = document.createElement('p');
+                title.className = 'font-medium break-all';
+                title.textContent = item.name || item.key;
+                const detail = document.createElement('p');
+                detail.className = 'text-sm break-all';
+                detail.textContent = `${item.state} · attempt ${item.attempts} · ${String(item.reason || 'waiting').replaceAll('_', ' ')}${item.next_at && !item.next_at.startsWith('0001') ? ` · next check ${new Date(item.next_at).toLocaleString()}` : ''}`;
+                const path = document.createElement('p');
+                path.className = 'text-xs font-mono break-all';
+                path.textContent = item.saved_path || '';
+                row.append(title, detail, path);
+                for (const action of ['retry', 'reconcile']) {
+                    const button = document.createElement('button');
+                    button.className = 'btn btn-sm btn-outline mr-2';
+                    button.textContent = action === 'retry' ? 'Retry saved cleanup' : 'Reconcile verified leftovers';
+                    button.disabled = item.state === 'running';
+                    button.addEventListener('click', () => this.resolveCleanup(item, action, button));
+                    row.append(button);
+                }
+                list.append(row);
+            }
+            const history = document.getElementById('cleanupHistory');
+            history.replaceChildren();
+            for (const item of data.history || []) {
+                const line = document.createElement('p');
+                line.textContent = `${item.key} · ${item.state} · ${item.decisions?.length || 0} operator decision(s)`;
+                history.append(line);
+            }
+        } catch (error) {
+            document.getElementById('cleanupStatus').textContent = `Cleanup status unavailable: ${error.message}`;
+        }
+    }
+
+    async resolveCleanup(item, action, button) {
+        const message = action === 'retry'
+            ? 'Retry this item using its original cleanup policy and safeguards?'
+            : 'Verify the saved provider IDs and reconcile absent outputs or empty owned staging folders? Existing media and uncertain provider transfers remain protected.';
+        if (!window.confirm(message)) return;
+        button.disabled = true;
+        const bytes = new Uint8Array(16);
+        if (!globalThis.crypto?.getRandomValues) { this.toast("Recovery actions require browser cryptographic support.", "error"); button.disabled = false; return; }
+        globalThis.crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 15) | 64;
+        bytes[8] = (bytes[8] & 63) | 128;
+        const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        const requestId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+
+        try {
+            const response = await fetch(`${this.api}/cleanup/workflows/${encodeURIComponent(item.key)}/resolve`, {
+                method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({incarnation: item.incarnation, revision: item.revision, request_id: requestId, action}),
+            });
+            if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+            this.toast('Cleanup recovery scheduled.', 'success');
+        } catch (error) { this.toast(error.message, 'error'); }
+        await this.loadCleanup();
+    }
     async loadRepairConfig() {
         try {
             this.repairConfig = await this.fetchJSON(`${this.api}/repair/config`) || {};

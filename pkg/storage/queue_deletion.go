@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Trifocals3537/tessarr/internal/workflow"
 	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
@@ -50,6 +51,7 @@ const (
 )
 
 type queueDeletionTombstone struct {
+	Work                        *workflow.Record   `json:"work,omitempty"`
 	PlacementScope              string             `json:"placement_scope,omitempty"`
 	Version                     int                `json:"version"`
 	Phase                       queueDeletionPhase `json:"phase"`
@@ -66,6 +68,7 @@ type queueDeletionTombstone struct {
 // PlacementEntries are additional same-key snapshots (for example, a main
 // entry) needed to retry provider placement cleanup after a restart.
 type QueueDeletionIntent struct {
+	Work                        *workflow.Record
 	PlacementScope              string
 	InfoHash                    string
 	QueueIncarnation            string
@@ -105,6 +108,9 @@ func decodeQueueDeletionTombstone(
 	var tombstone queueDeletionTombstone
 	if err := json.Unmarshal(data, &tombstone); err != nil {
 		return nil, fmt.Errorf("decode queue deletion tombstone %s: %w", key, err)
+	}
+	if err := tombstone.Work.Validate(); err != nil {
+		return nil, err
 	}
 	if tombstone.Version != queueDeletionTombstoneVersion {
 		return nil, fmt.Errorf(
@@ -211,6 +217,7 @@ func queueDeletionIntentFromTombstone(
 	}
 	return &QueueDeletionIntent{
 		InfoHash:                    key,
+		Work:                        tombstone.Work,
 		QueueIncarnation:            tombstone.QueueIncarnation,
 		Phase:                       string(tombstone.Phase),
 		Entry:                       entry,
@@ -341,6 +348,9 @@ func (s *Storage) prepareQueuedDeletion(
 		return nil, err
 	}
 	if found {
+		if tombstone.Work != nil {
+			return nil, workflow.ErrClaim
+		}
 		if tombstone.PlacementScope == QueuePlacementScopeTransferOnly {
 			if scope == QueuePlacementScopeAll && placementCleanup && len(placementSnapshots) == 0 {
 				return nil, fmt.Errorf("queue-only administrative cleanup cannot adopt immutable client intent; finish client cleanup and reconcile provider placements manually")
@@ -465,6 +475,7 @@ func (s *Storage) updateQueuedDeletion(
 	infohash string,
 	incarnation string,
 	update func(*queueDeletionTombstone) error,
+	claim ...string,
 ) error {
 	key := normalizeMainEntryKey(infohash)
 	ref, err := s.acquireMainEntryState(key)
@@ -494,6 +505,9 @@ func (s *Storage) updateQueuedDeletion(
 			tombstone.QueueIncarnation,
 			incarnation,
 		)
+	}
+	if err := cleanupToken(tombstone, firstCleanupToken(claim)); err != nil {
+		return err
 	}
 	if err := update(tombstone); err != nil {
 		return err
@@ -561,10 +575,11 @@ func (s *Storage) markQueuedDeletionOpaqueCleanupComplete(
 
 // RetireQueuedDeletionRow removes only the exact snapshotted incarnation. A
 // replacement row can never be consumed by recovery or a stale delete retry.
-func (s *Storage) RetireQueuedDeletionRow(
-	infohash string,
-	incarnation string,
-) error {
+func (s *Storage) RetireQueuedDeletionRow(infohash, incarnation string) error {
+	return s.retireQueuedDeletionRow(infohash, incarnation, "")
+}
+
+func (s *Storage) retireQueuedDeletionRow(infohash, incarnation, token string) error {
 	key := normalizeMainEntryKey(infohash)
 	ref, err := s.acquireMainEntryState(key)
 	if err != nil {
@@ -584,6 +599,9 @@ func (s *Storage) RetireQueuedDeletionRow(
 		return fmt.Errorf("%w: no durable intent for %s", ErrQueuedEntryNotFound, key)
 	}
 	state.queueDeleting = true
+	if err := cleanupToken(tombstone, token); err != nil {
+		return err
+	}
 	if tombstone.QueueIncarnation != incarnation {
 		return fmt.Errorf(
 			"%w: %s intent has incarnation %q, caller supplied %q",
@@ -639,11 +657,11 @@ func (s *Storage) RetireQueuedDeletionRow(
 // localCleanup callbacks run under the per-hash lifecycle lock, after the admin
 // durability gate. They must only perform local file work: never reenter Storage
 // or make provider/network calls.
-func (s *Storage) CompleteQueuedDeletion(
-	infohash string,
-	incarnation string,
-	localCleanup ...func() error,
-) error {
+func (s *Storage) CompleteQueuedDeletion(infohash, incarnation string, localCleanup ...func() error) error {
+	return s.completeQueuedDeletion(infohash, incarnation, "", localCleanup...)
+}
+
+func (s *Storage) completeQueuedDeletion(infohash, incarnation, token string, localCleanup ...func() error) error {
 	key := normalizeMainEntryKey(infohash)
 	ref, err := s.acquireMainEntryState(key)
 	if err != nil {
@@ -669,6 +687,9 @@ func (s *Storage) CompleteQueuedDeletion(
 		return nil
 	}
 	state.queueDeleting = true
+	if err := cleanupToken(tombstone, token); err != nil {
+		return err
+	}
 	if tombstone.QueueIncarnation != incarnation {
 		return fmt.Errorf(
 			"%w: %s intent has incarnation %q, caller supplied %q",
@@ -708,6 +729,11 @@ func (s *Storage) CompleteQueuedDeletion(
 	}
 	for _, cleanup := range localCleanup {
 		if err := cleanup(); err != nil {
+			return err
+		}
+	}
+	if token != "" {
+		if err := s.checkpointCleanupReceipt(key, tombstone); err != nil {
 			return err
 		}
 	}

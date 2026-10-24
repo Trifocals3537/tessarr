@@ -35,13 +35,14 @@ var legacyStoreNames = []string{"repair_jobs", "repair_keys"}
 
 // Storage handles persistence using HybridStore
 type Storage struct {
-	owner        *stateowner.Owner
-	closeOnce    sync.Once
-	closeErr     error
-	entries      *hybrid.Store
-	queue        *hybrid.Store
-	entryItems   *hybrid.Store
-	storageState *hybrid.Store
+	cleanupReceiptForTest func()
+	owner                 *stateowner.Owner
+	closeOnce             sync.Once
+	closeErr              error
+	entries               *hybrid.Store
+	queue                 *hybrid.Store
+	entryItems            *hybrid.Store
+	storageState          *hybrid.Store
 	// Durability hooks inject sync failures; production leaves them nil.
 	handoffSyncForTest     func() error
 	mainCleanupSyncForTest func() error

@@ -38,20 +38,21 @@ import (
 
 // Manager handles unified torrent management - replaces wire.Store completely
 type Manager struct {
-	workflowFault   atomic.Pointer[workflowFault]
-	storage         *storage.Storage
-	migrator        *Migrator
-	repair          *Repair
-	clients         *xsync.Map[string, debrid.Client]
-	arr             *arr.Storage
-	logger          zerolog.Logger
-	ready           chan struct{}
-	readyOnce       sync.Once
-	lifecycle       atomic.Pointer[lifecycleSnapshot]
-	streamClient    *http.Client
-	streamWait      func(context.Context, time.Duration) error
-	cdnTraffic      *cdntraffic.Governor
-	providerTraffic *providertraffic.Controller
+	cleanupPhaseForTest func(string)
+	workflowFault       atomic.Pointer[workflowFault]
+	storage             *storage.Storage
+	migrator            *Migrator
+	repair              *Repair
+	clients             *xsync.Map[string, debrid.Client]
+	arr                 *arr.Storage
+	logger              zerolog.Logger
+	ready               chan struct{}
+	readyOnce           sync.Once
+	lifecycle           atomic.Pointer[lifecycleSnapshot]
+	streamClient        *http.Client
+	streamWait          func(context.Context, time.Duration) error
+	cdnTraffic          *cdntraffic.Governor
+	providerTraffic     *providertraffic.Controller
 
 	// Migration jobs tracking
 	migrationJobs             *xsync.Map[string, *storage.SwitcherJob]
@@ -772,6 +773,8 @@ func (m *Manager) Start(ctx context.Context) error {
 		m.setLifecyclePhase(LifecyclePhaseFailed, "manager workers failed to start")
 		return fmt.Errorf("failed to start manager worker: %w", err)
 	}
+
+	m.startCleanupWorkflows()
 
 	// Start the mount manager if set
 	// This also start thr mounting process

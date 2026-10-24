@@ -98,6 +98,7 @@ func TestAdminRecoveryFailurePreservesAssociatedQueueCleanup(t *testing.T) {
 				}
 			}
 			clients.Store("fake", &placementDeleteTestProvider{name: "fake", delete: func(string) error { return nil }})
+			requestCleanupRetry(t, manager, "retry")
 			residual, fatal := manager.recoverQueuedDeletions()
 			if residual != nil || fatal != nil {
 				t.Fatalf("successful retry = %v, %v", residual, fatal)

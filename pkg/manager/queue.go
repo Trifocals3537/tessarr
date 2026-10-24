@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
@@ -87,6 +88,8 @@ func NewNZBRequest(name, downloadFolder string, nzbContent []byte, arr *arr.Arr,
 }
 
 type Queue struct {
+	cleanupOwnerOnce   sync.Once
+	cleanupOwner       string
 	outcomes           queueOutcomeStore
 	storage            *storage.Storage
 	logger             zerolog.Logger
@@ -107,6 +110,7 @@ func newQueue(storage *storage.Storage, removeStalledAfterStr string, lifecycles
 		lifecycle = newEntryLifecycle()
 	}
 	q := &Queue{
+		cleanupOwner:       uuid.NewString(),
 		storage:            storage,
 		logger:             logger.New("queue"),
 		lifecycle:          lifecycle,
@@ -498,4 +502,13 @@ func (q *Queue) UpdateWhere(predicate func(*storage.Entry) bool, updateFunc func
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (q *Queue) cleanupIdentity() string {
+	q.cleanupOwnerOnce.Do(func() {
+		if q.cleanupOwner == "" {
+			q.cleanupOwner = uuid.NewString()
+		}
+	})
+	return q.cleanupOwner
 }
