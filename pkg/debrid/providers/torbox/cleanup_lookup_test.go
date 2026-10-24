@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/Trifocals3537/tessarr/internal/customerror"
+	"github.com/Trifocals3537/tessarr/pkg/debrid/common"
 	"net/http"
 	"testing"
 )
@@ -34,6 +35,14 @@ func TestCleanupLookupRequiresTypedExactProviderAbsence(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatal("empty/malformed provider response accepted")
+			}
+			presence, err := provider.TorrentPresenceContext(context.Background(), "123")
+			if tc.absent {
+				if presence != common.TorrentAbsent || err != nil {
+					t.Fatal("typed absence was not accepted by presence capability", presence, err)
+				}
+			} else if presence != common.TorrentPresenceUnknown || err == nil {
+				t.Fatal("unverifiable response became presence evidence", presence, err)
 			}
 		})
 	}

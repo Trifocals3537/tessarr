@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,15 +157,22 @@ func TestCleanupRegressionStaleCleanupSnapshotDoesNotAffectReplacement(t *testin
 
 func TestCleanupRegressionDebridLinkCanRecoverCompletedProviderDeletion(t *testing.T) {
 	m := cleanupManager(t, t.TempDir())
-	deleted := false
+	var deleted atomic.Bool
+	var lookupAvailable atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "DELETE" && r.URL.Path == "/seedbox/deleted-transfer/remove" {
-			deleted = true
+			if deleted.Swap(true) {
+				t.Error("provider DELETE was replayed")
+			}
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		if r.Method != "GET" || r.URL.Path != "/seedbox/list" || r.URL.Query().Get("ids") != "deleted-transfer" {
 			t.Errorf("unexpected lookup %s %s", r.Method, r.URL)
+		}
+		if !lookupAvailable.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"success":true,"value":[]}`))
@@ -190,20 +199,32 @@ func TestCleanupRegressionDebridLinkCanRecoverCompletedProviderDeletion(t *testi
 	if err := p.DeleteTorrent("deleted-transfer"); err != nil {
 		t.Fatal(err)
 	}
-	if !deleted {
+	if !deleted.Load() {
 		t.Fatal("provider DELETE did not execute")
 	}
 	rows, _ := m.storage.QueuedDeletionIntents()
 	recoveryErr := m.runCleanupIntent(rows[0], true)
+	if recoveryErr == nil {
+		t.Fatal("unavailable lookup incorrectly completed recovery")
+	}
+	rows, err = m.storage.QueuedDeletionIntents()
+	if err != nil || len(rows) != 1 {
+		t.Fatal("unavailable lookup lost recovery ownership", err)
+	}
+	lookupAvailable.Store(true)
 	requestCleanupRetry(t, m, "reconcile")
 	m.retryCleanupWorkflows()
 	rows, err = m.storage.QueuedDeletionIntents()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("deleted=%v recovery=%v retained intents=%d", deleted, recoveryErr, len(rows))
+	t.Logf("deleted=%v recovery=%v retained intents=%d", deleted.Load(), recoveryErr, len(rows))
 	if len(rows) != 0 {
 		t.Error("successful DebridLink deletion cannot be discharged after restart or operator reconciliation")
+	}
+	receipts, err := m.storage.CleanupReceipts(100)
+	if err != nil || len(receipts) != 1 || len(receipts[0].Work.Decisions) != 1 {
+		t.Fatal("operator reconciliation was not checkpointed", err)
 	}
 }
 
@@ -260,8 +281,11 @@ func TestCleanupRegressionRecoveryRequiresAuthoritativeProviderAbsence(t *testin
 		t.Run(kind, func(t *testing.T) {
 			m := cleanupManager(t, t.TempDir())
 			requests := []string{}
+			var requestsMu sync.Mutex
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestsMu.Lock()
 				requests = append(requests, r.Method+" "+r.URL.Path)
+				requestsMu.Unlock()
 				if kind == "premiumize-list-miss" {
 					w.Header().Set("Content-Type", "application/json")
 					w.Write([]byte(`{"status":"success","transfers":[]}`))
@@ -294,7 +318,9 @@ func TestCleanupRegressionRecoveryRequiresAuthoritativeProviderAbsence(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			os.WriteFile(filepath.Join(output, "payload"), []byte("keep while remote deletion is uncertain"), 0600)
+			if err := os.WriteFile(filepath.Join(output, "payload"), []byte("keep while remote deletion is uncertain"), 0600); err != nil {
+				t.Fatal(err)
+			}
 			i := cleanupIntent(t, m, e, true)
 			i, err = m.storage.ClaimCleanup(i.InfoHash, i.QueueIncarnation, "crashed-owner", m.cleanupAccounts(i), time.Now(), false)
 			if err != nil {
@@ -310,7 +336,9 @@ func TestCleanupRegressionRecoveryRequiresAuthoritativeProviderAbsence(t *testin
 			err = m.runCleanupIntent(rows[0], true)
 			rows, _ = m.storage.QueuedDeletionIntents()
 			_, pathErr := os.Stat(output)
+			requestsMu.Lock()
 			t.Logf("recovery=%v requests=%v retained intents=%d output exists=%v", err, requests, len(rows), pathErr == nil)
+			requestsMu.Unlock()
 			if len(rows) == 0 {
 				t.Error("unverified provider absence discharged the cleanup obligation")
 			}
