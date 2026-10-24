@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Trifocals3537/tessarr/internal/customerror"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -147,6 +149,8 @@ func TestQBitCleanupScope(t *testing.T) {
 				}
 				fail = false
 				if mode == "recovery" {
+					p, _ := clients.Load("fake")
+					p.(*placementDeleteTestProvider).lookup = func(string) (*debridTypes.Torrent, error) { return nil, customerror.TorrentNotFoundError }
 					residual, fatal := m.recoverQueuedDeletions()
 					if residual != nil || fatal != nil {
 						t.Fatalf("recovery: %v %v", residual, fatal)

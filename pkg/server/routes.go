@@ -67,6 +67,10 @@ func (s *Server) WebRoutes() http.Handler {
 			r.Get("/repair/health/{name}", s.handleGetEntryHealth)
 			r.Post("/repair/health/{name}/check", s.handleRecheckEntry)
 
+			// Cleanup recovery
+			r.Get("/cleanup/workflows", s.handleCleanupWorkflows)
+			r.Post("/cleanup/workflows/{key}/resolve", s.handleResolveCleanup)
+
 			// Torrent management
 			r.Get("/torrents", s.handleGetTorrents)
 			r.Delete("/torrents/{category}/{hash}", s.handleDeleteTorrent)
