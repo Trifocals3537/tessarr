@@ -1,14 +1,136 @@
 package storage
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/workflow"
 	"github.com/google/uuid"
 )
+
+// ErrCleanupIntentObsolete identifies only an authoritative missing/replaced
+// intent. Corrupt snapshot identity errors must still fail admission closed.
+var ErrCleanupIntentObsolete = errors.New("cleanup intent has completed or been replaced")
+
+// CleanupIntent reads the current immutable intent for an explicit retry. The
+// subsequent claim still checks its incarnation/revision under the queue gate.
+func (s *Storage) CleanupIntent(key string) (*QueueDeletionIntent, error) {
+	ref, err := s.acquireMainEntryState(key)
+	if err != nil {
+		return nil, err
+	}
+	defer ref.release()
+	ref.state.mu.Lock()
+	defer ref.state.mu.Unlock()
+	t, found, err := s.loadQueueDeletionTombstone(ref.key)
+	if err != nil || !found {
+		return nil, err
+	}
+	return queueDeletionIntentFromTombstone(ref.key, t)
+}
+
+type CleanupAdminIntent struct {
+	Entry    *Entry
+	snapshot []byte
+}
+
+func (s *Storage) loadCleanupAdmin(key string) (*CleanupAdminIntent, error) {
+	if err := s.syncMainCleanupState(); err != nil {
+		return nil, err
+	}
+	t, found, err := s.loadMainEntryTombstone(key)
+	if err != nil || !found {
+		return nil, err
+	}
+	if len(t.PlacementSnapshot) == 0 {
+		return nil, nil
+	}
+	entry, err := decodeMainEntry(key, t.PlacementSnapshot)
+	if err != nil {
+		return nil, err
+	}
+	return &CleanupAdminIntent{Entry: entry, snapshot: bytes.Clone(t.PlacementSnapshot)}, nil
+}
+
+// PendingAdministrativeCleanup supplies account-binding metadata at first
+// adoption. Actual execution/completion still requires the queue claim token.
+func (s *Storage) PendingAdministrativeCleanup(key string) (*CleanupAdminIntent, error) {
+	ref, err := s.acquireMainEntryState(key)
+	if err != nil {
+		return nil, err
+	}
+	defer ref.release()
+	ref.state.mu.Lock()
+	defer ref.state.mu.Unlock()
+	return s.loadCleanupAdmin(ref.key)
+}
+
+func (s *Storage) withCleanupClaim(i *QueueDeletionIntent, action func(string) error) error {
+	if i == nil || i.Work == nil {
+		return workflow.ErrClaim
+	}
+	ref, err := s.acquireMainEntryState(i.InfoHash)
+	if err != nil {
+		return err
+	}
+	defer ref.release()
+	ref.state.mu.Lock()
+	defer ref.state.mu.Unlock()
+	t, found, err := s.loadQueueDeletionTombstone(ref.key)
+	if err != nil {
+		return err
+	}
+	if !found || t.QueueIncarnation != i.QueueIncarnation {
+		return ErrQueuedDeletionIdentityMismatch
+	}
+	if err := cleanupToken(t, i.Work.Token); err != nil {
+		return err
+	}
+	return action(ref.key)
+}
+
+// CleanupAdminIntent loads only the independent, previously authorized main
+// snapshot. It never discovers additional placements in the current main row.
+func (s *Storage) CleanupAdminIntent(i *QueueDeletionIntent) (*CleanupAdminIntent, error) {
+	var result *CleanupAdminIntent
+	err := s.withCleanupClaim(i, func(key string) error {
+		var err error
+		result, err = s.loadCleanupAdmin(key)
+		return err
+	})
+	return result, err
+}
+
+func (s *Storage) CompleteCleanupAdmin(i *QueueDeletionIntent, expected *CleanupAdminIntent) error {
+	if expected == nil || len(expected.snapshot) == 0 {
+		return workflow.ErrClaim
+	}
+	return s.withCleanupClaim(i, func(key string) error {
+		if err := s.syncMainCleanupState(); err != nil {
+			return err
+		}
+		t, found, err := s.loadMainEntryTombstone(key)
+		if err != nil {
+			return err
+		}
+		if !found || !bytes.Equal(t.PlacementSnapshot, expected.snapshot) {
+			return workflow.ErrClaim
+		}
+		t.PlacementSnapshot = nil
+		data, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		if err := s.entryTombstones.Put(key, data, nil); err != nil {
+			return err
+		}
+		return s.syncMainCleanupState()
+	})
+}
 
 func firstCleanupToken(tokens []string) string {
 	if len(tokens) == 1 {
@@ -79,6 +201,9 @@ func (s *Storage) ClaimCleanup(key, incarnation, owner string, accounts map[stri
 		claimed, err = queueDeletionIntentFromTombstone(normalizeMainEntryKey(key), t)
 		return err
 	})
+	if err == ErrQueuedDeletionIdentityMismatch {
+		return nil, errors.Join(ErrCleanupIntentObsolete, err)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Trifocals3537/tessarr/internal/customerror"
 	"github.com/Trifocals3537/tessarr/internal/workflow"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
+	"github.com/google/uuid"
 )
 
 var errCleanupFatal = errors.New("cleanup checkpoint failed")
@@ -58,51 +58,100 @@ func (m *Manager) cleanupAccounts(i *storage.QueueDeletionIntent) map[string]str
 // No elapsed-time lease stealing is allowed: Stop drains this worker before
 // releasing process/storage ownership to another manager.
 func (m *Manager) runCleanupIntent(snapshot *storage.QueueDeletionIntent, restart bool) error {
+	return m.runCleanupAttempt(snapshot, restart, false)
+}
+
+// explicitAdmin is used only by the original removePlacements=true operation,
+// never by the generic operator retry action or the automatic worker.
+func (m *Manager) runCleanupAttempt(snapshot *storage.QueueDeletionIntent, restart, explicitAdmin bool) error {
 	if m.queue == nil || snapshot == nil || snapshot.Entry == nil {
 		return errCleanupFatal
 	}
-	lease, err := m.queue.lifecycle.beginDelete(snapshot.InfoHash)
-	if err != nil {
-		return nil
-	}
-	complete := false
-	defer func() { lease.Finish(complete) }()
-	ctx := m.cleanupContext()
-	wait, cancel := context.WithTimeout(ctx, defaultEntryDeleteDrainTimeout)
-	err = lease.Wait(wait)
-	cancel()
-	if err != nil {
-		return err
-	}
-	if m.queue.removePendingJobs != nil {
-		m.queue.removePendingJobs(snapshot.InfoHash)
-	}
-	i, err := m.storage.ClaimCleanup(snapshot.InfoHash, snapshot.QueueIncarnation, m.queue.cleanupIdentity(), m.cleanupAccounts(snapshot), time.Now(), restart)
-	if errors.Is(err, workflow.ErrClaim) || errors.Is(err, workflow.ErrNotDue) {
+	var i *storage.QueueDeletionIntent
+	lease, err := m.queue.lifecycle.beginDeleteChecked(snapshot.InfoHash, func() error {
+		if explicitAdmin {
+			if snapshot.Work == nil {
+				return workflow.ErrClaim
+			}
+			if err := m.storage.ResolveCleanup(snapshot.InfoHash, snapshot.QueueIncarnation, snapshot.Work.Revision, uuid.NewString(), "retry", time.Now()); err != nil {
+				return err
+			}
+		}
+		var claimErr error
+		accounts := m.cleanupAccounts(snapshot)
+		if snapshot.Work == nil || (snapshot.Work.Attempt == 0 && snapshot.Work.Accounts == nil) {
+			admin, err := m.storage.PendingAdministrativeCleanup(snapshot.InfoHash)
+			if err != nil {
+				return err
+			}
+			if admin != nil {
+				for name, account := range m.cleanupAccounts(&storage.QueueDeletionIntent{Entry: admin.Entry}) {
+					accounts[name] = account
+				}
+			}
+		}
+		i, claimErr = m.storage.ClaimCleanup(snapshot.InfoHash, snapshot.QueueIncarnation, m.queue.cleanupIdentity(), accounts, time.Now(), restart)
+		return claimErr
+	})
+	if errors.Is(err, workflow.ErrClaim) || errors.Is(err, workflow.ErrNotDue) ||
+		errors.Is(err, storage.ErrCleanupIntentObsolete) || errors.Is(err, ErrQueueEntryDeleting) {
+		if explicitAdmin {
+			return err
+		}
 		return nil
 	}
 	if err != nil {
 		m.recordWorkflowFault(err)
 		return errors.Join(errCleanupFatal, err)
 	}
+	complete := false
+	defer func() { lease.Finish(complete) }()
+	ctx := m.cleanupContext()
 	m.cleanupPhase("claimed")
 	outcome := workflow.Run(ctx, func(ctx context.Context) error {
+		timeout := m.queue.deleteDrainTimeout
+		if timeout <= 0 {
+			timeout = defaultEntryDeleteDrainTimeout
+		}
+		wait, cancel := context.WithTimeout(ctx, timeout)
+		err := lease.Wait(wait)
+		cancel()
+		if err != nil {
+			return err
+		}
+		if m.queue.removePendingJobs != nil {
+			m.queue.removePendingJobs(snapshot.InfoHash)
+		}
 		if err := m.storage.StartCleanup(i); err != nil {
 			return errors.Join(errCleanupFatal, err)
 		}
 		if err := m.storage.RetireCleanup(i); err != nil {
 			return errors.Join(errCleanupFatal, err)
 		}
+		if i.UnrecoverableCleanupPending {
+			return cleanupBlocked("unrecoverable_callback")
+		}
 		// The independent administrative main obligation remains authoritative.
-		pendingAdmin, err := m.storage.CleanupAdminPending(i.InfoHash)
+		admin, err := m.storage.CleanupAdminIntent(i)
 		if err != nil {
 			return errors.Join(errCleanupFatal, err)
 		}
-		if pendingAdmin {
-			return cleanupRetry("awaiting_administrative_cleanup")
-		}
-		if i.UnrecoverableCleanupPending {
-			return cleanupBlocked("unrecoverable_callback")
+		if admin != nil {
+			if explicitAdmin {
+				if err := m.retrySavedAdministrativeCleanup(i, admin); err != nil {
+					return err
+				}
+			} else {
+				if err := m.validateCleanupAccounts(i, []*storage.Entry{admin.Entry}, true); err != nil {
+					return err
+				}
+				if err := m.reconcileProviderEntries(ctx, []*storage.Entry{admin.Entry}); err != nil {
+					return err
+				}
+				if err := m.storage.CompleteCleanupAdmin(i, admin); err != nil {
+					return errors.Join(errCleanupFatal, err)
+				}
+			}
 		}
 		if i.PlacementCleanupPending {
 			entries := cleanupEntries(i)
@@ -113,22 +162,8 @@ func (m *Manager) runCleanupIntent(snapshot *storage.QueueDeletionIntent, restar
 					}
 				}
 			}
-			for _, entry := range entries {
-				for _, p := range entry.Providers {
-					if p == nil {
-						continue
-					}
-					if p.Provider == "usenet" {
-						return cleanupBlocked("usenet_metadata_requires_review")
-					}
-					client := m.ProviderClient(p.Provider)
-					if client == nil || i.Work.Accounts[p.Provider] == "" || i.Work.Accounts[p.Provider] != submissionAccount(client.Config()) {
-						return cleanupBlocked("provider_account_changed")
-					}
-					if err := m.verifyPlacementAccount(client, p.ID); err != nil {
-						return cleanupBlocked("provider_account_changed")
-					}
-				}
+			if err := m.validateCleanupAccounts(i, entries, true); err != nil {
+				return err
 			}
 			if i.Work.EffectStarted || i.Work.Mode == "reconcile" {
 				if err := m.reconcileCleanupProviders(ctx, i); err != nil {
@@ -203,7 +238,11 @@ func (m *Manager) runCleanupIntent(snapshot *storage.QueueDeletionIntent, restar
 // A recorded/uncertain DELETE is never blindly replayed. Only a typed exact-ID
 // absence can discharge its obligation. A listing miss or HTTP 500 is not proof.
 func (m *Manager) reconcileCleanupProviders(ctx context.Context, i *storage.QueueDeletionIntent) error {
-	for _, entry := range cleanupEntries(i) {
+	return m.reconcileProviderEntries(ctx, cleanupEntries(i))
+}
+
+func (m *Manager) reconcileProviderEntries(ctx context.Context, entries []*storage.Entry) error {
+	for _, entry := range entries {
 		for _, p := range entry.Providers {
 			if p == nil {
 				continue
@@ -212,17 +251,22 @@ func (m *Manager) reconcileCleanupProviders(ctx context.Context, i *storage.Queu
 			if client == nil {
 				return cleanupBlocked("provider_account_changed")
 			}
-			var err error
-			if c, ok := client.(debrid.ContextTorrentGetter); ok {
-				_, err = c.GetTorrentContext(ctx, p.ID)
-			} else {
-				_, err = client.GetTorrent(p.ID)
+			checker, ok := client.(debrid.ContextTorrentPresenceChecker)
+			if !ok {
+				return cleanupBlocked("provider_absence_requires_review")
 			}
-			if errors.Is(err, customerror.TorrentNotFoundError) {
-				continue
+			presence, err := checker.TorrentPresenceContext(ctx, p.ID)
+			if errors.Is(err, debrid.ErrPresenceUnverifiable) {
+				return cleanupBlocked("provider_absence_requires_review")
 			}
 			if err != nil {
 				return cleanupRetry("provider_lookup_unavailable")
+			}
+			if presence == debrid.TorrentAbsent {
+				continue
+			}
+			if presence != debrid.TorrentPresent {
+				return cleanupBlocked("provider_absence_requires_review")
 			}
 			return cleanupBlocked("provider_effect_requires_review")
 		}

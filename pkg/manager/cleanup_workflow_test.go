@@ -45,6 +45,16 @@ func (p *cleanupProvider) GetTorrent(id string) (*debridTypes.Torrent, error) {
 	}
 	return &debridTypes.Torrent{Id: id, InfoHash: "cleanup-work"}, nil
 }
+func (p *cleanupProvider) TorrentPresenceContext(ctx context.Context, id string) (debrid.TorrentPresence, error) {
+	_, err := p.GetTorrent(id)
+	if errors.Is(err, customerror.TorrentNotFoundError) {
+		return debrid.TorrentAbsent, nil
+	}
+	if err != nil {
+		return debrid.TorrentPresenceUnknown, err
+	}
+	return debrid.TorrentPresent, nil
+}
 func cleanupDeleteCount(root string) int {
 	b, _ := os.ReadFile(filepath.Join(root, "delete-count"))
 	n, _ := strconv.Atoi(string(b))

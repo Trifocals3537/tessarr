@@ -1048,7 +1048,7 @@ func (m *Manager) GetTorrentsCount() (int, error) {
 
 // DeleteEntry deletes a torrent by infohash
 func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
-	return m.deleteMainEntryWithCleanup(infohash, func(mainEntry *storage.Entry) error {
+	err := m.deleteMainEntryWithCleanup(infohash, func(mainEntry *storage.Entry) error {
 		if removePlacements {
 			if err := m.storage.PrepareMainDeletionPlacements(mainEntry); err != nil {
 				return err
@@ -1070,9 +1070,18 @@ func (m *Manager) DeleteEntry(infohash string, removePlacements bool) error {
 		}
 		return nil
 	})
+	if removePlacements && storage.IsEntryNotFound(err) && m.queue != nil {
+		if handled, retryErr := m.retryAdoptedAdministrativeCleanup(infohash); handled {
+			return retryErr
+		}
+	}
+	return err
 }
 
 func (m *Manager) deleteAdministrativeQueueAndMainPlacements(infohash string, mainEntry *storage.Entry) error {
+	if handled, err := m.retryAdoptedAdministrativeCleanup(infohash); handled {
+		return err
+	}
 	mainFinished := false
 	_, err := m.queue.deleteWithPreparation(infohash, func(entry *storage.Entry) error { return m.RemoveTorrentPlacements(entry) }, true, func() (*storage.QueueDeletionIntent, error) {
 		return m.queue.storage.PrepareQueuedDeletion(infohash, true, mainEntry)
@@ -1181,6 +1190,9 @@ func (m *Manager) DeleteQueueEntry(infohash string, removePlacements bool) error
 
 	// An authoritative main miss still permits queue-only deletion. Any
 	// indeterminate main lookup error returned above fails closed.
+	if handled, err := m.retryAdoptedAdministrativeCleanup(infohash); handled {
+		return err
+	}
 	_, queueErr := m.queue.deleteWithResult(infohash, func(queued *storage.Entry) error {
 		return m.RemoveTorrentPlacements(queued)
 	})

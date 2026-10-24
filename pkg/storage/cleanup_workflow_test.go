@@ -1,14 +1,45 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/Trifocals3537/tessarr/internal/workflow"
+	"google.golang.org/protobuf/proto"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestCleanupObsoleteClaimDoesNotMaskCorruptSnapshotIdentity(t *testing.T) {
+	s, i := cleanupFixture(t, filepath.Join(t.TempDir(), "db"))
+	defer s.Close()
+	if _, err := s.ClaimCleanup(i.InfoHash, "replacement", "owner", nil, time.Now(), false); !errors.Is(err, ErrCleanupIntentObsolete) {
+		t.Fatal("authoritative identity miss was not tagged obsolete", err)
+	}
+	tombstone, _, err := s.loadQueueDeletionTombstone(i.InfoHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := *i.Entry
+	changed.InfoHash = "different-entry"
+	tombstone.Snapshot, err = proto.Marshal(EntryToProto(&changed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(tombstone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.queueTombstones.Put(i.InfoHash, data, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ClaimCleanup(i.InfoHash, i.QueueIncarnation, "owner", nil, time.Now(), false)
+	if err == nil || errors.Is(err, ErrCleanupIntentObsolete) {
+		t.Fatal("corrupt identity was mistaken for a harmless obsolete claim", err)
+	}
+}
 
 func cleanupFixture(t *testing.T, dir string) (*Storage, *QueueDeletionIntent) {
 	t.Helper()
@@ -199,5 +230,61 @@ func TestCleanupDecisionAndCompletionReceiptSurviveCrash(t *testing.T) {
 				t.Fatal("completion receipt was not reconciled")
 			}
 		})
+	}
+}
+
+func TestCleanupAdministrativeCheckpointRequiresCurrentClaimAndSnapshot(t *testing.T) {
+	s, i := cleanupFixture(t, filepath.Join(t.TempDir(), "db"))
+	defer s.Close()
+	e := i.Entry
+	if err := s.AddOrUpdate(e); err != nil {
+		t.Fatal(err)
+	}
+	offline := errors.New("provider offline")
+	if err := s.DeleteWithCleanup(e.InfoHash, func(entry *Entry) error {
+		if err := s.PrepareMainDeletionPlacements(entry); err != nil {
+			return err
+		}
+		return offline
+	}); !errors.Is(err, offline) {
+		t.Fatal(err)
+	}
+	i, err := s.ClaimCleanup(i.InfoHash, i.QueueIncarnation, "first", nil, time.Now(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := s.CleanupAdminIntent(i)
+	if err != nil || admin == nil {
+		t.Fatal("missing saved admin scope", err)
+	}
+	if err := s.ReleaseCleanup(i.InfoHash, i.QueueIncarnation, i.Work.Token, "review", true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := s.QueuedDeletionIntents()
+	if err := s.ResolveCleanup(i.InfoHash, i.QueueIncarnation, rows[0].Work.Revision, "retry", "retry", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.ClaimCleanup(i.InfoHash, i.QueueIncarnation, "next", nil, time.Now(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteCleanupAdmin(i, admin); !errors.Is(err, workflow.ErrClaim) {
+		t.Fatal("stale worker cleared admin scope", err)
+	}
+	changed := &CleanupAdminIntent{Entry: admin.Entry, snapshot: []byte("different saved scope")}
+	if err := s.CompleteCleanupAdmin(next, changed); !errors.Is(err, workflow.ErrClaim) {
+		t.Fatal("mismatched admin snapshot accepted", err)
+	}
+	s.mainCleanupSyncForTest = func() error { return offline }
+	if err := s.CompleteCleanupAdmin(next, admin); !errors.Is(err, offline) {
+		t.Fatal("admin durability gate ignored", err)
+	}
+	s.mainCleanupSyncForTest = nil
+	retained, err := s.CleanupAdminIntent(next)
+	if err != nil || retained == nil {
+		t.Fatal("failed checkpoint lost admin intent", err)
+	}
+	if err := s.CompleteCleanupAdmin(next, retained); err != nil {
+		t.Fatal(err)
 	}
 }

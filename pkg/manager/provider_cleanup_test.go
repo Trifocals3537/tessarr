@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -32,6 +33,16 @@ func (p *placementDeleteTestProvider) GetTorrent(id string) (*debridTypes.Torren
 		return p.lookup(id)
 	}
 	return nil, errors.New("provider lookup unavailable")
+}
+func (p *placementDeleteTestProvider) TorrentPresenceContext(ctx context.Context, id string) (debrid.TorrentPresence, error) {
+	_, err := p.GetTorrent(id)
+	if errors.Is(err, customerror.TorrentNotFoundError) {
+		return debrid.TorrentAbsent, nil
+	}
+	if err != nil {
+		return debrid.TorrentPresenceUnknown, err
+	}
+	return debrid.TorrentPresent, nil
 }
 func (p *placementDeleteTestProvider) Config() config.Debrid {
 	return config.Debrid{Name: p.name}

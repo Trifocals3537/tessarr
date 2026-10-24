@@ -53,8 +53,9 @@ func TestAdminRecoveryFailurePreservesAssociatedQueueCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			offline := errors.New("provider unavailable")
+			calls := 0
 			clients := xsync.NewMap[string, debrid.Client]()
-			clients.Store("fake", &placementDeleteTestProvider{name: "fake", delete: func(string) error { return offline }})
+			clients.Store("fake", &placementDeleteTestProvider{name: "fake", delete: func(string) error { calls++; return offline }})
 			manager := &Manager{storage: store, queue: queue, clients: clients, logger: zerolog.Nop()}
 			if method == "entry" {
 				err = manager.DeleteEntry(entry.InfoHash, true)
@@ -76,8 +77,11 @@ func TestAdminRecoveryFailurePreservesAssociatedQueueCleanup(t *testing.T) {
 			// Repeated failure must not remove files or forget either obligation.
 			for attempt := 0; attempt < 2; attempt++ {
 				residual, fatal := manager.recoverQueuedDeletions()
-				if fatal != nil || !errors.Is(residual, offline) {
+				if fatal != nil || (attempt == 0 && !errors.Is(residual, offline)) {
 					t.Fatalf("recovery = %v, %v", residual, fatal)
+				}
+				if calls != 2 {
+					t.Fatalf("workflow-owned admin DELETE replayed: %d calls", calls)
 				}
 				if _, err := os.Stat(staging); err != nil {
 					t.Fatalf("staging removed while main obligation failed: %v", err)
@@ -98,10 +102,13 @@ func TestAdminRecoveryFailurePreservesAssociatedQueueCleanup(t *testing.T) {
 				}
 			}
 			clients.Store("fake", &placementDeleteTestProvider{name: "fake", delete: func(string) error { return nil }})
-			requestCleanupRetry(t, manager, "retry")
-			residual, fatal := manager.recoverQueuedDeletions()
-			if residual != nil || fatal != nil {
-				t.Fatalf("successful retry = %v, %v", residual, fatal)
+			if method == "entry" {
+				err = manager.DeleteEntry(entry.InfoHash, true)
+			} else {
+				err = manager.DeleteQueueEntry(entry.InfoHash, true)
+			}
+			if err != nil {
+				t.Fatalf("explicit retry after restart: %v", err)
 			}
 			if _, err := os.Stat(staging); !os.IsNotExist(err) {
 				t.Fatalf("staging retained after success: %v", err)

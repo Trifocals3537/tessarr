@@ -27,6 +27,10 @@ func (m *Manager) recoverQueuedDeletions() (residual error, fatal error) {
 
 	var residuals []error
 	var fatals []error
+	owned := make(map[string]bool, len(intents))
+	for _, intent := range intents {
+		owned[intent.InfoHash] = intent.Work != nil
+	}
 	adminEntries, err := store.MainDeletionPlacementIntents()
 	if err != nil {
 		return nil, err
@@ -36,6 +40,12 @@ func (m *Manager) recoverQueuedDeletions() (residual error, fatal error) {
 	// without preventing unrelated queue intents from finishing recovery.
 
 	for _, entry := range adminEntries {
+		// A workflow-owned intent may have crashed after a provider effect.
+		// Its claim must reconcile the saved admin scope read-only; never replay
+		// that DELETE through the older startup-only path.
+		if owned[entry.InfoHash] {
+			continue
+		}
 		if err := m.RemoveTorrentPlacements(entry); err != nil {
 
 			residuals = append(residuals, fmt.Errorf("resume administrative main placement cleanup %s: %w", entry.InfoHash, err))
