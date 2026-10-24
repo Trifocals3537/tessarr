@@ -316,3 +316,34 @@ func TestCleanupBackgroundRunnerCompletesDueWorkWithoutRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestCleanupCancellationAfterDurableCompletionIsSuccessful(t *testing.T) {
+	m := cleanupManager(t, t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.ctx = ctx
+	m.cleanupPhaseForTest = func(stage string) {
+		if stage == "local_done" {
+			cancel()
+		}
+	}
+	e := &storage.Entry{InfoHash: "completed-before-shutdown", Name: "release", Protocol: config.ProtocolTorrent, SavePath: m.config.DownloadFolder, State: storage.EntryStateDownloading}
+	i := cleanupIntent(t, m, e, false)
+	if err := m.runCleanupIntent(i, false); err != nil {
+		t.Fatalf("durable completion was reported as interrupted: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("shutdown boundary was not exercised")
+	}
+	if err := m.workflowAvailable(); err != nil {
+		t.Fatalf("completed cleanup suspended admissions: %v", err)
+	}
+	rows, err := m.storage.QueuedDeletionIntents()
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("completed cleanup retained an intent: %v", err)
+	}
+	receipts, err := m.storage.CleanupReceipts(100)
+	if err != nil || len(receipts) != 1 || receipts[0].IntentPresent {
+		t.Fatalf("durable completion receipt missing: %v", err)
+	}
+}

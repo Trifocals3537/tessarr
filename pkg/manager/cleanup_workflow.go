@@ -170,10 +170,13 @@ func (m *Manager) runCleanupIntent(snapshot *storage.QueueDeletionIntent, restar
 			}
 			return cleanupBlocked("local_cleanup_requires_review")
 		}
+		// Completion is authoritative even if shutdown cancels the context
+		// while the local callback or final checkpoints are finishing. Releasing
+		// an already removed intent would falsely suspend new admissions.
+		complete = true
 		return nil
 	})
-	if outcome.Kind == workflow.Succeeded {
-		complete = true
+	if complete {
 		return nil
 	}
 	if errors.Is(outcome.Err, errCleanupFatal) {
