@@ -248,6 +248,9 @@ func verificationError(filename string, head []byte, readErr error) error {
 	if nntp.IsArticleNotFoundError(readErr) {
 		return fmt.Errorf("head article of %q is missing: %w", filename, customerror.UsenetSegmentMissingError)
 	}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return readErr
+	}
 	if matchesKnownMediaHead(head) {
 		return nil
 	}
@@ -276,8 +279,8 @@ func (u *Usenet) acquireContentVerifySlot(ctx context.Context) (func(), error) {
 
 // VerifyFileContent performs an extension-aware head verification for one
 // stored NZB file. Unsupported or ambiguous formats pass through without a
-// read. The caller must opt in; normal imports and scheduled sweeps never call
-// this method.
+// read. Health rechecks use this bounded proof in addition to STAT; normal
+// import acceptance remains unchanged.
 func (u *Usenet) VerifyFileContent(ctx context.Context, nzoID, filename string) error {
 	if _, supported := mediaHeadRuleFor(filename); !supported {
 		return nil
@@ -332,6 +335,9 @@ func (u *Usenet) verifyFileContentHead(ctx context.Context, file *storage.NZBFil
 	}
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if n != len(head) && (readErr == nil || errors.Is(readErr, io.EOF)) {
+		return io.ErrUnexpectedEOF
 	}
 	return verificationError(file.Name, head[:n], readErr)
 }

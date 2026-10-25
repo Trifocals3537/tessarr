@@ -99,7 +99,9 @@ func (m *Manager) RecordTerminalReadFailure(entry *storage.Entry, filename strin
 
 	persisted := false
 	if m.storage != nil && entry.Name != "" {
-		persisted = m.storage.MarkEntryDirtyChecked(entry.Name, entry.Protocol, "read_failure:"+class) == nil
+		persisted = m.storage.RecordFailedRead(entry.Name, entry.Protocol, "read_failure:"+class, storage.FailedReadRange{
+			InfoHash: entry.InfoHash, FileName: filename, Offset: offset, Length: length,
+		}) == nil
 	}
 	if persisted && m.repair != nil {
 		m.repair.QueueDirtyEntry(entry.Name)

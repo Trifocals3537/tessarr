@@ -74,12 +74,13 @@ func (c *healCache) do(infoHash string, fix func() error) error {
 
 // fileResult is the outcome of probing one file in an entry.
 type fileResult struct {
-	name     string
-	infoHash string
-	protocol config.Protocol
-	healthy  bool
-	broken   bool
-	reason   string // populated only when broken or unknown
+	name       string
+	infoHash   string
+	protocol   config.Protocol
+	healthy    bool
+	broken     bool
+	incomplete bool
+	reason     string // populated only when broken or unknown
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -313,11 +314,9 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	// store isn't fully decoded up front. A vanished or empty entry is a skip
 	// (nil tells the worker not to count it).
 	if c.item == nil {
-		item, err := s.GetEntryItem(c.name)
-		if err != nil || item == nil || len(item.Files) == 0 {
+		if err := r.resolveHealthCandidate(c); err != nil || c.item == nil || len(c.item.Files) == 0 {
 			return nil
 		}
-		c.item = item
 	}
 
 	h, _ := s.GetEntryHealth(c.name)
@@ -331,11 +330,13 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.Status = storage.HealthRepairing
 	h.ActiveRunID = runID
 	h.Protocol = ""
-	r.saveHealth(h)
+	if err := s.SaveEntryHealth(h); err != nil {
+		return nil
+	}
 
 	names := orderedFilenames(c.item)
-	results := r.probeFiles(ctx, c.item, names, opts)
-	if autoRepair {
+	results := r.probeFilesWithEvidence(ctx, c, h, names, opts)
+	if autoRepair && len(h.FailedReads) == 0 && !h.FailedReadsIncomplete && !strings.HasPrefix(h.DirtyReason, "read_failure") {
 		r.autoHealResults(ctx, results, heal)
 	}
 
@@ -349,14 +350,47 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 	h.Fingerprint = storage.EntryItemRepairFingerprint(c.item)
 	h.LastCheckedAt = time.Now()
 	h.NextCheckDueAt = h.LastCheckedAt.Add(r.recheckInterval())
-	h.Dirty = false
-	h.DirtyReason = ""
+	complete := ctx.Err() == nil
+	h.IncompleteFiles = nil
+	for _, result := range results {
+		if result.incomplete || (!result.healthy && !result.broken) {
+			complete = false
+			h.IncompleteFiles = append(h.IncompleteFiles, result.name)
+		}
+	}
+	if current, err := s.GetEntryItem(c.name); err != nil || storage.EntryItemRepairFingerprint(current) != h.Fingerprint {
+		complete = false
+		h.Status = storage.HealthUnknown
+		h.ProbeProgress = nil
+	}
+	if len(names) == 0 {
+		complete = false
+	}
+	if !complete {
+		if h.Status == storage.HealthHealthy {
+			h.Status = storage.HealthUnknown
+		}
+		h.Dirty = true
+		if h.DirtyReason == "" {
+			h.DirtyReason = "health_recheck_incomplete"
+		}
+		h.NextCheckDueAt = time.Time{}
+		h.FailureReason = "health_recheck_incomplete"
+	} else {
+		h.Dirty = false
+		h.DirtyReason = ""
+		h.ProbeProgress = nil
+		// Proven broken ranges remain diagnostic evidence until recovery.
+		if h.Status == storage.HealthHealthy {
+			h.FailedReads = nil
+		}
+	}
 	h.ActiveRunID = ""
 	h.PreviousStatus = ""
 	if proto := firstProtocol(results); proto != "" {
 		h.Protocol = proto
 	}
-	switch final {
+	switch h.Status {
 	case storage.HealthHealthy:
 		h.LastOKAt = h.LastCheckedAt
 		h.FailureReason = ""
@@ -365,28 +399,10 @@ func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, hea
 		h.FailureReason = topReason(broken)
 	}
 
-	r.saveHealth(h)
-	return h
-}
-
-// probeFiles fans per-file probes inside a single entry, capped at
-// repairFilesPerEntry concurrent workers.
-func (r *Repair) probeFiles(ctx context.Context, item *storage.EntryItem, names []string, opts RepairRunOptions) []fileResult {
-	results := make([]fileResult, len(names))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(repairFilesPerEntry)
-	for i, name := range names {
-		g.Go(func() error {
-			if gctx.Err() != nil {
-				results[i] = fileResult{name: name, reason: "context_cancelled"}
-				return nil
-			}
-			results[i] = r.probeFile(gctx, item, name, opts)
-			return nil
-		})
+	if err := s.SaveEntryHealth(h); err != nil {
+		return nil
 	}
-	_ = g.Wait()
-	return results
+	return h
 }
 
 // probeFile checks one file. NZB probes use usenet.CheckFile. Torrent probes
@@ -596,24 +612,22 @@ func (r *Repair) brokenFiles(c *candidate, results []fileResult) []storage.Broke
 }
 
 // rollupStatus collapses per-file results into a single EntryHealth status.
-// Any broken file fails the entry; otherwise healthy wins over unknown.
+// Any broken file fails the entry; otherwise every file must be healthy.
 func rollupStatus(results []fileResult) storage.HealthStatus {
 	if len(results) == 0 {
 		return storage.HealthUnknown
 	}
-	hasBroken, hasHealthy := false, false
+	hasBroken, allHealthy := false, true
 	for _, res := range results {
 		if res.broken {
 			hasBroken = true
 		}
-		if res.healthy {
-			hasHealthy = true
-		}
+		allHealthy = allHealthy && res.healthy
 	}
 	switch {
 	case hasBroken:
 		return storage.HealthBroken
-	case hasHealthy:
+	case allHealthy:
 		return storage.HealthHealthy
 	default:
 		return storage.HealthUnknown
@@ -915,7 +929,7 @@ func (r *Repair) collectBrokenHealths(names []string, requireArrFile bool) (*xsy
 
 	healths := xsync.NewMap[string, *storage.EntryHealth]()
 	_ = r.manager.storage.ForEachEntryHealth(func(h *storage.EntryHealth) error {
-		if h == nil || h.Status != storage.HealthBroken {
+		if h == nil || h.Dirty || h.Status != storage.HealthBroken {
 			return nil
 		}
 		if len(wanted) > 0 {
@@ -1204,13 +1218,13 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		return nil, fmt.Errorf("entry is being probed by run %s", h.ActiveRunID)
 	}
 
-	item, err := r.manager.GetEntryItem(entryName)
-	if err != nil || item == nil {
+	c := &candidate{name: entryName}
+	if err := r.resolveHealthCandidate(c); err != nil || c.item == nil {
 		return nil, fmt.Errorf("entry %q not found", entryName)
 	}
+	entryName = c.name
 
 	runID := "recheck-" + entryName
-	c := &candidate{name: entryName, item: item}
 
 	if ctx == nil {
 		ctx = r.parentCtx
@@ -1219,12 +1233,14 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 		return nil, err
 	}
 	r.runReserved(func() {
+		r.eventProbeMu.Lock()
+		defer r.eventProbeMu.Unlock()
 		if fix {
 			r.attachArrContext(ctx, c)
 		}
 		heal := newHealCache()
 		final := r.probeEntry(ctx, runID, c, heal, RepairRunOptions{}, fix)
-		if !fix || final.Status != storage.HealthBroken {
+		if !fix || final == nil || final.Dirty || final.Status != storage.HealthBroken {
 			return
 		}
 		pseudo := &storage.RepairRun{ID: runID, Stats: storage.RepairRunStats{}}
@@ -1314,6 +1330,8 @@ func (r *Repair) RecheckMedia(ctx context.Context, arrName, mediaID string, fix 
 // executeRecheckMedia is the body of a media recheck. Mirrors executeSweep
 // but scoped to a specific media-id resolved through one or more Arrs.
 func (r *Repair) executeRecheckMedia(ctx context.Context, run *storage.RepairRun, arrs []*arr.Arr, arrName, mediaID string, fix bool) {
+	r.eventProbeMu.Lock()
+	defer r.eventProbeMu.Unlock()
 	candidates := make(map[string]*candidate)
 	var lastErr error
 	for _, a := range arrs {

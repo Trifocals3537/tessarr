@@ -244,7 +244,15 @@ type EntryHealth struct {
 	DirtyReason string `json:"dirty_reason,omitempty"`
 	// DirtyRevision is incremented for every runtime failure signal. Stale
 	// health-probe saves retain a newer dirty revision instead of clearing it.
-	DirtyRevision uint64 `json:"dirty_revision,omitempty"`
+	DirtyRevision uint64            `json:"dirty_revision,omitempty"`
+	FailedReads   []FailedReadRange `json:"failed_reads,omitempty"`
+	// Missing/overflowed evidence cannot be acknowledged by a sampled check.
+	FailedReadsIncomplete bool                 `json:"failed_reads_incomplete,omitempty"`
+	IncompleteFiles       []string             `json:"incomplete_files,omitempty"`
+	ProbeProgress         *HealthProbeProgress `json:"probe_progress,omitempty"`
+	// Alias records forward failures to one verified canonical health row.
+	CanonicalEntry string            `json:"canonical_entry,omitempty"`
+	AliasRevisions map[string]uint64 `json:"alias_revisions,omitempty"`
 
 	LastCheckedAt  time.Time    `json:"last_checked_at"`
 	LastOKAt       time.Time    `json:"last_ok_at"`
@@ -292,6 +300,14 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 	if state == nil || state.EntryName == "" {
 		return fmt.Errorf("entry health is missing entry name")
 	}
+	name, err := s.healthNameLocked(state.EntryName)
+	if err != nil {
+		return err
+	}
+	if name != state.EntryName {
+		// An old probe must not overwrite a canonical record after handoff.
+		return fmt.Errorf("health identity changed during probe")
+	}
 	data, err := s.repairState.Get(state.EntryName)
 	if err == nil {
 		var current EntryHealth
@@ -299,18 +315,28 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 			return fmt.Errorf("decode current entry health %q: %w", state.EntryName, err)
 		}
 		if current.DirtyRevision > state.DirtyRevision {
+			state.Status = HealthUnknown
+			state.LastOKAt = current.LastOKAt
+			state.FailureReason = "new_failure_during_recheck"
 			state.Dirty = current.Dirty
 			state.DirtyReason = current.DirtyReason
 			state.DirtyRevision = current.DirtyRevision
 			state.NextCheckDueAt = current.NextCheckDueAt
+			state.FailedReads = current.FailedReads
+			state.FailedReadsIncomplete = current.FailedReadsIncomplete
+			state.ProbeProgress = nil
 			if current.Protocol != "" {
 				state.Protocol = current.Protocol
 			}
 		}
+		state.AliasRevisions = current.AliasRevisions
 	} else if !hybrid.IsNotFound(err) {
 		return fmt.Errorf("load current entry health %q: %w", state.EntryName, err)
 	}
-	return s.putEntryHealthLocked(state)
+	if err := s.putEntryHealthLocked(state); err != nil {
+		return err
+	}
+	return s.repairState.Sync()
 }
 
 func (s *Storage) putEntryHealthLocked(state *EntryHealth) error {
@@ -322,10 +348,28 @@ func (s *Storage) putEntryHealthLocked(state *EntryHealth) error {
 	}
 	// Index the status so CountEntryHealthByStatus can build its histogram
 	// straight from the in-memory index without decoding every record.
-	return s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: string(state.Status)})
+	status := string(state.Status)
+	if state.CanonicalEntry != "" {
+		status = "alias"
+	}
+	err = s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: status})
+	s.healthCountsMu.Lock()
+	s.healthCounts = nil
+	s.healthCountsMu.Unlock()
+	return err
 }
 
 func (s *Storage) GetEntryHealth(entryName string) (*EntryHealth, error) {
+	s.entryHealthMu.Lock()
+	defer s.entryHealthMu.Unlock()
+	name, err := s.healthNameLocked(entryName)
+	if err != nil {
+		return nil, err
+	}
+	return s.getEntryHealthLocked(name)
+}
+
+func (s *Storage) getEntryHealthLocked(entryName string) (*EntryHealth, error) {
 	if entryName == "" {
 		return nil, fmt.Errorf("entry name is empty")
 	}
@@ -351,6 +395,9 @@ func (s *Storage) ForEachEntryHealth(fn func(*EntryHealth) error) error {
 		}
 		if state.EntryName == "" {
 			state.EntryName = key
+		}
+		if state.CanonicalEntry != "" {
+			return nil
 		}
 		return fn(&state)
 	})
@@ -410,11 +457,20 @@ func (s *Storage) MarkEntryDirty(entryName string, protocol config.Protocol, rea
 // MarkEntryDirtyChecked is the error-reporting form used by runtime read
 // feedback. Existing mutation paths retain the best-effort wrapper above.
 func (s *Storage) MarkEntryDirtyChecked(entryName string, protocol config.Protocol, reason string) error {
+	return s.markEntryDirty(entryName, protocol, reason, nil)
+}
+
+func (s *Storage) markEntryDirty(entryName string, protocol config.Protocol, reason string, failed *FailedReadRange) error {
 	if entryName == "" {
 		return nil
 	}
 	s.entryHealthMu.Lock()
 	defer s.entryHealthMu.Unlock()
+	var resolveErr error
+	entryName, resolveErr = s.healthNameLocked(entryName)
+	if resolveErr != nil {
+		return resolveErr
+	}
 
 	var state *EntryHealth
 	data, err := s.repairState.Get(entryName)
@@ -436,8 +492,16 @@ func (s *Storage) MarkEntryDirtyChecked(entryName string, protocol config.Protoc
 	state.Dirty = true
 	state.DirtyReason = reason
 	state.DirtyRevision++
+	state.ProbeProgress = nil
+	if failed != nil {
+		addFailedRead(state, *failed)
+	}
 	state.NextCheckDueAt = time.Time{}
-	return s.putEntryHealthLocked(state)
+	if err := s.putEntryHealthLocked(state); err != nil {
+		return err
+	}
+	// Runtime failure evidence must survive a crash before queue admission.
+	return s.repairState.Sync()
 }
 
 // healthCountsTTL bounds how often CountEntryHealthByStatus scans the entire
@@ -468,6 +532,9 @@ func (s *Storage) CountEntryHealthByStatus() map[HealthStatus]int {
 	// index, so the fallback set shrinks to zero.
 	var needDecode []string
 	_ = s.repairState.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+		if meta.Status == "alias" {
+			return nil
+		}
 		if meta.Status != "" {
 			counts[HealthStatus(meta.Status)]++
 		} else {

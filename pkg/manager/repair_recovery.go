@@ -52,7 +52,7 @@ func (r *Repair) recoveryArr(job *storage.RepairRecovery) *arr.Arr {
 // healBrokenEntry records each file before touching Arr. Source entries are
 // retained: accepting a search does not prove a replacement exists.
 func (r *Repair) healBrokenEntry(ctx context.Context, run *storage.RepairRun, statsMu *sync.Mutex, name string, health *storage.EntryHealth) {
-	if health == nil || health.Status != storage.HealthBroken {
+	if health == nil || health.Dirty || health.Status != storage.HealthBroken {
 		return
 	}
 	for _, bf := range health.BrokenFiles {
