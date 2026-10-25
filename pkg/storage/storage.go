@@ -50,6 +50,8 @@ type Storage struct {
 	queueIntentSyncForTest   func() error
 	submissionSyncForTest    func() error
 	healthAliasSyncedForTest func()
+	healthRetirementForTest  func(string)
+	healthAliasPhaseForTest  func(string)
 	// Per-key durability latches survive lifecycle-state eviction. Operations
 	// on each key are serialized by its lifecycle lock.
 	handoffPending   sync.Map
@@ -64,7 +66,7 @@ type Storage struct {
 	logger           zerolog.Logger
 
 	// Lock order: per-key lifecycle -> placementPublicationMu -> entryItemsMu
-	// -> hybrid store locks. Never take a lifecycle lock while holding this
+	// -> entryHealthMu -> hybrid store locks. Never take a lifecycle lock while holding this
 	// mutex, and never retain it across provider/network work.
 	placementPublicationMu sync.Mutex
 	entryItemsMu           sync.Mutex
@@ -216,6 +218,10 @@ func NewStorage(dbPath string) (*Storage, error) {
 			_ = s.Close()
 			return nil, err
 		}
+	}
+	if err := s.reconcileHealthRetirements(); err != nil {
+		_ = s.Close()
+		return nil, err
 	}
 	if err := s.PruneTorrentSources(); err != nil {
 		log.Warn().Err(err).Msg("Failed to prune unreferenced torrent sources")

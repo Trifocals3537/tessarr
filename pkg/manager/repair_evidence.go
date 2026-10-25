@@ -18,7 +18,6 @@ import (
 	"github.com/Trifocals3537/tessarr/internal/nntp"
 	"github.com/Trifocals3537/tessarr/pkg/manager/link"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
-	"github.com/Trifocals3537/tessarr/pkg/storage/hybrid"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -29,61 +28,11 @@ func (r *Repair) resolveHealthCandidate(c *candidate) error {
 }
 
 func (r *Repair) resolveHealthCandidateUsingNaming(c *candidate, naming config.WebDavFolderNaming) error {
-	s := r.manager.storage
-	if h, err := s.GetEntryHealth(c.name); err == nil && h.EntryName != c.name {
-		c.name = h.EntryName
-	}
-	if item, err := s.GetEntryItem(c.name); err == nil {
-		c.item = item
-		return nil
-	} else if !hybrid.IsNotFound(err) {
-		return err
-	}
-	var owner *storage.Entry
-	if err := s.ForEach(func(e *storage.Entry) error {
-		if e.Name != c.name {
-			return nil
-		}
-		if owner != nil {
-			return errors.New("ambiguous health owner")
-		}
-		owner = e
-		return nil
-	}); err != nil {
-		return err
-	}
-	if owner == nil {
-		return errors.New("health owner not found")
-	}
-	canonical := storage.GetTorrentFolder(naming, owner)
-	if canonical == "" || canonical == c.name {
-		return errors.New("canonical health item not found")
-	}
-	item, err := s.GetEntryItem(canonical)
+	item, err := r.manager.storage.ResolveHealthEntry(c.name, naming)
 	if err != nil {
 		return err
 	}
-	if len(item.Files) == 0 {
-		return errors.New("empty canonical health item")
-	}
-	for _, f := range item.Files {
-		if f == nil || f.InfoHash != owner.InfoHash {
-			return errors.New("canonical health ownership mismatch")
-		}
-	}
-	if h, err := s.GetEntryHealth(c.name); err == nil {
-		for _, failed := range h.FailedReads {
-			if failed.InfoHash != owner.InfoHash {
-				return errors.New("failed range ownership mismatch")
-			}
-		}
-	} else if !hybrid.IsNotFound(err) {
-		return err
-	}
-	if err := s.BindHealthAlias(c.name, canonical); err != nil {
-		return err
-	}
-	c.name, c.item = canonical, item
+	c.name, c.item = item.Name, item
 	return nil
 }
 
@@ -110,6 +59,9 @@ func (r *Repair) fileProbeFingerprint(item *storage.EntryItem, name string) (str
 			return "", err
 		}
 	} else {
+		if r.manager.ProviderClient(e.ActiveProvider) == nil {
+			return "", errors.New("active provider source unavailable")
+		}
 		target, err = importReadinessTargetFingerprint(e)
 		if err != nil {
 			return "", err
@@ -145,7 +97,7 @@ func failedRangesFor(h *storage.EntryHealth, item *storage.EntryItem) (map[strin
 	}
 	for _, failed := range h.FailedReads {
 		f := item.Files[failed.FileName]
-		if f == nil || f.Deleted || f.InfoHash != failed.InfoHash || failed.Offset < 0 || failed.Length <= 0 || failed.Offset > f.Size || failed.Length > f.Size-failed.Offset {
+		if f == nil || f.Deleted || f.InfoHash != failed.InfoHash || failed.FileID != "" && failed.FileID != f.ID || failed.Offset < 0 || failed.Length <= 0 || failed.Offset > f.Size || failed.Length > f.Size-failed.Offset {
 			return out, errors.New("failed_range_identity_changed")
 		}
 		out[failed.FileName] = append(out[failed.FileName], failed)
@@ -208,8 +160,10 @@ func (r *Repair) probeFilesWithEvidence(ctx context.Context, c *candidate, h *st
 				res.reason = evidenceErr.Error()
 			}
 			after, afterErr := r.fileProbeFingerprint(c.item, name)
-			if res.healthy && (err != nil || afterErr != nil || before != after || gctx.Err() != nil) {
+			if err != nil || afterErr != nil || before != after || gctx.Err() != nil {
 				res.healthy = false
+				res.broken = false
+				res.incomplete = true
 				res.reason = "probe_target_changed_or_incomplete"
 			}
 			mu.Lock()
@@ -225,11 +179,29 @@ func (r *Repair) probeFilesWithEvidence(ctx context.Context, c *candidate, h *st
 					res.reason = "progress_persistence_failed"
 				}
 			}
+			res.sourceFingerprint = after
 			results[i] = res
 			return nil
 		})
 	}
 	_ = g.Wait()
+	// A later file can change the source/account after an earlier file finished.
+	// Revalidate every verdict before publishing or authorizing repair.
+	for i := range results {
+		res := &results[i]
+		if !res.healthy && !res.broken {
+			continue
+		}
+		current, err := r.fileProbeFingerprint(c.item, res.name)
+		changed := err != nil || current != res.sourceFingerprint
+		if changed || ctx.Err() != nil {
+			res.healthy, res.broken, res.incomplete = false, false, true
+			res.reason = "probe_target_changed_or_incomplete"
+			if changed {
+				delete(h.ProbeProgress.Verified, res.name)
+			}
+		}
+	}
 	return results
 }
 

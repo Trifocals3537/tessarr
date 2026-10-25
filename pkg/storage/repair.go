@@ -214,6 +214,8 @@ type BrokenFile struct {
 	Protocol  config.Protocol `json:"protocol,omitempty"`
 	Reason    string          `json:"reason,omitempty"`
 	Size      int64           `json:"size,omitempty"`
+	FileID    string          `json:"file_id,omitempty"`
+	ByteRange *[2]int64       `json:"byte_range,omitempty"`
 
 	// Arr re-acquire payload. Empty when source=managed or when no Arr owns
 	// the file.
@@ -253,6 +255,11 @@ type EntryHealth struct {
 	// Alias records forward failures to one verified canonical health row.
 	CanonicalEntry string            `json:"canonical_entry,omitempty"`
 	AliasRevisions map[string]uint64 `json:"alias_revisions,omitempty"`
+	// A reset keeps the revision fence; deleting it lets an old probe overwrite
+	// a newer failure after the revision counter restarts from zero.
+	Cleared         bool                            `json:"cleared,omitempty"`
+	OwnerInfoHash   string                          `json:"owner_info_hash,omitempty"`
+	FileRetirements map[string]HealthFileRetirement `json:"file_retirements,omitempty"`
 
 	LastCheckedAt  time.Time    `json:"last_checked_at"`
 	LastOKAt       time.Time    `json:"last_ok_at"`
@@ -330,9 +337,12 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 			}
 		}
 		state.AliasRevisions = current.AliasRevisions
+		state.OwnerInfoHash = current.OwnerInfoHash
+		state.FileRetirements = current.FileRetirements
 	} else if !hybrid.IsNotFound(err) {
 		return fmt.Errorf("load current entry health %q: %w", state.EntryName, err)
 	}
+	state.Cleared = false
 	if err := s.putEntryHealthLocked(state); err != nil {
 		return err
 	}
@@ -351,6 +361,9 @@ func (s *Storage) putEntryHealthLocked(state *EntryHealth) error {
 	status := string(state.Status)
 	if state.CanonicalEntry != "" {
 		status = "alias"
+	}
+	if state.Cleared {
+		status = "cleared"
 	}
 	err = s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: status})
 	s.healthCountsMu.Lock()
@@ -396,7 +409,7 @@ func (s *Storage) ForEachEntryHealth(fn func(*EntryHealth) error) error {
 		if state.EntryName == "" {
 			state.EntryName = key
 		}
-		if state.CanonicalEntry != "" {
+		if state.CanonicalEntry != "" || state.Cleared {
 			return nil
 		}
 		return fn(&state)
@@ -404,15 +417,28 @@ func (s *Storage) ForEachEntryHealth(fn func(*EntryHealth) error) error {
 }
 
 func (s *Storage) DeleteEntryHealth(entryName string) error {
+	s.entryHealthMu.Lock()
+	defer s.entryHealthMu.Unlock()
+	if h, err := s.getEntryHealthLocked(entryName); err == nil {
+		moved, err := s.healthOwnerMovedLocked(h)
+		if err != nil {
+			return err
+		}
+		if moved {
+			return nil
+		}
+	} else if !hybrid.IsNotFound(err) {
+		return err
+	}
 	if entryName == "" || !s.repairState.Exists(entryName) {
 		return nil
 	}
 	return s.repairState.Delete(entryName)
 }
 
-// ClearEntryHealthByStatuses deletes persisted repair health records whose
-// status matches one of the supplied statuses. It only clears repair state;
-// it does not touch entries, files, Arrs, or debrid placements.
+// ClearEntryHealthByStatuses resets display-only health records. Unresolved
+// evidence and durable handoff/retirement records cannot be cleared this way.
+// Hidden revision fences prevent pre-reset probes from erasing later failures.
 func (s *Storage) ClearEntryHealthByStatuses(statuses []HealthStatus) (int, error) {
 	wanted := make(map[HealthStatus]struct{}, len(statuses))
 	for _, status := range statuses {
@@ -439,7 +465,29 @@ func (s *Storage) ClearEntryHealthByStatuses(statuses []HealthStatus) (int, erro
 
 	cleared := 0
 	for _, name := range names {
-		if err := s.DeleteEntryHealth(name); err != nil {
+		// Re-read under the same lock used for failure publication. A runtime
+		// signal arriving after enumeration must not be discarded by this reset.
+		s.entryHealthMu.Lock()
+		state, err := s.getEntryHealthLocked(name)
+		if hybrid.IsNotFound(err) {
+			s.entryHealthMu.Unlock()
+			continue
+		}
+		if err != nil {
+			s.entryHealthMu.Unlock()
+			return cleared, err
+		}
+		_, selected := wanted[state.Status]
+		if !selected || state.Cleared || state.CanonicalEntry != "" || protectedHealthState(state) {
+			s.entryHealthMu.Unlock()
+			continue
+		}
+		err = s.putEntryHealthLocked(&EntryHealth{EntryName: name, Status: HealthUnknown, Cleared: true, DirtyRevision: state.DirtyRevision + 1})
+		if err == nil {
+			err = s.repairState.Sync()
+		}
+		s.entryHealthMu.Unlock()
+		if err != nil {
 			return cleared, err
 		}
 		cleared++
@@ -466,6 +514,10 @@ func (s *Storage) markEntryDirty(entryName string, protocol config.Protocol, rea
 	}
 	s.entryHealthMu.Lock()
 	defer s.entryHealthMu.Unlock()
+	return s.markEntryDirtyLocked(entryName, protocol, reason, failed)
+}
+
+func (s *Storage) markEntryDirtyLocked(entryName string, protocol config.Protocol, reason string, failed *FailedReadRange) error {
 	var resolveErr error
 	entryName, resolveErr = s.healthNameLocked(entryName)
 	if resolveErr != nil {
@@ -493,6 +545,7 @@ func (s *Storage) markEntryDirty(entryName string, protocol config.Protocol, rea
 		state.Protocol = protocol
 	}
 	state.Dirty = true
+	state.Cleared = false
 	state.DirtyReason = reason
 	state.DirtyRevision++
 	state.ProbeProgress = nil
@@ -538,7 +591,7 @@ func (s *Storage) CountEntryHealthByStatus() map[HealthStatus]int {
 	// index, so the fallback set shrinks to zero.
 	var needDecode []string
 	_ = s.repairState.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
-		if meta.Status == "alias" {
+		if meta.Status == "alias" || meta.Status == "cleared" {
 			return nil
 		}
 		if meta.Status != "" {

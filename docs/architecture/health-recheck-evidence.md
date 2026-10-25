@@ -8,7 +8,7 @@ new database or service.
 
 ## Evidence and completion
 
-- Terminal failures persist owner hash, exact filename, offset and length
+- Terminal failures persist owner hash, stable file ID when known, exact filename, offset and length
   before event admission. Duplicate ranges coalesce; at most 64 distinct ranges
   are retained. Invalid or overflowed evidence makes the check incomplete.
 - All health rechecks perform supported NZB media-head verification in addition
@@ -27,6 +27,13 @@ new database or service.
   destructive Arr repair or clear-broken selection.
 - Newer failure revisions override stale probe saves, including their ranges,
   dirty state and last successful timestamp. A stale success becomes unknown.
+- Clear State resets only disposable status. Dirty rows, failed ranges, missing
+  evidence, active work, progress and durable handoff/retirement records remain.
+  Cleared display rows retain hidden revision fences, so an old probe cannot
+  erase a later failure after a status reset.
+- Source checks fence broken verdicts as well as successful ones, including a
+  final pass across all results before repair authority is published. A change
+  during a later file invalidates earlier proofs from that account/source.
 
 Import acceptance, provider deletion fences, cleanup workflow authority,
 administrative account binding, library paths and Usenet metadata are unchanged.
@@ -70,6 +77,22 @@ after a crash between these writes. Later failures under the old name forward
 to the canonical row. A stale alias probe cannot overwrite it, and forwarding
 records do not appear as independent health entries. No media path is renamed.
 
+Bindings retain their owner hash and revalidate the original runtime name
+against the current main entry and canonical index. Renames migrate evidence
+before retargeting forwarding records. Reused names do not transfer the previous
+owner's evidence. Revision fences survive renames back to a previously used key.
+
+## Operator file retirement
+
+Clear Broken and explicit mount-file removal persist an exact owner/file-ID,
+size and byte-range intent before publishing the local index's Deleted flag.
+Only after that index is synced does the health row acknowledge matching failed
+ranges and retain a confirmed receipt. Other files, changed incarnations, newer
+failures and unscoped legacy evidence remain unresolved. Startup and subsequent
+rechecks replay pending intents only against the same exact file identity.
+Confirmed receipts suppress delayed feedback for that retired incarnation.
+These receipts grant no provider deletion or administrative retry authority.
+
 Historical read-failure rows without recorded ranges remain incomplete; the
 software does not invent missing evidence from availability samples. Their
 canonical identity can still be repaired, and a bad head can still be detected.
@@ -90,7 +113,17 @@ change does not backfill live warnings or clear historical records.
   provider/account replacement, missing/legacy ranges, invalid offsets and
   overflow; generic updates and alias merges cannot hide legacy evidence gaps.
 - Real main-entry/index producers for the .mkv suffix and You./YOU. cases,
-  including ambiguous owner and mixed-owner rejection.
+  including ambiguous owner and mixed-owner rejection, canonical rename and
+  runtime-name reuse without transferring another owner's failures.
+- Status resets with unresolved evidence and high-revision stale probes;
+  process death at all three file-retirement and owned-alias migration phases;
+  exact retirement, unrelated/newer failures and rename-back revision fences.
+
+An existing orphan-reconciliation limitation remains a separate follow-up:
+an interrupted manual recheck of a previously clean, fresh row retains its
+checkpoint but may wait for another trigger or the normal recheck interval.
+Dirty incomplete checks remain eligible for recovery. This PR's four review
+fixes do not change clean-row scheduling after restart.
 
 The existing cleanup, crash recovery, operator resolution and account authority
 regressions must pass alongside these tests before merge or deployment.

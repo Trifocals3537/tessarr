@@ -74,13 +74,14 @@ func (c *healCache) do(infoHash string, fix func() error) error {
 
 // fileResult is the outcome of probing one file in an entry.
 type fileResult struct {
-	name       string
-	infoHash   string
-	protocol   config.Protocol
-	healthy    bool
-	broken     bool
-	incomplete bool
-	reason     string // populated only when broken or unknown
+	name              string
+	infoHash          string
+	protocol          config.Protocol
+	healthy           bool
+	broken            bool
+	incomplete        bool
+	sourceFingerprint string
+	reason            string // populated only when broken or unknown
 }
 
 // executeSweep is the body of a sweep: enumerate, filter due, probe, repair.
@@ -310,6 +311,11 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // then persists final health.
 func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool) *storage.EntryHealth {
 	s := r.manager.storage
+	if changed, err := s.ReconcileHealthFileRetirements(c.name); err != nil {
+		return nil
+	} else if changed {
+		c.item = nil
+	}
 	// Lazily load the entry body. Enumeration only recorded the name, so the
 	// store isn't fully decoded up front. A vanished or empty entry is a skip
 	// (nil tells the worker not to count it).
@@ -545,7 +551,7 @@ func (r *Repair) probeTorrentFileByUnrestrict(ctx context.Context, entry *storag
 func (r *Repair) autoHealResults(ctx context.Context, results []fileResult, heal *healCache) {
 	byHash := make(map[string][]int)
 	for i, res := range results {
-		if !res.broken || res.protocol != config.ProtocolTorrent || res.infoHash == "" {
+		if !res.broken || res.incomplete || res.protocol != config.ProtocolTorrent || res.infoHash == "" {
 			continue
 		}
 		byHash[res.infoHash] = append(byHash[res.infoHash], i)
@@ -589,6 +595,11 @@ func (r *Repair) brokenFiles(c *candidate, results []fileResult) []storage.Broke
 		}
 		if file, ok := c.item.Files[res.name]; ok && file != nil {
 			bf.Size = file.Size
+			bf.FileID = file.ID
+			if file.ByteRange != nil {
+				copied := *file.ByteRange
+				bf.ByteRange = &copied
+			}
 			if bf.InfoHash == "" {
 				bf.InfoHash = file.InfoHash
 			}
@@ -1176,7 +1187,7 @@ func (r *Repair) clearBroken(ctx context.Context, run *storage.RepairRun, health
 
 		remaining := make([]storage.BrokenFile, 0, len(h.BrokenFiles))
 		for _, bf := range h.BrokenFiles {
-			if err := r.manager.RemoveTorrentFile(bf.EntryName, bf.FileName); err != nil {
+			if err := r.manager.removeTorrentFile(bf.EntryName, bf.FileName, &bf); err != nil {
 				if isAlreadyClearedFileError(err) {
 					run.Stats.Cleared++
 					r.saveRun(run)

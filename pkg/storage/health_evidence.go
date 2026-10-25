@@ -12,6 +12,12 @@ import (
 
 const maxFailedReadRanges = 64
 
+func protectedHealthState(h *EntryHealth) bool {
+	return h.Dirty || len(h.FailedReads) > 0 || h.FailedReadsIncomplete ||
+		h.ProbeProgress != nil || h.ActiveRunID != "" || len(h.BrokenFiles) > 0 ||
+		len(h.AliasRevisions) > 0 || len(h.FileRetirements) > 0
+}
+
 func missingLegacyReadEvidence(h *EntryHealth) bool {
 	return h.Dirty && strings.HasPrefix(h.DirtyReason, "read_failure") && len(h.FailedReads) == 0
 }
@@ -22,6 +28,7 @@ type FailedReadRange struct {
 	FileName string `json:"file_name"`
 	Offset   int64  `json:"offset"`
 	Length   int64  `json:"length"`
+	FileID   string `json:"file_id,omitempty"`
 }
 
 // Only complete, successful file probes are reusable. Revision and both file
@@ -50,7 +57,8 @@ func addFailedRead(h *EntryHealth, f FailedReadRange) {
 }
 
 func (s *Storage) RecordFailedRead(entryName string, protocol config.Protocol, reason string, failed FailedReadRange) error {
-	return s.markEntryDirty(entryName, protocol, reason, &failed)
+	_, err := s.RecordFailedReadAt(entryName, protocol, reason, failed)
+	return err
 }
 
 func (s *Storage) healthNameLocked(name string) (string, error) {

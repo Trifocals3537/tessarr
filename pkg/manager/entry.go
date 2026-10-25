@@ -471,6 +471,10 @@ func (m *Manager) CopyEntry(entry *FileInfo, destPath string, delete bool) error
 }
 
 func (m *Manager) RemoveTorrentFile(torrentName, filename string) error {
+	return m.removeTorrentFile(torrentName, filename, nil)
+}
+
+func (m *Manager) removeTorrentFile(torrentName, filename string, confirmed *storage.BrokenFile) error {
 	item, err := m.storage.GetEntryItem(torrentName)
 	if err != nil {
 		return fmt.Errorf("entry %s not found", torrentName)
@@ -479,11 +483,17 @@ func (m *Manager) RemoveTorrentFile(torrentName, filename string) error {
 	if err != nil {
 		return fmt.Errorf("file %s not found in entry %s", filename, torrentName)
 	}
-	file.Deleted = true
-	item.Files[filename] = file
-
-	// Update item in storage
-	if err := m.storage.UpdateItem(item); err != nil {
+	if confirmed != nil && (confirmed.InfoHash != file.InfoHash || confirmed.Size > 0 && confirmed.Size != file.Size) {
+		return fmt.Errorf("broken file identity changed")
+	}
+	if confirmed != nil && confirmed.FileID != "" {
+		sameRange := confirmed.ByteRange == nil && file.ByteRange == nil || confirmed.ByteRange != nil && file.ByteRange != nil && *confirmed.ByteRange == *file.ByteRange
+		if confirmed.FileID != file.ID || !sameRange {
+			return fmt.Errorf("broken file identity changed")
+		}
+	}
+	item, err = m.storage.RetireEntryItemFile(torrentName, filename, file)
+	if err != nil {
 		return fmt.Errorf("failed to update entry %s: %w", torrentName, err)
 	}
 
