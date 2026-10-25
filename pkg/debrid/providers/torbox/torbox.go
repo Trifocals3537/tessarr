@@ -199,7 +199,10 @@ func (tb *Torbox) doGetContextBounded(
 	}
 	defer resp.Body.Close()
 
-	if result != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && resp.ContentLength != 0 {
+	// Exact-ID absence must come from the provider's typed error, not a generic
+	// proxy/CDN 404 page. Other non-success responses keep their existing path.
+	exactNotFound := resp.StatusCode == http.StatusNotFound && endpoint == "/api/torrents/mylist" && queryParams["id"] != ""
+	if result != nil && ((resp.StatusCode >= 200 && resp.StatusCode < 300) || exactNotFound) && resp.ContentLength != 0 {
 		if err := utils.DecodeJSONResponseBounded(resp.Body, result, maxResponseBytes); err != nil {
 			return resp, err
 		}
@@ -578,6 +581,9 @@ func (tb *Torbox) GetTorrentContext(ctx context.Context, torrentId string) (*typ
 		return nil, err
 	}
 
+	if resp.StatusCode == http.StatusNotFound && res.Error == "ITEM_NOT_FOUND" {
+		return nil, customerror.TorrentNotFoundError
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("torbox API error: Status: %d", resp.StatusCode)
 	}

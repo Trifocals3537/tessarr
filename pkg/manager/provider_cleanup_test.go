@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"github.com/Trifocals3537/tessarr/internal/config"
 	"github.com/Trifocals3537/tessarr/internal/customerror"
 	debrid "github.com/Trifocals3537/tessarr/pkg/debrid/common"
+	debridTypes "github.com/Trifocals3537/tessarr/pkg/debrid/types"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/rs/zerolog"
@@ -19,12 +21,29 @@ type placementDeleteTestProvider struct {
 	debrid.Client
 	name   string
 	delete func(string) error
+	lookup func(string) (*debridTypes.Torrent, error)
 }
 
 func (p *placementDeleteTestProvider) DeleteTorrent(id string) error {
 	return p.delete(id)
 }
 
+func (p *placementDeleteTestProvider) GetTorrent(id string) (*debridTypes.Torrent, error) {
+	if p.lookup != nil {
+		return p.lookup(id)
+	}
+	return nil, errors.New("provider lookup unavailable")
+}
+func (p *placementDeleteTestProvider) TorrentPresenceContext(ctx context.Context, id string) (debrid.TorrentPresence, error) {
+	_, err := p.GetTorrent(id)
+	if errors.Is(err, customerror.TorrentNotFoundError) {
+		return debrid.TorrentAbsent, nil
+	}
+	if err != nil {
+		return debrid.TorrentPresenceUnknown, err
+	}
+	return debrid.TorrentPresent, nil
+}
 func (p *placementDeleteTestProvider) Config() config.Debrid {
 	return config.Debrid{Name: p.name}
 }
@@ -162,7 +181,7 @@ func TestRemoveTorrentPlacementsUsesDeterministicOrderAndJoinsErrors(t *testing.
 	}
 }
 
-func TestRecoverQueuedDeletionRetiresRowAndRetriesPlacementCleanup(t *testing.T) {
+func TestRecoverQueuedDeletionRetiresRowAndReconcilesPlacementCleanup(t *testing.T) {
 	root := t.TempDir()
 	config.SetConfigPath(root)
 	downloadRoot := filepath.Join(root, "downloads")
@@ -254,8 +273,8 @@ func TestRecoverQueuedDeletionRetiresRowAndRetriesPlacementCleanup(t *testing.T)
 	if _, err := store.GetQueued(entry.InfoHash); !storage.IsQueuedEntryNotFound(err) {
 		t.Fatalf("recovered queue row = %v, want not found", err)
 	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("local files remain after recovery retirement: %v", err)
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("local files removed with uncertain provider cleanup: %v", err)
 	}
 	intents, err := store.QueuedDeletionIntents()
 	if err != nil {
@@ -266,12 +285,14 @@ func TestRecoverQueuedDeletionRetiresRowAndRetriesPlacementCleanup(t *testing.T)
 	}
 
 	fail = false
+	provider.lookup = func(string) (*debridTypes.Torrent, error) { return nil, customerror.TorrentNotFoundError }
+	requestCleanupRetry(t, manager, "retry")
 	residual, fatal = manager.recoverQueuedDeletions()
 	if fatal != nil || residual != nil {
 		t.Fatalf("second recovery = residual %v, fatal %v", residual, fatal)
 	}
-	if calls != 2 {
-		t.Fatalf("provider cleanup calls = %d, want 2", calls)
+	if calls != 1 {
+		t.Fatalf("provider DELETE replayed: calls = %d, want 1", calls)
 	}
 	intents, err = store.QueuedDeletionIntents()
 	if err != nil {

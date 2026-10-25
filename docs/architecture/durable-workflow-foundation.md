@@ -4,9 +4,10 @@ Status: first implementation milestone, October 2026.
 
 Tessarr's next architectural workstream is a shared durable workflow core. This
 milestone establishes its safety boundaries while retaining the current storage
-format, provider behavior, and deployment platforms. A transactional database
-replacement, durable external-effect outbox, and generic persisted worker leases
-are subsequent milestones; this change does not claim to implement them.
+format, provider behavior, and deployment platforms. The next execution milestone
+adds persisted claims and operator recovery for retained queue cleanup; see
+[cleanup workflows](cleanup-workflows.md). A transactional database replacement
+and a general external-effect outbox remain subsequent milestones.
 
 Queue-backed provider creation now has a scoped intent/reconciliation boundary
 in the same append-log stores. See [provider submission recovery](provider-submission-recovery.md)
@@ -87,9 +88,9 @@ provider, Arr, or filesystem effects.
 1. Evaluate a transactional catalog/workflow store behind repository contracts.
    SQLite on local storage is a candidate, subject to benchmarks, Windows CGO=0,
    native Linux/glibc compatibility, and explicit durability settings.
-2. Define durable job/attempt identities, fenced claims, not-before timestamps,
-   tri-state request policies, and critical external-effect records. Commit
-   intent before making an external call, then reconcile uncertain outcomes.
+2. Extend cleanup's durable attempts, fenced claims, retry deadlines and operator
+   decisions to other work types. Preserve tri-state admission policies and
+   record critical external effects before calling providers or Arrs.
 3. Build an offline migration from an immutable checkpoint, comparing semantic
    digests of entries, files, placements, queue incarnations, tombstones, cleanup
    obligations, health revisions, source references, and output ownership.

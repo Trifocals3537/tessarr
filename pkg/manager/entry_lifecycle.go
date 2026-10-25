@@ -276,6 +276,12 @@ func (w *entryWorkLease) Close() {
 // already registered is captured and canceled; work racing registration sees
 // the tombstone and is rejected.
 func (l *entryLifecycle) beginDelete(key string) (*entryDeleteLease, error) {
+	return l.beginDeleteChecked(key, nil)
+}
+
+// beginDeleteChecked validates durable ownership while the generation gate is
+// held, before canceling workers or removing pending jobs for that key.
+func (l *entryLifecycle) beginDeleteChecked(key string, check func() error) (*entryDeleteLease, error) {
 	state, err := l.stateFor(key, true)
 	if err != nil {
 		return nil, err
@@ -285,6 +291,11 @@ func (l *entryLifecycle) beginDelete(key string) (*entryDeleteLease, error) {
 	defer state.mu.Unlock()
 	if state.deleting {
 		return nil, fmt.Errorf("%w: %s", ErrQueueEntryDeleting, key)
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return nil, err
+		}
 	}
 	state.deleting = true
 
