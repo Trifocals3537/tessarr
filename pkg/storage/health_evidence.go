@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
@@ -10,6 +11,10 @@ import (
 )
 
 const maxFailedReadRanges = 64
+
+func missingLegacyReadEvidence(h *EntryHealth) bool {
+	return h.Dirty && strings.HasPrefix(h.DirtyReason, "read_failure") && len(h.FailedReads) == 0
+}
 
 // FailedReadRange uses logical file offsets, never provider/archive offsets.
 type FailedReadRange struct {
@@ -118,7 +123,7 @@ func (s *Storage) BindHealthAlias(alias, canonical string) error {
 			for _, f := range source.FailedReads {
 				addFailedRead(dest, f)
 			}
-			dest.FailedReadsIncomplete = dest.FailedReadsIncomplete || source.FailedReadsIncomplete
+			dest.FailedReadsIncomplete = dest.FailedReadsIncomplete || source.FailedReadsIncomplete || missingLegacyReadEvidence(source)
 			if source.Protocol != "" {
 				dest.Protocol = source.Protocol
 			}

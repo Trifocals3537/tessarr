@@ -486,6 +486,9 @@ func (s *Storage) markEntryDirty(entryName string, protocol config.Protocol, rea
 	if state == nil {
 		state = &EntryHealth{EntryName: entryName, Status: HealthUnknown}
 	}
+	// A later generic mutation or new known range cannot erase an older
+	// failure whose range was never retained by the previous implementation.
+	state.FailedReadsIncomplete = state.FailedReadsIncomplete || missingLegacyReadEvidence(state)
 	if protocol != "" {
 		state.Protocol = protocol
 	}
@@ -495,6 +498,9 @@ func (s *Storage) markEntryDirty(entryName string, protocol config.Protocol, rea
 	state.ProbeProgress = nil
 	if failed != nil {
 		addFailedRead(state, *failed)
+	}
+	if failed == nil && missingLegacyReadEvidence(state) {
+		state.FailedReadsIncomplete = true
 	}
 	state.NextCheckDueAt = time.Time{}
 	if err := s.putEntryHealthLocked(state); err != nil {

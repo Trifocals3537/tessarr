@@ -59,6 +59,34 @@ func TestFailedReadEvidenceOverflowAndInvalidRangeStayIncomplete(t *testing.T) {
 	}
 }
 
+func TestLegacyReadEvidenceCannotBeHiddenByMutationOrAliasMerge(t *testing.T) {
+	s := newMainLifecycleTestStorage(t)
+	// Model a pre-upgrade row exactly: no range or incomplete-evidence field.
+	if err := s.SaveEntryHealth(&EntryHealth{EntryName: "legacy", Dirty: true, DirtyReason: "read_failure:timeout", DirtyRevision: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkEntryDirtyChecked("legacy", config.ProtocolNZB, "entry_item_changed"); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := s.GetEntryHealth("legacy")
+	if !h.FailedReadsIncomplete {
+		t.Fatal("generic mutation erased legacy evidence gap")
+	}
+	if err := s.RecordFailedRead("canonical", config.ProtocolNZB, "read_failure:timeout", FailedReadRange{InfoHash: "hash", FileName: "file", Offset: 1, Length: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveEntryHealth(&EntryHealth{EntryName: "alias", Dirty: true, DirtyReason: "read_failure:timeout", DirtyRevision: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindHealthAlias("alias", "canonical"); err != nil {
+		t.Fatal(err)
+	}
+	h, _ = s.GetEntryHealth("canonical")
+	if !h.FailedReadsIncomplete || len(h.FailedReads) != 1 {
+		t.Fatalf("known canonical range hid missing alias evidence: %+v", h)
+	}
+}
+
 func TestHealthAliasCrashReplayAndForwarding(t *testing.T) {
 	for _, phase := range []string{"range", "handoff", "alias", "progress"} {
 		t.Run(phase, func(t *testing.T) {
