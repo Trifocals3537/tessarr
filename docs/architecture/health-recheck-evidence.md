@@ -84,7 +84,8 @@ owner's evidence. Revision fences survive renames back to a previously used key.
 
 Before a main-entry rename changes its index, the old canonical and legacy
 runtime rows acquire a synced owner binding. Missing legacy read evidence is
-retained explicitly. Checks through the new name complete the owner's handoff
+retained explicitly, including a runtime-name change that leaves the canonical
+folder unchanged. Checks through the new name complete the owner's handoff
 before probing; they do not depend on a second stream failure or a request
 through the old name. If another owner reuses the old canonical key, its prior
 owner's evidence is moved first. Failed ownership proof never permits appending

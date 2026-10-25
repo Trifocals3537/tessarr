@@ -282,7 +282,7 @@ func (s *Storage) reconcileHealthOwnerLocked(owner *Entry, naming config.WebDavF
 // and index still agree. This synced binding survives both a rolled-back rename
 // and a crash after the authoritative main row moves to its new folder.
 func (s *Storage) prepareHealthRenameLocked(previous, replacement *Entry) error {
-	if previous == nil || previous.GetFolder() == replacement.GetFolder() {
+	if previous == nil || previous.GetFolder() == replacement.GetFolder() && previous.Name == replacement.Name {
 		return nil
 	}
 	item, err := s.GetEntryItem(previous.GetFolder())

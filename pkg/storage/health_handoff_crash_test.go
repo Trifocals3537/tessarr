@@ -1,13 +1,16 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/logger"
 )
 
 func crashHealthHandoff(t *testing.T, path, mode, phase string) {
@@ -220,4 +223,53 @@ func TestHealthHandoffCrashHelper(t *testing.T) {
 		t.Fatalf("unknown handoff crash mode %q", mode)
 	}
 	t.Fatal("expected crash boundary without Close")
+}
+
+func TestHealthHandoffRuntimeOnlyRenamePreservesLegacyWarning(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHealthHandoffRuntimeOnlyRenameHelper$", "-test.v")
+	cmd.Env = append(os.Environ(), "TESSARR_HANDOFF_RUNTIME_ONLY=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("runtime-only rename: %v %s", err, out)
+	}
+}
+
+func TestHealthHandoffRuntimeOnlyRenameHelper(t *testing.T) {
+	if os.Getenv("TESSARR_HANDOFF_RUNTIME_ONLY") != "1" {
+		return
+	}
+	defer logger.Close()
+	root := t.TempDir()
+	if err := config.SetConfigPath(root); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(map[string]any{"folder_naming": "original", "debrids": []map[string]any{{"name": "realdebrid", "api_key": "fixture"}}})
+	if err := os.WriteFile(filepath.Join(root, "config.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	config.Reset()
+	config.Get()
+	s := newMainLifecycleTestStorage(t)
+	e := healthResolutionEntry()
+	e.Name, e.OriginalFilename = "Runtime.Before", "Canonical.Fixed"
+	if err := s.AddOrUpdateDurable(e); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveEntryHealth(&EntryHealth{EntryName: e.Name, Dirty: true, DirtyReason: "read_failure:timeout", DirtyRevision: 7}); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := s.Get(e.InfoHash)
+	current.Name = "Runtime.After"
+	if err := s.AddOrUpdateDurable(current); err != nil {
+		t.Fatal(err)
+	}
+	if current.GetFolder() != e.GetFolder() {
+		t.Fatal("fixture changed canonical identity")
+	}
+	if _, err := s.ResolveHealthEntry(current.GetFolder(), config.Get().FolderNaming); err != nil {
+		t.Fatal(err)
+	}
+	h, err := s.GetEntryHealth(current.GetFolder())
+	if err != nil || !h.Dirty || !h.FailedReadsIncomplete || h.OwnerInfoHash != e.InfoHash {
+		t.Fatalf("runtime rename lost unscoped legacy warning: %+v %v", h, err)
+	}
 }
