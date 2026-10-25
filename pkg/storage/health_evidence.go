@@ -15,7 +15,7 @@ const maxFailedReadRanges = 64
 func protectedHealthState(h *EntryHealth) bool {
 	return h.Dirty || len(h.FailedReads) > 0 || h.FailedReadsIncomplete ||
 		h.ProbeProgress != nil || h.ActiveRunID != "" || len(h.BrokenFiles) > 0 ||
-		len(h.AliasRevisions) > 0 || len(h.FileRetirements) > 0
+		len(h.AliasRevisions) > 0 || len(h.FileRetirements) > 0 || len(h.FileRetirementHistory) > 0
 }
 
 func missingLegacyReadEvidence(h *EntryHealth) bool {

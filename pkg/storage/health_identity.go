@@ -2,7 +2,7 @@ package storage
 
 import (
 	"errors"
-	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -11,6 +11,43 @@ import (
 )
 
 var ErrHealthIdentity = errors.New("health owner or canonical identity is unresolved")
+
+func healthOwnerCategory(owner string) string {
+	return "health-owner:" + owner
+}
+
+// Reuse the hybrid store's existing metadata indexes. Old rows are indexed
+// once without changing their proof/revision; ordinary checks then read only
+// this owner's roots and its exact runtime key, not the whole health database.
+func (s *Storage) ensureHealthIdentityIndexLocked() error {
+	if s.healthIdentityIndexed {
+		return nil
+	}
+	var keys []string
+	if err := s.repairState.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
+		if meta.Category == "" {
+			keys = append(keys, key)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		h, err := s.getEntryHealthLocked(key)
+		if err != nil {
+			return err
+		}
+		if err := s.putEntryHealthLocked(h); err != nil {
+			return err
+		}
+	}
+	// Retry even if a prior failed sync left the metadata visible in memory.
+	if err := s.repairState.Sync(); err != nil {
+		return err
+	}
+	s.healthIdentityIndexed = true
+	return nil
+}
 
 func itemOwnedBy(item *EntryItem, hash string) bool {
 	if item == nil || len(item.Files) == 0 {
@@ -55,6 +92,9 @@ func (s *Storage) resolveHealthEntryLocked(name string, naming config.WebDavFold
 				}
 				if GetTorrentFolder(naming, owner) != name {
 					return nil, ErrHealthIdentity
+				}
+				if err := s.reconcileHealthOwnerLocked(owner, naming, make(map[string]bool)); err != nil {
+					return nil, err
 				}
 				if err := s.bindOwnedHealthLocked(name, name, owner.InfoHash); err != nil {
 					return nil, err
@@ -127,10 +167,166 @@ func (s *Storage) resolveHealthEntryLocked(name string, naming config.WebDavFold
 	if !itemOwnedBy(item, owner.InfoHash) {
 		return nil, ErrHealthIdentity
 	}
+	if err := s.reconcileHealthOwnerLocked(owner, naming, make(map[string]bool)); err != nil {
+		return nil, err
+	}
 	if err := s.bindOwnedHealthLocked(name, canonical, owner.InfoHash); err != nil {
 		return nil, err
 	}
 	return item, nil
+}
+
+// Every entry point, including an inventory probe of the new name, completes
+// the owner's handoff. A destination occupied by a moved owner is evacuated
+// first; cycles and ambiguous ownership retain the evidence and fail closed.
+// The caller owns entryItemsMu and entryHealthMu.
+func (s *Storage) reconcileHealthOwnerLocked(owner *Entry, naming config.WebDavFolderNaming, visiting map[string]bool) error {
+	if visiting[owner.InfoHash] {
+		return ErrHealthIdentity
+	}
+	visiting[owner.InfoHash] = true
+	defer delete(visiting, owner.InfoHash)
+	if intent, _, err := s.loadMainEntryTombstone(owner.InfoHash); err != nil {
+		return err
+	} else if intent != nil {
+		return ErrEntryDeleting
+	}
+	canonical := GetTorrentFolder(naming, owner)
+	item, err := s.GetEntryItem(canonical)
+	if err != nil {
+		return err
+	}
+	if !itemOwnedBy(item, owner.InfoHash) {
+		return ErrHealthIdentity
+	}
+	dest, err := s.getEntryHealthLocked(canonical)
+	if err != nil && !hybrid.IsNotFound(err) {
+		return err
+	}
+	previousOwner := rangeOwner(dest)
+	if previousOwner != "" && previousOwner != owner.InfoHash && (dest.CanonicalEntry != "" || protectedHealthState(dest)) {
+		previous, err := s.getMainRaw(previousOwner)
+		if err != nil {
+			return err
+		}
+		if GetTorrentFolder(naming, previous) == canonical {
+			return ErrHealthIdentity
+		}
+		if err := s.reconcileHealthOwnerLocked(previous, naming, visiting); err != nil {
+			return err
+		}
+		dest, err = s.getEntryHealthLocked(canonical)
+		if err != nil {
+			return err
+		}
+		if dest.CanonicalEntry == "" {
+			return ErrHealthIdentity
+		}
+		// The previous root is durable at its own canonical key. Preserve the
+		// reused key's revision fence, then make it available to its new owner.
+		if err := s.putEntryHealthLocked(&EntryHealth{EntryName: canonical, OwnerInfoHash: owner.InfoHash, Status: HealthUnknown, Dirty: true, DirtyReason: "health_owner_changed", DirtyRevision: dest.DirtyRevision + 1}); err != nil {
+			return err
+		}
+		if err := s.repairState.Sync(); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureHealthIdentityIndexLocked(); err != nil {
+		return err
+	}
+	keys := s.repairState.FilterByCategory(healthOwnerCategory(owner.InfoHash))
+	if !slices.Contains(keys, owner.Name) && s.repairState.Exists(owner.Name) {
+		keys = append(keys, owner.Name)
+	}
+	var sources []string
+	for _, key := range keys {
+		h, err := s.getEntryHealthLocked(key)
+		if err != nil {
+			return err
+		}
+		if key == canonical || h.CanonicalEntry != "" {
+			continue
+		}
+		if rangeOwner(h) == owner.InfoHash {
+			sources = append(sources, key)
+		} else if key == owner.Name && rangeOwner(h) == "" && protectedHealthState(h) {
+			// Old runtime rows can lack both an owner field and saved ranges.
+			// Only a unique exact main-entry name may bind their missing proof.
+			if err := s.entries.ForEach(func(k string, b []byte) error {
+				if strings.HasPrefix(k, "__") {
+					return nil
+				}
+				e, err := decodeMainEntry(k, b)
+				if err != nil {
+					return err
+				}
+				if e.Name == owner.Name && e.InfoHash != owner.InfoHash {
+					return ErrHealthIdentity
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			sources = append(sources, key)
+		}
+	}
+	for _, source := range sources {
+		if err := s.bindOwnedHealthLocked(source, canonical, owner.InfoHash); err != nil {
+			return err
+		}
+	}
+	return s.bindOwnedHealthLocked(canonical, canonical, owner.InfoHash)
+}
+
+// Capture legacy missing evidence and its exact owner while the old main row
+// and index still agree. This synced binding survives both a rolled-back rename
+// and a crash after the authoritative main row moves to its new folder.
+func (s *Storage) prepareHealthRenameLocked(previous, replacement *Entry) error {
+	if previous == nil || previous.GetFolder() == replacement.GetFolder() {
+		return nil
+	}
+	item, err := s.GetEntryItem(previous.GetFolder())
+	if err != nil {
+		return err
+	}
+	s.entryHealthMu.Lock()
+	defer s.entryHealthMu.Unlock()
+	if !itemOwnedBy(item, previous.InfoHash) {
+		// A shared folder is not proof that its unresolved/missing evidence
+		// belongs only to the owner moving away. Keep that uncertainty in
+		// place rather than losing it or assigning it to another owner.
+		name, err := s.healthNameLocked(previous.GetFolder())
+		if err != nil {
+			return err
+		}
+		h, err := s.getEntryHealthLocked(name)
+		if hybrid.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if len(h.FailedReads) > 0 || h.FailedReadsIncomplete || missingLegacyReadEvidence(h) || h.ProbeProgress != nil || len(h.FileRetirements) > 0 || len(h.FileRetirementHistory) > 0 {
+			return ErrHealthIdentity
+		}
+		return nil
+	}
+	if err := s.reconcileHealthOwnerLocked(previous, config.Get().FolderNaming, make(map[string]bool)); err != nil {
+		return err
+	}
+	h, err := s.getEntryHealthLocked(previous.GetFolder())
+	if err != nil {
+		return err
+	}
+	if missingLegacyReadEvidence(h) {
+		h.FailedReadsIncomplete = true
+		h.DirtyRevision++
+		h.ProbeProgress = nil
+		if err := s.putEntryHealthLocked(h); err != nil {
+			return err
+		}
+	}
+	return s.repairState.Sync()
 }
 
 func rangeOwner(h *EntryHealth) string {
@@ -212,6 +408,7 @@ func (s *Storage) bindOwnedHealthLocked(alias, canonical, owner string) error {
 	}
 	if sourceName == canonical && transfer {
 		dest.OwnerInfoHash = owner
+		dest.FailedReadsIncomplete = dest.FailedReadsIncomplete || missingLegacyReadEvidence(dest)
 		if err := s.putEntryHealthLocked(dest); err != nil {
 			return err
 		}
@@ -221,10 +418,9 @@ func (s *Storage) bindOwnedHealthLocked(alias, canonical, owner string) error {
 			dest.AliasRevisions = make(map[string]uint64)
 		}
 		if rev, ok := dest.AliasRevisions[key]; !ok || rev < source.DirtyRevision {
-			for filename, receipt := range source.FileRetirements {
-				if current, ok := dest.FileRetirements[filename]; ok && !current.matches(&File{InfoHash: receipt.InfoHash, ID: receipt.FileID, Size: receipt.Size, ByteRange: receipt.ByteRange}) {
-					return ErrHealthIdentity
-				}
+			item, err := s.GetEntryItem(canonical)
+			if err != nil {
+				return err
 			}
 			dest.Dirty, dest.Cleared = true, false
 			dest.Status = HealthUnknown
@@ -242,12 +438,7 @@ func (s *Storage) bindOwnedHealthLocked(alias, canonical, owner string) error {
 			if source.Protocol != "" {
 				dest.Protocol = source.Protocol
 			}
-			if len(source.FileRetirements) > 0 {
-				if dest.FileRetirements == nil {
-					dest.FileRetirements = make(map[string]HealthFileRetirement)
-				}
-				maps.Copy(dest.FileRetirements, source.FileRetirements)
-			}
+			mergeHealthRetirements(dest, source, item)
 			for k, v := range source.AliasRevisions {
 				dest.AliasRevisions[k] = max(dest.AliasRevisions[k], v)
 			}
@@ -294,6 +485,9 @@ func (s *Storage) bindOwnedHealthLocked(alias, canonical, owner string) error {
 		if err := s.putEntryHealthLocked(&EntryHealth{EntryName: alias, CanonicalEntry: canonical, OwnerInfoHash: owner, Status: HealthUnknown, DirtyRevision: max(raw.DirtyRevision, dest.DirtyRevision)}); err != nil {
 			return err
 		}
+		if sourceName == alias && s.healthAliasPhaseForTest != nil {
+			s.healthAliasPhaseForTest("source")
+		}
 	}
 	if err := s.repairState.Sync(); err != nil {
 		return err
@@ -315,6 +509,11 @@ func (s *Storage) RecordFailedReadAt(name string, protocol config.Protocol, reas
 	defer s.entryItemsMu.Unlock()
 	s.entryHealthMu.Lock()
 	defer s.entryHealthMu.Unlock()
+	if retired, err := s.retiredReadLocked(failed); err != nil {
+		return "", err
+	} else if retired {
+		return "", nil
+	}
 	check := &EntryHealth{}
 	addFailedRead(check, failed)
 	if check.FailedReadsIncomplete {
@@ -333,6 +532,11 @@ func (s *Storage) RecordFailedReadAt(name string, protocol config.Protocol, reas
 		if itemErr == nil {
 			file := item.Files[failed.FileName]
 			if file != nil && file.InfoHash == failed.InfoHash {
+				// A canonical conflict must be resolved before considering any
+				// optional runtime-name alias. Never swallow this ownership error.
+				if _, err := s.resolveHealthEntryLocked(canonical, config.Get().FolderNaming); err != nil {
+					return "", err
+				}
 				if failed.FileID == "" {
 					failed.FileID = file.ID
 				}

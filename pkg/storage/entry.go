@@ -230,9 +230,18 @@ func (s *Storage) addOrUpdateMainRaw(entry *Entry) error {
 
 	s.entryItemsMu.Lock()
 	defer s.entryItemsMu.Unlock()
+	if err := s.prepareHealthRenameLocked(previous, entry); err != nil {
+		return fmt.Errorf("prepare health rename: %w", err)
+	}
+	if previous != nil && previous.GetFolder() != entry.GetFolder() && s.healthRenameForTest != nil {
+		s.healthRenameForTest("prepared")
+	}
 	snapshots, err := s.mutateEntryItems(previous, entry)
 	if err != nil {
 		return err
+	}
+	if previous != nil && previous.GetFolder() != entry.GetFolder() && s.healthRenameForTest != nil {
+		s.healthRenameForTest("index")
 	}
 	if err := s.entries.Put(entry.InfoHash, data, meta); err != nil {
 		restoreErr := s.restoreEntryItemSnapshots(snapshots)
@@ -240,6 +249,9 @@ func (s *Storage) addOrUpdateMainRaw(entry *Entry) error {
 			fmt.Errorf("write main entry: %w", err),
 			restoreErr,
 		)
+	}
+	if previous != nil && previous.GetFolder() != entry.GetFolder() && s.healthRenameForTest != nil {
+		s.healthRenameForTest("main")
 	}
 	s.markEntryItemMutation(previous, entry)
 	return nil

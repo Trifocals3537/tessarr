@@ -52,6 +52,7 @@ type Storage struct {
 	healthAliasSyncedForTest func()
 	healthRetirementForTest  func(string)
 	healthAliasPhaseForTest  func(string)
+	healthRenameForTest      func(string)
 	// Per-key durability latches survive lifecycle-state eviction. Operations
 	// on each key are serialized by its lifecycle lock.
 	handoffPending   sync.Map
@@ -73,6 +74,7 @@ type Storage struct {
 	entryItemsDirty        bool
 	startupComplete        bool
 	entryHealthMu          sync.Mutex
+	healthIdentityIndexed  bool // Guarded by entryHealthMu; rebuilt on each open.
 	healthCountsMu         sync.Mutex
 	healthCounts           map[HealthStatus]int
 	healthCountsBuiltAt    time.Time

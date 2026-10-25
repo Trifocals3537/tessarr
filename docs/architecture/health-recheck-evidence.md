@@ -82,6 +82,23 @@ against the current main entry and canonical index. Renames migrate evidence
 before retargeting forwarding records. Reused names do not transfer the previous
 owner's evidence. Revision fences survive renames back to a previously used key.
 
+Before a main-entry rename changes its index, the old canonical and legacy
+runtime rows acquire a synced owner binding. Missing legacy read evidence is
+retained explicitly. Checks through the new name complete the owner's handoff
+before probing; they do not depend on a second stream failure or a request
+through the old name. If another owner reuses the old canonical key, its prior
+owner's evidence is moved first. Failed ownership proof never permits appending
+the new owner's range to that protected row. Stale saves from another owner
+are rejected even when they carry a higher revision.
+If a shared folder has unresolved proof that cannot be assigned to the moving
+owner, the rename is rejected before index/main changes instead of guessing
+which owner's future checks may ignore that evidence.
+
+Owner and retirement lookups reuse the existing hybrid metadata indexes. Legacy
+records are indexed once per open without changing their proof or revision;
+ordinary probes read the matching owner's records rather than decoding every
+health row. No extra database, service or background worker is introduced.
+
 ## Operator file retirement
 
 Clear Broken and explicit mount-file removal persist an exact owner/file-ID,
@@ -92,6 +109,13 @@ failures and unscoped legacy evidence remain unresolved. Startup and subsequent
 rechecks replay pending intents only against the same exact file identity.
 Confirmed receipts suppress delayed feedback for that retired incarnation.
 These receipts grant no provider deletion or administrative retry authority.
+
+A fresh exact operator request can supersede a receipt for a different file
+incarnation. The old receipt is retained as history in the same durable intent
+write. History is never replay authority: stale intent still cannot remove the
+replacement. Only confirmed historical identities suppress delayed feedback,
+and a filename alone cannot identify a retired incarnation. Remaining files,
+newer failures and incomplete legacy evidence keep their existing protection.
 
 Historical read-failure rows without recorded ranges remain incomplete; the
 software does not invent missing evidence from availability samples. Their
@@ -118,12 +142,20 @@ change does not backfill live warnings or clear historical records.
 - Status resets with unresolved evidence and high-revision stale probes;
   process death at all three file-retirement and owned-alias migration phases;
   exact retirement, unrelated/newer failures and rename-back revision fences.
+- Direct new-name checks read truncated/restored HTTP tails; legacy warnings
+  survive producer renames; reused canonical keys retain each owner's proof.
+- Process death before index rename, after index publication and after main
+  publication, for both legacy and exact-range warnings; reused-name handoff
+  and replacement-removal crashes at all durability boundaries.
+- Public Clear Broken resolves a shared-folder replacement while preserving
+  the other file and both parents; superseded receipts retain delayed-feedback
+  protection without authorizing stale replay.
 
 An existing orphan-reconciliation limitation remains a separate follow-up:
 an interrupted manual recheck of a previously clean, fresh row retains its
 checkpoint but may wait for another trigger or the normal recheck interval.
-Dirty incomplete checks remain eligible for recovery. This PR's four review
-fixes do not change clean-row scheduling after restart.
+Dirty incomplete checks remain eligible for recovery. These changes do not
+change clean-row scheduling after restart.
 
 The existing cleanup, crash recovery, operator resolution and account authority
 regressions must pass alongside these tests before merge or deployment.

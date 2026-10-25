@@ -257,9 +257,10 @@ type EntryHealth struct {
 	AliasRevisions map[string]uint64 `json:"alias_revisions,omitempty"`
 	// A reset keeps the revision fence; deleting it lets an old probe overwrite
 	// a newer failure after the revision counter restarts from zero.
-	Cleared         bool                            `json:"cleared,omitempty"`
-	OwnerInfoHash   string                          `json:"owner_info_hash,omitempty"`
-	FileRetirements map[string]HealthFileRetirement `json:"file_retirements,omitempty"`
+	Cleared               bool                              `json:"cleared,omitempty"`
+	OwnerInfoHash         string                            `json:"owner_info_hash,omitempty"`
+	FileRetirements       map[string]HealthFileRetirement   `json:"file_retirements,omitempty"`
+	FileRetirementHistory map[string][]HealthFileRetirement `json:"file_retirement_history,omitempty"`
 
 	LastCheckedAt  time.Time    `json:"last_checked_at"`
 	LastOKAt       time.Time    `json:"last_ok_at"`
@@ -321,6 +322,9 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 		if err := json.Unmarshal(data, &current); err != nil {
 			return fmt.Errorf("decode current entry health %q: %w", state.EntryName, err)
 		}
+		if current.OwnerInfoHash != "" && state.OwnerInfoHash != "" && current.OwnerInfoHash != state.OwnerInfoHash {
+			return ErrHealthIdentity
+		}
 		if current.DirtyRevision > state.DirtyRevision {
 			state.Status = HealthUnknown
 			state.LastOKAt = current.LastOKAt
@@ -339,6 +343,7 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 		state.AliasRevisions = current.AliasRevisions
 		state.OwnerInfoHash = current.OwnerInfoHash
 		state.FileRetirements = current.FileRetirements
+		state.FileRetirementHistory = current.FileRetirementHistory
 	} else if !hybrid.IsNotFound(err) {
 		return fmt.Errorf("load current entry health %q: %w", state.EntryName, err)
 	}
@@ -365,7 +370,11 @@ func (s *Storage) putEntryHealthLocked(state *EntryHealth) error {
 	if state.Cleared {
 		status = "cleared"
 	}
-	err = s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: status})
+	provider := ""
+	if len(state.FileRetirements) > 0 || len(state.FileRetirementHistory) > 0 {
+		provider = "health-retirements"
+	}
+	err = s.repairState.Put(state.EntryName, data, &hybrid.EntryMeta{Status: status, Category: healthOwnerCategory(rangeOwner(state)), Provider: provider})
 	s.healthCountsMu.Lock()
 	s.healthCounts = nil
 	s.healthCountsMu.Unlock()

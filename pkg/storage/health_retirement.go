@@ -39,6 +39,80 @@ func retirementFor(f *File) HealthFileRetirement {
 	return r
 }
 
+func sameRetirement(a, b HealthFileRetirement) bool {
+	return a.matches(&File{InfoHash: b.InfoHash, ID: b.FileID, Size: b.Size, ByteRange: b.ByteRange})
+}
+
+// Superseded intents are audit/feedback evidence only, never replay authority.
+// Keep confirmed old identities so delayed reads cannot dirty a replacement.
+func archiveHealthRetirement(h *EntryHealth, name string, receipt HealthFileRetirement) {
+	h.FileRetirementHistory = maps.Clone(h.FileRetirementHistory)
+	if h.FileRetirementHistory == nil {
+		h.FileRetirementHistory = make(map[string][]HealthFileRetirement)
+	}
+	old := slices.Clone(h.FileRetirementHistory[name])
+	for i, prior := range old {
+		if sameRetirement(prior, receipt) {
+			old[i].Confirmed = prior.Confirmed || receipt.Confirmed
+			h.FileRetirementHistory[name] = old
+			return
+		}
+	}
+	h.FileRetirementHistory[name] = append(old, receipt)
+}
+
+func mergeHealthRetirements(dest, source *EntryHealth, item *EntryItem) {
+	for name, history := range source.FileRetirementHistory {
+		for _, receipt := range history {
+			archiveHealthRetirement(dest, name, receipt)
+		}
+	}
+	for name, receipt := range source.FileRetirements {
+		if dest.FileRetirements == nil {
+			dest.FileRetirements = make(map[string]HealthFileRetirement)
+		}
+		if prior, ok := dest.FileRetirements[name]; ok {
+			if sameRetirement(prior, receipt) {
+				prior.Confirmed = prior.Confirmed || receipt.Confirmed
+				dest.FileRetirements[name] = prior
+				continue
+			}
+			if !receipt.matches(item.Files[name]) {
+				archiveHealthRetirement(dest, name, receipt)
+				continue
+			}
+			archiveHealthRetirement(dest, name, prior)
+		}
+		dest.FileRetirements[name] = receipt
+	}
+}
+
+func (s *Storage) retiredReadLocked(failed FailedReadRange) (bool, error) {
+	if failed.FileID == "" {
+		return false, nil // An old name alone cannot identify a retired incarnation.
+	}
+	if err := s.ensureHealthIdentityIndexLocked(); err != nil {
+		return false, err
+	}
+	found := false
+	for _, key := range s.repairState.FilterByProvider("health-retirements") {
+		h, err := s.getEntryHealthLocked(key)
+		if err != nil {
+			return false, err
+		}
+		matches := func(receipt HealthFileRetirement) bool {
+			return receipt.Confirmed && receipt.InfoHash == failed.InfoHash && receipt.FileID == failed.FileID
+		}
+		if receipt, ok := h.FileRetirements[failed.FileName]; ok && matches(receipt) {
+			found = true
+		}
+		for _, receipt := range h.FileRetirementHistory[failed.FileName] {
+			found = found || matches(receipt)
+		}
+	}
+	return found, nil
+}
+
 // RetireEntryItemFile serializes the exact file snapshot with parent deletion,
 // index publication and health feedback. A crash at either write boundary is
 // replayed only against the same logical file identity.
@@ -94,13 +168,13 @@ func (s *Storage) retireEntryItemFile(name, filename string, expected *File, rep
 	if replay && (!authorized || !existing.matches(f)) {
 		return nil, ErrHealthRetirementIdentity
 	}
-	if authorized && !existing.matches(f) {
-		return nil, ErrHealthRetirementIdentity
-	}
 	if f.Deleted && (!authorized || !existing.matches(f)) {
 		return nil, fmt.Errorf("file already deleted without matching retirement receipt")
 	}
 	if !authorized || !existing.matches(f) {
+		if authorized {
+			archiveHealthRetirement(h, filename, existing)
+		}
 		h.FileRetirements = maps.Clone(h.FileRetirements)
 		if h.FileRetirements == nil {
 			h.FileRetirements = make(map[string]HealthFileRetirement)
