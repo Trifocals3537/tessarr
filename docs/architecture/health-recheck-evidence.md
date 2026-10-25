@@ -49,6 +49,14 @@ inventory count; `probe_progress.verified` is completed probe coverage, and
 `incomplete_files` identifies unfinished filenames. These are bounded health
 checks, not claims of complete media decode or every-byte integrity.
 
+Torrent progress also includes the existing account-binding MACs for all
+configured placements. Replacing a provider client/account cannot reuse a
+successful range proof from the old account even when the entry itself did not
+change. NZB progress likewise binds the NNTP provider/account configuration.
+API keys and NNTP credentials are never stored in health records. Coalesced
+queue-generation uncertainty retains dirty state without inventing a new
+range-less failure after the actual ranges have already been validated.
+
 ## Canonical health names
 
 An absent runtime name can be resolved only through one exact main-entry owner,
@@ -79,7 +87,8 @@ change does not backfill live warnings or clear historical records.
   successful STAT, restored tail, CRC-valid short mapped article, wrong media
   head, metadata replacement, canceled and connection-only availability checks.
 - Partial and canceled packs, resumed file coverage, new failure revisions,
-  provider replacement, missing/legacy ranges, invalid offsets and overflow.
+  provider/account replacement, missing/legacy ranges, invalid offsets and
+  overflow; generic updates and alias merges cannot hide legacy evidence gaps.
 - Real main-entry/index producers for the .mkv suffix and You./YOU. cases,
   including ambiguous owner and mixed-owner rejection.
 

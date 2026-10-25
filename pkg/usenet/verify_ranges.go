@@ -2,6 +2,7 @@ package usenet
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/Trifocals3537/tessarr/internal/config"
 	"github.com/Trifocals3537/tessarr/internal/customerror"
 	"github.com/Trifocals3537/tessarr/internal/nntp"
 	"github.com/Trifocals3537/tessarr/pkg/storage"
@@ -19,11 +21,22 @@ type metadataFingerprint struct {
 	digest string
 }
 
+func repairAccountsFingerprint(providers []config.UsenetProvider) string {
+	h := sha256.New()
+	for _, provider := range providers {
+		mac := hmac.New(sha256.New, []byte(provider.Password))
+		_, _ = fmt.Fprintf(mac, "tessarr/health-nntp-account/v1\x00%s\x00%d\x00%s\x00%t", provider.Host, provider.Port, provider.Username, provider.SSL)
+		_, _ = h.Write(mac.Sum(nil))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // Hash the compressed metadata once per immutable file generation. Do not
 // decode entire segment maps just to resume an availability-only pack probe.
 // The bounded cache is checked against inode, size and modification time on
 // every use; normal metadata writes atomically replace the file.
 func (u *Usenet) FileRepairFingerprint(id, name string) (string, error) {
+	accountKey := repairAccountsFingerprint(config.Get().Usenet.Providers)
 	u.nzbStorage.mu.RLock()
 	defer u.nzbStorage.mu.RUnlock()
 	path, err := u.nzbStorage.metaFilePath(id)
@@ -45,7 +58,7 @@ func (u *Usenet) FileRepairFingerprint(id, name string) (string, error) {
 	u.repairFingerprintMu.Lock()
 	defer u.repairFingerprintMu.Unlock()
 	if previous, ok := u.repairFingerprints[id]; ok && os.SameFile(previous.info, info) && previous.info.Size() == info.Size() && previous.info.ModTime().Equal(info.ModTime()) {
-		return previous.digest + ":" + name, nil
+		return previous.digest + ":" + name + ":" + accountKey, nil
 	}
 	h := sha256.New()
 	if n, err := io.Copy(h, io.LimitReader(file, maxNZBMetadataFileBytes+1)); err != nil {
@@ -65,7 +78,7 @@ func (u *Usenet) FileRepairFingerprint(id, name string) (string, error) {
 	}
 	digest := hex.EncodeToString(h.Sum(nil))
 	u.repairFingerprints[id] = metadataFingerprint{info: info, digest: digest}
-	return digest + ":" + name, nil
+	return digest + ":" + name + ":" + accountKey, nil
 }
 
 type contextRangeReader interface {

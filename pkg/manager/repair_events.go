@@ -307,7 +307,9 @@ func (r *Repair) preserveConcurrentDirtySignal(entryName string) {
 	if health != nil {
 		protocol = health.Protocol
 	}
-	_ = r.manager.storage.MarkEntryDirtyChecked(entryName, protocol, "read_failure_during_recheck")
+	// This is queue-generation uncertainty, not a new range-less read
+	// failure. The newer ranges may already have been included in the probe.
+	_ = r.manager.storage.MarkEntryDirtyChecked(entryName, protocol, "health_recheck_generation_changed")
 }
 
 func (r *Repair) eventQueueStatus() RepairEventQueueStatus {

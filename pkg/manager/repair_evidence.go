@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -113,6 +114,23 @@ func (r *Repair) fileProbeFingerprint(item *storage.EntryItem, name string) (str
 		if err != nil {
 			return "", err
 		}
+		// A resumed range may have used any completed failover placement.
+		// Bind its proof to all current accounts, including credential changes
+		// that do not mutate the entry or increment its dirty revision.
+		accounts := make(map[string]string, len(e.Providers))
+		for provider := range e.Providers {
+			accounts[provider] = "unavailable"
+			if r.manager.clients != nil {
+				if client := r.manager.ProviderClient(provider); client != nil {
+					accounts[provider] = submissionAccount(client.Config())
+				}
+			}
+		}
+		accountData, err := json.Marshal(accounts)
+		if err != nil {
+			return "", err
+		}
+		meta = string(accountData)
 	}
 	h := sha256.Sum256([]byte(hex.EncodeToString(target[:]) + "\x00" + meta + "\x00" + storage.EntryItemRepairFingerprint(&storage.EntryItem{Files: map[string]*storage.File{name: f}})))
 	return hex.EncodeToString(h[:]), nil

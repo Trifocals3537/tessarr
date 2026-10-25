@@ -92,6 +92,23 @@ func TestValidHeadDoesNotHideTransportFailure(t *testing.T) {
 	}
 }
 
+func TestHealthNNTPProofBindsProviderAccount(t *testing.T) {
+	provider := config.UsenetProvider{Host: "fixture", Port: 563, SSL: true, Username: "first-user", Password: "first-password"}
+	before := repairAccountsFingerprint([]config.UsenetProvider{provider})
+	for _, changed := range []config.UsenetProvider{
+		{Host: provider.Host, Port: provider.Port, SSL: true, Username: "second-user", Password: provider.Password},
+		{Host: provider.Host, Port: provider.Port, SSL: true, Username: provider.Username, Password: "second-password"},
+		{Host: "second-host", Port: provider.Port, SSL: true, Username: provider.Username, Password: provider.Password},
+	} {
+		if got := repairAccountsFingerprint([]config.UsenetProvider{changed}); got == before {
+			t.Fatal("provider/account change reused proof")
+		}
+	}
+	if strings.Contains(before, provider.Password) || strings.Contains(before, provider.Username) {
+		t.Fatal("account credentials exposed in proof")
+	}
+}
+
 func TestRangeRecheckThroughProductionNNTPReader(t *testing.T) {
 	// Fallback roots are process-global and set once. Isolate the fixture CA;
 	// production TLS verification and authentication policy remain enabled.

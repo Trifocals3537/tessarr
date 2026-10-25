@@ -24,12 +24,13 @@ import (
 
 type healthEvidenceClient struct {
 	debrid.Client
-	check func(context.Context, string) error
+	apiKey string
+	check  func(context.Context, string) error
 }
 
 func (*healthEvidenceClient) SupportsCheck() bool { return true }
-func (*healthEvidenceClient) Config() config.Debrid {
-	return config.Debrid{Name: "primary", Provider: "realdebrid"}
+func (c *healthEvidenceClient) Config() config.Debrid {
+	return config.Debrid{Name: "primary", Provider: "realdebrid", APIKey: c.apiKey}
 }
 func (c *healthEvidenceClient) CheckFile(ctx context.Context, _ string, link string) error {
 	return c.check(ctx, link)
@@ -167,6 +168,34 @@ func TestHealthTargetReplacementDiscardsSuccessfulProbe(t *testing.T) {
 	}
 }
 
+func TestHealthProgressCannotCrossProviderAccounts(t *testing.T) {
+	r, _, item := newEvidenceRepair(t, 2)
+	var complete atomic.Bool
+	var calls atomic.Int32
+	check := func(_ context.Context, name string) error {
+		if name == "video-000.mkv" {
+			calls.Add(1)
+		}
+		if name == "video-001.mkv" && !complete.Load() {
+			return context.DeadlineExceeded
+		}
+		return nil
+	}
+	r.manager.clients.Store("primary", &healthEvidenceClient{apiKey: "first-account", check: check})
+	h := r.probeEntry(context.Background(), "test", &candidate{name: item.Name}, newHealCache(), RepairRunOptions{}, false)
+	if h == nil || !h.Dirty || h.ProbeProgress == nil || len(h.ProbeProgress.Verified) != 1 {
+		t.Fatalf("fixture did not retain progress: %+v", h)
+	}
+	// No entry mutation, dirty signal or process restart accompanies a client
+	// replacement. The cached successful file must still be checked again.
+	r.manager.clients.Store("primary", &healthEvidenceClient{apiKey: "second-account", check: check})
+	complete.Store(true)
+	h = r.probeEntry(context.Background(), "test", &candidate{name: item.Name}, newHealCache(), RepairRunOptions{}, false)
+	if h == nil || h.Dirty || h.Status != storage.HealthHealthy || calls.Load() != 2 {
+		t.Fatalf("proof reused across accounts: %+v calls=%d", h, calls.Load())
+	}
+}
+
 func TestHealthMissingAndLegacyRangeEvidenceStaysIncomplete(t *testing.T) {
 	r, _, item := newEvidenceRepair(t, 1)
 	if err := r.manager.storage.MarkEntryDirtyChecked(item.Name, config.ProtocolTorrent, "read_failure:timeout"); err != nil {
@@ -242,6 +271,42 @@ func TestHealthCanceledPackKeepsRevisionAndCompletedProgress(t *testing.T) {
 	r.manager.clients.Store("primary", &healthEvidenceClient{check: func(context.Context, string) error { return nil }})
 	if outcome := r.reconcileDirtyEntry(context.Background(), item.Name); outcome != repairEventHealthy {
 		t.Fatalf("resume outcome %s", outcome)
+	}
+}
+
+func TestHealthCoalescedValidatedFailureDoesNotInventEvidenceGap(t *testing.T) {
+	r, e, item := newEvidenceRepair(t, 1)
+	r.eventMu.Lock()
+	r.eventStarted = true
+	r.eventMu.Unlock()
+	if !r.QueueDirtyEntry(item.Name) {
+		t.Fatal("queue admission failed")
+	}
+	work, _ := r.nextDirtyEvent()
+	if err := r.manager.storage.RecordFailedRead(item.Name, e.Protocol, "read_failure:timeout", storage.FailedReadRange{InfoHash: e.InfoHash, FileName: "video-000.mkv", Offset: 10, Length: 20}); err != nil {
+		t.Fatal(err)
+	}
+	r.QueueDirtyEntry(item.Name)
+	// The probe loaded the latest revision after the second queue admission
+	// and successfully validated it. The generation guard still asks for a
+	// fresh check, but must not invent a permanently missing failed range.
+	h, _ := r.manager.storage.GetEntryHealth(item.Name)
+	h.Dirty = false
+	h.DirtyReason = ""
+	h.FailedReads = nil
+	h.Status = storage.HealthHealthy
+	if err := r.manager.storage.SaveEntryHealth(h); err != nil {
+		t.Fatal(err)
+	}
+	if outcome := r.finishDirtyEvent(work, repairEventHealthy); outcome != repairEventIncomplete {
+		t.Fatalf("lost generation guard: %s", outcome)
+	}
+	h, _ = r.manager.storage.GetEntryHealth(item.Name)
+	if !h.Dirty || h.FailedReadsIncomplete {
+		t.Fatalf("synthetic event invented lost evidence: %+v", h)
+	}
+	if outcome := r.reconcileDirtyEntry(context.Background(), item.Name); outcome != repairEventHealthy {
+		t.Fatalf("validated coalesced range stranded: %s", outcome)
 	}
 }
 
