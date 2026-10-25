@@ -68,6 +68,12 @@ and drains the queue, and retries only the independently authorized main snapsho
 and any still-pending saved queue placements. Queue placement scope, account and
 recovered-placement fences, and `PreserveFiles` remain authoritative. The generic
 operator retry/reconcile actions never gain that explicit deletion authority.
+If that administrative snapshot introduces a provider after initial adoption,
+its missing account restriction is synced before its first DELETE. The binding
+checks the current claim and exact saved admin snapshot, adds only providers in
+that snapshot, and cannot replace any existing queue or admin account restriction.
+A later account change blocks dispatch, including after a crash or restart.
+Read-only operator actions cannot establish these missing bindings.
 Legacy main obligations without a workflow keep their existing startup recovery;
 repair and unrelated external-effect workflows are not migrated yet.
 
@@ -112,6 +118,9 @@ of nonempty folders, aliases, quarantines, main entries and Usenet metadata.
 Additional regressions exercise stale scans against replacement workers, drain
 timeouts, all provider presence adapters, explicit administrative retry after
 adoption, and subprocess exits after its provider DELETE and main checkpoint.
+Late-account regressions include legacy/durably fenced placements, atomic binding
+validation, stale claims and snapshots, failed durability gates, operator refusal,
+and subprocess exits immediately after binding and after the provider effect.
 
 Older binaries ignore workflow metadata and can replay older recovery behavior.
 Before any downgrade, stop the writer, preserve a consistent checkpoint and

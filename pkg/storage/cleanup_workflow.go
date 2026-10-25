@@ -16,6 +16,8 @@ import (
 // intent. Corrupt snapshot identity errors must still fail admission closed.
 var ErrCleanupIntentObsolete = errors.New("cleanup intent has completed or been replaced")
 
+var ErrCleanupAccountConflict = errors.New("cleanup provider account differs from its saved binding")
+
 // CleanupIntent reads the current immutable intent for an explicit retry. The
 // subsequent claim still checks its incarnation/revision under the queue gate.
 func (s *Storage) CleanupIntent(key string) (*QueueDeletionIntent, error) {
@@ -130,6 +132,75 @@ func (s *Storage) CompleteCleanupAdmin(i *QueueDeletionIntent, expected *Cleanup
 		}
 		return s.syncMainCleanupState()
 	})
+}
+
+// BindCleanupAdminAccounts extends restrictions only for providers in the exact
+// independent admin snapshot. It never replaces an existing restriction. The
+// updated record is returned only after PutExistingSynced publishes the write.
+func (s *Storage) BindCleanupAdminAccounts(i *QueueDeletionIntent, expected *CleanupAdminIntent, accounts map[string]string, now time.Time) (*workflow.Record, error) {
+	if i == nil || i.Work == nil || expected == nil || len(expected.snapshot) == 0 {
+		return nil, workflow.ErrClaim
+	}
+	var bound *workflow.Record
+	err := s.mutateCleanupWork(i.InfoHash, i.QueueIncarnation, func(t *queueDeletionTombstone) error {
+		if err := cleanupToken(t, i.Work.Token); err != nil {
+			return err
+		}
+		if err := s.syncMainCleanupState(); err != nil {
+			return err
+		}
+		admin, found, err := s.loadMainEntryTombstone(normalizeMainEntryKey(i.InfoHash))
+		if err != nil {
+			return err
+		}
+		if !found || !bytes.Equal(admin.PlacementSnapshot, expected.snapshot) {
+			return workflow.ErrClaim
+		}
+		entry, err := decodeMainEntry(normalizeMainEntryKey(i.InfoHash), admin.PlacementSnapshot)
+		if err != nil {
+			return err
+		}
+		allowed := make(map[string]struct{})
+		for _, provider := range entry.Providers {
+			if provider == nil {
+				continue
+			}
+			if provider.Provider == "" || provider.Provider == "usenet" || provider.ID == "" {
+				return workflow.ErrClaim
+			}
+			allowed[provider.Provider] = struct{}{}
+		}
+		for name := range accounts {
+			if _, ok := allowed[name]; !ok {
+				return workflow.ErrClaim
+			}
+		}
+		for name := range allowed {
+			account := accounts[name]
+			if account == "" {
+				return ErrCleanupAccountConflict
+			}
+			if previous := t.Work.Accounts[name]; previous != "" && previous != account {
+				return ErrCleanupAccountConflict
+			}
+		}
+		if t.Work.Accounts == nil {
+			t.Work.Accounts = make(map[string]string)
+		}
+		for name := range allowed {
+			if t.Work.Accounts[name] == "" {
+				t.Work.Accounts[name] = accounts[name]
+			}
+		}
+		t.Work.Revision++
+		t.Work.UpdatedAt = now
+		bound = t.Work
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return bound, nil
 }
 
 func firstCleanupToken(tokens []string) string {

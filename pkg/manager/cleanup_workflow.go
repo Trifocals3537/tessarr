@@ -142,7 +142,7 @@ func (m *Manager) runCleanupAttempt(snapshot *storage.QueueDeletionIntent, resta
 					return err
 				}
 			} else {
-				if err := m.validateCleanupAccounts(i, []*storage.Entry{admin.Entry}, true); err != nil {
+				if err := m.validateCleanupAccounts(i, []*storage.Entry{admin.Entry}); err != nil {
 					return err
 				}
 				if err := m.reconcileProviderEntries(ctx, []*storage.Entry{admin.Entry}); err != nil {
@@ -162,7 +162,7 @@ func (m *Manager) runCleanupAttempt(snapshot *storage.QueueDeletionIntent, resta
 					}
 				}
 			}
-			if err := m.validateCleanupAccounts(i, entries, true); err != nil {
+			if err := m.validateCleanupAccounts(i, entries); err != nil {
 				return err
 			}
 			if i.Work.EffectStarted || i.Work.Mode == "reconcile" {

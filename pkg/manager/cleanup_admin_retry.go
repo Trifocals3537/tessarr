@@ -8,23 +8,39 @@ import (
 	"github.com/Trifocals3537/tessarr/pkg/storage"
 )
 
-func (m *Manager) validateCleanupAccounts(i *storage.QueueDeletionIntent, entries []*storage.Entry, requireBound bool) error {
+// cleanupAccountCandidates captures current identities without granting effect
+// authority. Late administrative identities must be checkpointed before use.
+func (m *Manager) cleanupAccountCandidates(entries []*storage.Entry) (map[string]string, error) {
+	accounts := make(map[string]string)
 	for _, entry := range entries {
 		for _, p := range entry.Providers {
 			if p == nil {
 				continue
 			}
 			if p.Provider == "usenet" {
-				return cleanupBlocked("usenet_metadata_requires_review")
+				return nil, cleanupBlocked("usenet_metadata_requires_review")
 			}
 			client := m.ProviderClient(p.Provider)
-			bound := i.Work.Accounts[p.Provider]
-			if client == nil || (requireBound && bound == "") || (bound != "" && bound != submissionAccount(client.Config())) {
-				return cleanupBlocked("provider_account_changed")
+			if client == nil {
+				return nil, cleanupBlocked("provider_account_changed")
 			}
 			if err := m.verifyPlacementAccount(client, p.ID); err != nil {
-				return cleanupBlocked("provider_account_changed")
+				return nil, cleanupBlocked("provider_account_changed")
 			}
+			accounts[p.Provider] = submissionAccount(client.Config())
+		}
+	}
+	return accounts, nil
+}
+
+func (m *Manager) validateCleanupAccounts(i *storage.QueueDeletionIntent, entries []*storage.Entry) error {
+	accounts, err := m.cleanupAccountCandidates(entries)
+	if err != nil {
+		return err
+	}
+	for name, account := range accounts {
+		if bound := i.Work.Accounts[name]; bound == "" || bound != account {
+			return cleanupBlocked("provider_account_changed")
 		}
 	}
 	return nil
@@ -44,11 +60,25 @@ func (m *Manager) retrySavedAdministrativeCleanup(i *storage.QueueDeletionIntent
 				}
 			}
 		}
-		if err := m.validateCleanupAccounts(i, queueEntries, true); err != nil {
+		if err := m.validateCleanupAccounts(i, queueEntries); err != nil {
 			return err
 		}
 	}
-	if err := m.validateCleanupAccounts(i, []*storage.Entry{admin.Entry}, false); err != nil {
+	adminEntries := []*storage.Entry{admin.Entry}
+	accounts, err := m.cleanupAccountCandidates(adminEntries)
+	if err != nil {
+		return err
+	}
+	bound, err := m.storage.BindCleanupAdminAccounts(i, admin, accounts, time.Now())
+	if errors.Is(err, storage.ErrCleanupAccountConflict) {
+		return cleanupBlocked("provider_account_changed")
+	}
+	if err != nil {
+		return errors.Join(errCleanupFatal, err)
+	}
+	i.Work = bound
+	m.cleanupPhase("administrative_accounts_bound")
+	if err := m.validateCleanupAccounts(i, adminEntries); err != nil {
 		return err
 	}
 	if i.PlacementCleanupPending {
