@@ -189,13 +189,25 @@ func TestHealthFileRetirementRespectsMainDeletionFence(t *testing.T) {
 	e := seedHealthResolution(t, s)
 	item, _ := s.GetEntryItem(e.GetFolder())
 	blocked := errors.New("operator cleanup still pending")
-	if err := s.DeleteWithCleanup(e.InfoHash, func(*Entry) error { return blocked }); !errors.Is(err, blocked) {
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- s.DeleteWithCleanup(e.InfoHash, func(*Entry) error {
+			close(started)
+			<-release
+			return blocked
+		})
+	}()
+	<-started
+	_, retireErr := s.RetireEntryItemFile(item.Name, "bad.mkv", item.Files["bad.mkv"])
+	h, _ := s.GetEntryHealth(item.Name)
+	close(release)
+	if err := <-done; !errors.Is(err, blocked) {
 		t.Fatalf("deletion fixture: %v", err)
 	}
-	if _, err := s.RetireEntryItemFile(item.Name, "bad.mkv", item.Files["bad.mkv"]); !errors.Is(err, ErrEntryDeleting) {
-		t.Fatalf("retirement bypassed main deletion: %v", err)
+	if !errors.Is(retireErr, ErrEntryDeleting) {
+		t.Fatalf("retirement bypassed main deletion: %v", retireErr)
 	}
-	h, _ := s.GetEntryHealth(item.Name)
 	if len(h.FailedReads) != 2 || len(h.FileRetirements) != 0 {
 		t.Fatalf("fenced retirement changed evidence: %+v", h)
 	}
