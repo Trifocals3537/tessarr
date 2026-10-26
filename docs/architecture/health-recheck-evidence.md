@@ -76,6 +76,11 @@ media candidates that already carry a preloaded snapshot. Refreshing the item
 retains their Arr/file context for operator resolution; preloading never grants
 permission to skip failed-range or missing-evidence handoff.
 
+Manual recheck/fix requests resolve the current owner and reload its canonical
+health before checking active work. Historical run IDs in retired-owner archives
+cannot block a reused name. Genuine current-owner runs still block duplicate
+requests through either the canonical name or its runtime alias.
+
 The canonical dirty signal and merged revision are synced before a forwarding
 record replaces the old health key. A replay marker prevents duplicate handoff
 after a crash between these writes. Later failures under the old name forward
@@ -185,6 +190,10 @@ change does not backfill live warnings or clear historical records.
 - In-flight main and fence sync failures roll deletion back without archiving
   active proof, through both deletion APIs. Contended lifecycle directories
   defer health handoff without reversing the lock order.
+- Manual recheck and fix requests succeed after archived alias reuse, before
+  and after orphan reconciliation and storage restart, through both canonical
+  and runtime names. Archives remain immutable, and current active runs still
+  reject duplicate operator work.
 
 An existing orphan-reconciliation limitation remains a separate follow-up:
 an interrupted manual recheck of a previously clean, fresh row retains its

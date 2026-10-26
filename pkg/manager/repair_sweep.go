@@ -1220,16 +1220,17 @@ func (r *Repair) RecheckEntry(ctx context.Context, entryName string, fix bool) (
 	if entryName == "" {
 		return nil, errors.New("entry name is empty")
 	}
-	h, _ := r.manager.storage.GetEntryHealth(entryName)
-	if h != nil && h.ActiveRunID != "" {
-		return nil, fmt.Errorf("entry is being probed by run %s", h.ActiveRunID)
-	}
-
 	c := &candidate{name: entryName}
 	if err := r.resolveHealthCandidate(c); err != nil || c.item == nil {
 		return nil, fmt.Errorf("entry %q not found", entryName)
 	}
 	entryName = c.name
+	// A reused name can still forward to immutable retired-owner history.
+	// Only the resolved current owner's active run may block this request.
+	h, _ := r.manager.storage.GetEntryHealth(entryName)
+	if h != nil && h.ActiveRunID != "" {
+		return nil, fmt.Errorf("entry is being probed by run %s", h.ActiveRunID)
+	}
 
 	runID := "recheck-" + entryName
 
