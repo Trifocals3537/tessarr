@@ -33,6 +33,15 @@ func ProtocolRequestAllowed(r *http.Request, appURL string) bool {
 	}
 }
 
+// GETMutationNeedsCredentials identifies requests that could be a no-referrer
+// browser navigation. Plain HTTP listeners may receive no Fetch Metadata, and
+// SameSite=Lax cookies still accompany top-level GETs. Action handlers must
+// require validated request credentials instead of ambient cookies or no auth.
+func GETMutationNeedsCredentials(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodGet && !BrowserOriginPresent(r) &&
+		strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")) == ""
+}
+
 func RequestOriginAllowed(r *http.Request, appURL string) bool {
 	if r == nil {
 		return false

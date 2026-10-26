@@ -22,7 +22,7 @@ func (q *QBit) handleLogin(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	username := r.FormValue("username")
 	password := r.FormValue("password")
-	_, err := q.authenticate(getCategory(ctx), username, password)
+	_, err := q.authenticate(getCategory(ctx), username, password, false)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

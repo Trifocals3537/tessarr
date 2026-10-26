@@ -88,3 +88,25 @@ func TestRequestOriginMatchesListenerTransport(t *testing.T) {
 		})
 	}
 }
+
+func TestGETMutationNeedsCredentials(t *testing.T) {
+	for _, tt := range []struct {
+		method, origin, referer, site string
+		want                          bool
+	}{
+		{method: http.MethodGet, want: true},
+		{method: http.MethodGet, origin: "http://tessarr.test"},
+		{method: http.MethodGet, referer: "http://tessarr.test/page"},
+		{method: http.MethodGet, site: "same-origin"},
+		{method: http.MethodGet, site: "none"},
+		{method: http.MethodPost},
+	} {
+		r := httptest.NewRequest(tt.method, "http://192.0.2.20/api", nil)
+		r.Header.Set("Origin", tt.origin)
+		r.Header.Set("Referer", tt.referer)
+		r.Header.Set("Sec-Fetch-Site", tt.site)
+		if got := GETMutationNeedsCredentials(r); got != tt.want {
+			t.Errorf("%+v: needs credentials=%v", tt, got)
+		}
+	}
+}

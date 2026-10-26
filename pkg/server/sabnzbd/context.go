@@ -121,7 +121,8 @@ func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 		host := r.FormValue("ma_username")
 		token := r.FormValue("ma_password")
 		category := getCategory(r.Context())
-		a, err := s.authenticate(category, host, token)
+		requireCredentials := httpsecurity.GETMutationNeedsCredentials(r) && isGETAction(r)
+		a, err := s.authenticate(category, host, token, requireCredentials)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
@@ -131,13 +132,26 @@ func (s *SABnzbd) authContext(next http.Handler) http.Handler {
 	})
 }
 
-func (s *SABnzbd) authenticate(category, username, password string) (*arr.Arr, error) {
+func isGETAction(r *http.Request) bool {
+	switch strings.TrimSpace(r.FormValue("mode")) {
+	case ModeQueue, ModeHistory:
+		return r.FormValue("name") != ""
+	case ModeConfig, ModeGetConfig, ModeVersion, ModeGetCats, ModeGetScripts, ModeGetFiles, ModeStatus, ModeFullStatus:
+		return false
+	default:
+		// Unknown and future action modes must not silently inherit the
+		// unauthenticated read policy.
+		return true
+	}
+}
+
+func (s *SABnzbd) authenticate(category, username, password string, requireCredentials bool) (*arr.Arr, error) {
 	cfg := config.Get()
 	arrStorage := s.manager.Arr()
 	if matched := arrStorage.MatchCredentials(category, username, password); matched != nil {
 		return matched, nil
 	}
-	if cfg.UseAuth && !config.VerifyAuth(username, password) {
+	if (cfg.UseAuth || requireCredentials) && !config.VerifyAuth(username, password) {
 		return nil, fmt.Errorf("unauthorized: invalid credentials")
 	}
 	return arrStorage.GetOrCreate(category), nil

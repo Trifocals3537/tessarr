@@ -79,6 +79,12 @@ the transport. For a public proxy URL, set `app_url` to the URL used by the
 browser, including its scheme. SABnzbd configuration responses include server
 settings with empty password fields; stored Usenet passwords remain private.
 
+GET actions without Origin, Referer or Fetch Metadata require valid configured
+Arr or Tessarr credentials, even when authentication is disabled. A qBittorrent
+SID cookie alone cannot authorize these requests. Native clients can continue
+using session cookies for read requests and POST actions; SABnzbd clients can
+provide their existing `ma_username` and `ma_password` credentials for GET actions.
+
 Native installations use the loopback-only bind default so the first-run setup
 wizard is not exposed to the network. The official container image explicitly
 overrides this to `0.0.0.0`; control container access with published ports,
