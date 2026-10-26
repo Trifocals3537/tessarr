@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/httpsecurity"
 	"github.com/Trifocals3537/tessarr/internal/utils"
 
 	"github.com/Trifocals3537/tessarr/pkg/arr"
@@ -30,6 +31,10 @@ func getMode(ctx context.Context) string {
 
 func (s *SABnzbd) categoryContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !httpsecurity.ProtocolRequestAllowed(r, config.Get().AppURL) {
+			http.Error(w, "Cross-site request rejected", http.StatusForbidden)
+			return
+		}
 		contentType := strings.ToLower(r.Header.Get("Content-Type"))
 		var err error
 		if strings.Contains(contentType, "multipart/form-data") {

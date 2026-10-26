@@ -195,11 +195,12 @@ change does not backfill live warnings or clear historical records.
   and runtime names. Archives remain immutable, and current active runs still
   reject duplicate operator work.
 
-An existing orphan-reconciliation limitation remains a separate follow-up:
-an interrupted manual recheck of a previously clean, fresh row retains its
-checkpoint but may wait for another trigger or the normal recheck interval.
-Dirty incomplete checks remain eligible for recovery. These changes do not
-change clean-row scheduling after restart.
+Startup reconciliation marks interrupted checks dirty and clears their next-due
+deadline, including checks whose previous verdict was healthy or unsupported
+and whose last check is still fresh. The startup event worker and normal sweeps
+can therefore resume them immediately. This scheduling change preserves the
+previous verdict, failure revision, failed ranges and source-bound progress;
+it does not invent a new failure or authorize destructive repair.
 
 The existing cleanup, crash recovery, operator resolution and account authority
 regressions must pass alongside these tests before merge or deployment.

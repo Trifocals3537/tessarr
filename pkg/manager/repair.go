@@ -529,6 +529,15 @@ func (r *Repair) reconcileOrphans() {
 		}
 		state.ActiveRunID = ""
 		state.PreviousStatus = ""
+		// An unfinished manual recheck can have a fresh, previously healthy
+		// verdict. Preserve that verdict and its source-bound progress, but
+		// make the remaining work due for startup admission and later sweeps.
+		// This is scheduling state, not a new failure revision.
+		state.Dirty = true
+		if state.DirtyReason == "" {
+			state.DirtyReason = "health_recheck_interrupted"
+		}
+		state.NextCheckDueAt = time.Time{}
 		if err := s.SaveEntryHealth(state); err == nil {
 			cleared++
 		}

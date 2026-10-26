@@ -144,6 +144,9 @@ func (s *Server) setupRedirectMiddleware(next http.Handler) http.Handler {
 		path := pathWithoutURLBase(r.URL.Path, s.urlBase)
 		// Skip setup check for setup-related routes
 		if strings.HasPrefix(path, "/setup") ||
+			path == "/login" ||
+			path == "/register" ||
+			path == "/skip-auth" ||
 			strings.HasPrefix(path, "/api/setup") ||
 			strings.HasPrefix(path, "/api/login") ||
 			strings.HasPrefix(path, "/api/logout") ||
