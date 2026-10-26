@@ -44,15 +44,17 @@ type Storage struct {
 	entryItems            *hybrid.Store
 	storageState          *hybrid.Store
 	// Durability hooks inject sync failures; production leaves them nil.
-	handoffSyncForTest       func() error
-	mainCleanupSyncForTest   func() error
-	queueRowSyncForTest      func() error
-	queueIntentSyncForTest   func() error
-	submissionSyncForTest    func() error
-	healthAliasSyncedForTest func()
-	healthRetirementForTest  func(string)
-	healthAliasPhaseForTest  func(string)
-	healthRenameForTest      func(string)
+	handoffSyncForTest            func() error
+	mainCleanupSyncForTest        func() error
+	queueRowSyncForTest           func() error
+	queueIntentSyncForTest        func() error
+	submissionSyncForTest         func() error
+	healthAliasSyncedForTest      func()
+	healthRetirementForTest       func(string)
+	healthAliasPhaseForTest       func(string)
+	healthRenameForTest           func(string)
+	healthOwnerArchiveForTest     func(string)
+	healthOwnerArchiveSyncForTest func(string) error
 	// Per-key durability latches survive lifecycle-state eviction. Operations
 	// on each key are serialized by its lifecycle lock.
 	handoffPending   sync.Map

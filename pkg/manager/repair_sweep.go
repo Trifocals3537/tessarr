@@ -311,18 +311,14 @@ func (r *Repair) probeAndHealCandidates(ctx context.Context, run *storage.Repair
 // then persists final health.
 func (r *Repair) probeEntry(ctx context.Context, runID string, c *candidate, heal *healCache, opts RepairRunOptions, autoRepair bool) *storage.EntryHealth {
 	s := r.manager.storage
-	if changed, err := s.ReconcileHealthFileRetirements(c.name); err != nil {
+	if _, err := s.ReconcileHealthFileRetirements(c.name); err != nil {
 		return nil
-	} else if changed {
-		c.item = nil
 	}
-	// Lazily load the entry body. Enumeration only recorded the name, so the
-	// store isn't fully decoded up front. A vanished or empty entry is a skip
-	// (nil tells the worker not to count it).
-	if c.item == nil {
-		if err := r.resolveHealthCandidate(c); err != nil || c.item == nil || len(c.item.Files) == 0 {
-			return nil
-		}
+	// Arr candidates may already have an item, but that snapshot grants no
+	// health ownership. Always complete handoff and refresh it before probing;
+	// resolveHealthCandidate retains the candidate's Arr/content metadata.
+	if err := r.resolveHealthCandidate(c); err != nil || c.item == nil || len(c.item.Files) == 0 {
+		return nil
 	}
 
 	h, _ := s.GetEntryHealth(c.name)

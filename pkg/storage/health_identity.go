@@ -77,6 +77,9 @@ func (s *Storage) resolveHealthEntryLocked(name string, naming config.WebDavFold
 	if err != nil && !hybrid.IsNotFound(err) {
 		return nil, err
 	}
+	if raw != nil && raw.Archived {
+		return nil, ErrHealthIdentity
+	}
 	item, itemErr := s.GetEntryItem(name)
 	if itemErr != nil && !hybrid.IsNotFound(itemErr) {
 		return nil, itemErr
@@ -206,29 +209,34 @@ func (s *Storage) reconcileHealthOwnerLocked(owner *Entry, naming config.WebDavF
 	previousOwner := rangeOwner(dest)
 	if previousOwner != "" && previousOwner != owner.InfoHash && (dest.CanonicalEntry != "" || protectedHealthState(dest)) {
 		previous, err := s.getMainRaw(previousOwner)
-		if err != nil {
+		if IsEntryNotFound(err) {
+			if err := s.releaseRetiredHealthOwnerLocked(canonical, previousOwner, owner, dest); err != nil {
+				return err
+			}
+		} else if err != nil {
 			return err
-		}
-		if GetTorrentFolder(naming, previous) == canonical {
-			return ErrHealthIdentity
-		}
-		if err := s.reconcileHealthOwnerLocked(previous, naming, visiting); err != nil {
-			return err
-		}
-		dest, err = s.getEntryHealthLocked(canonical)
-		if err != nil {
-			return err
-		}
-		if dest.CanonicalEntry == "" {
-			return ErrHealthIdentity
-		}
-		// The previous root is durable at its own canonical key. Preserve the
-		// reused key's revision fence, then make it available to its new owner.
-		if err := s.putEntryHealthLocked(&EntryHealth{EntryName: canonical, OwnerInfoHash: owner.InfoHash, Status: HealthUnknown, Dirty: true, DirtyReason: "health_owner_changed", DirtyRevision: dest.DirtyRevision + 1}); err != nil {
-			return err
-		}
-		if err := s.repairState.Sync(); err != nil {
-			return err
+		} else {
+			if GetTorrentFolder(naming, previous) == canonical {
+				return ErrHealthIdentity
+			}
+			if err := s.reconcileHealthOwnerLocked(previous, naming, visiting); err != nil {
+				return err
+			}
+			dest, err = s.getEntryHealthLocked(canonical)
+			if err != nil {
+				return err
+			}
+			if dest.CanonicalEntry == "" {
+				return ErrHealthIdentity
+			}
+			// The previous root is durable at its own canonical key. Preserve
+			// its revision fence before making this key available to its owner.
+			if err := s.putEntryHealthLocked(&EntryHealth{EntryName: canonical, OwnerInfoHash: owner.InfoHash, Status: HealthUnknown, Dirty: true, DirtyReason: "health_owner_changed", DirtyRevision: dest.DirtyRevision + 1}); err != nil {
+				return err
+			}
+			if err := s.repairState.Sync(); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.ensureHealthIdentityIndexLocked(); err != nil {
@@ -244,7 +252,7 @@ func (s *Storage) reconcileHealthOwnerLocked(owner *Entry, naming config.WebDavF
 		if err != nil {
 			return err
 		}
-		if key == canonical || h.CanonicalEntry != "" {
+		if key == canonical || h.CanonicalEntry != "" || h.Archived {
 			continue
 		}
 		if rangeOwner(h) == owner.InfoHash {
@@ -379,6 +387,9 @@ func (s *Storage) bindOwnedHealthLocked(alias, canonical, owner string) error {
 	// A reused runtime name may bind to a new unique owner. Its old target's
 	// evidence remains with that old owner; it must never contaminate the new one.
 	transfer := previousOwner == "" || previousOwner == owner
+	if source != nil && source.Archived {
+		transfer = false // Historical proof is never active work for a reimport.
+	}
 	if transfer && source != nil {
 		for _, failed := range source.FailedReads {
 			if failed.InfoHash != owner {
@@ -396,6 +407,14 @@ func (s *Storage) bindOwnedHealthLocked(alias, canonical, owner string) error {
 		// A rename back to a previously used key must retain that key's
 		// revision fence against probes that started before the first rename.
 		dest = &EntryHealth{EntryName: canonical, Status: HealthUnknown, DirtyRevision: dest.DirtyRevision}
+		if source != nil && source.Archived {
+			dest.Dirty = true
+			dest.DirtyReason = "health_owner_changed"
+			dest.DirtyRevision = max(dest.DirtyRevision, source.DirtyRevision) + 1
+		}
+	}
+	if dest != nil && dest.Archived {
+		return ErrHealthIdentity
 	}
 	if dest == nil {
 		dest = &EntryHealth{EntryName: canonical, Status: HealthUnknown}
@@ -580,7 +599,7 @@ func (s *Storage) RecordFailedReadAt(name string, protocol config.Protocol, reas
 }
 
 func (s *Storage) healthOwnerMovedLocked(h *EntryHealth) (bool, error) {
-	if h.CanonicalEntry != "" {
+	if h.CanonicalEntry != "" || h.Archived {
 		return true, nil
 	}
 	if h.OwnerInfoHash != "" {

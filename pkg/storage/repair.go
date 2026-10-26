@@ -261,6 +261,9 @@ type EntryHealth struct {
 	OwnerInfoHash         string                            `json:"owner_info_hash,omitempty"`
 	FileRetirements       map[string]HealthFileRetirement   `json:"file_retirements,omitempty"`
 	FileRetirementHistory map[string][]HealthFileRetirement `json:"file_retirement_history,omitempty"`
+	// Exact retired-owner snapshots are immutable and excluded from active work.
+	Archived     bool   `json:"archived,omitempty"`
+	ArchivedFrom string `json:"archived_from,omitempty"`
 
 	LastCheckedAt  time.Time    `json:"last_checked_at"`
 	LastOKAt       time.Time    `json:"last_ok_at"`
@@ -308,6 +311,9 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 	if state == nil || state.EntryName == "" {
 		return fmt.Errorf("entry health is missing entry name")
 	}
+	if state.Archived || state.ArchivedFrom != "" {
+		return ErrHealthIdentity
+	}
 	name, err := s.healthNameLocked(state.EntryName)
 	if err != nil {
 		return err
@@ -321,6 +327,9 @@ func (s *Storage) saveEntryHealthLocked(state *EntryHealth) error {
 		var current EntryHealth
 		if err := json.Unmarshal(data, &current); err != nil {
 			return fmt.Errorf("decode current entry health %q: %w", state.EntryName, err)
+		}
+		if current.Archived {
+			return ErrHealthIdentity
 		}
 		if current.OwnerInfoHash != "" && state.OwnerInfoHash != "" && current.OwnerInfoHash != state.OwnerInfoHash {
 			return ErrHealthIdentity
@@ -370,6 +379,9 @@ func (s *Storage) putEntryHealthLocked(state *EntryHealth) error {
 	if state.Cleared {
 		status = "cleared"
 	}
+	if state.Archived {
+		status = "archived"
+	}
 	provider := ""
 	if len(state.FileRetirements) > 0 || len(state.FileRetirementHistory) > 0 {
 		provider = "health-retirements"
@@ -418,7 +430,7 @@ func (s *Storage) ForEachEntryHealth(fn func(*EntryHealth) error) error {
 		if state.EntryName == "" {
 			state.EntryName = key
 		}
-		if state.CanonicalEntry != "" || state.Cleared {
+		if state.CanonicalEntry != "" || state.Cleared || state.Archived {
 			return nil
 		}
 		return fn(&state)
@@ -547,6 +559,9 @@ func (s *Storage) markEntryDirtyLocked(entryName string, protocol config.Protoco
 	if state == nil {
 		state = &EntryHealth{EntryName: entryName, Status: HealthUnknown}
 	}
+	if state.Archived {
+		return ErrEntryDeleting
+	}
 	// A later generic mutation or new known range cannot erase an older
 	// failure whose range was never retained by the previous implementation.
 	state.FailedReadsIncomplete = state.FailedReadsIncomplete || missingLegacyReadEvidence(state)
@@ -600,7 +615,7 @@ func (s *Storage) CountEntryHealthByStatus() map[HealthStatus]int {
 	// index, so the fallback set shrinks to zero.
 	var needDecode []string
 	_ = s.repairState.ForEachMeta(func(key string, meta *hybrid.IndexEntry) error {
-		if meta.Status == "alias" || meta.Status == "cleared" {
+		if meta.Status == "alias" || meta.Status == "cleared" || meta.Status == "archived" {
 			return nil
 		}
 		if meta.Status != "" {

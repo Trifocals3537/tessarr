@@ -71,6 +71,11 @@ its configured derived folder name, and an index whose files belong to that
 owner. Ambiguous names and mixed ownership fail closed. Names are never merged
 using case folding or suffix stripping alone.
 
+Every probe resolves current ownership and refreshes its item, including Arr
+media candidates that already carry a preloaded snapshot. Refreshing the item
+retains their Arr/file context for operator resolution; preloading never grants
+permission to skip failed-range or missing-evidence handoff.
+
 The canonical dirty signal and merged revision are synced before a forwarding
 record replaces the old health key. A replay marker prevents duplicate handoff
 after a crash between these writes. Later failures under the old name forward
@@ -99,6 +104,22 @@ Owner and retirement lookups reuse the existing hybrid metadata indexes. Legacy
 records are indexed once per open without changing their proof or revision;
 ordinary probes read the matching owner's records rather than decoding every
 health row. No extra database, service or background worker is introduced.
+
+When a shared folder's former owner has no main row, its validated retired or
+deleting fence must prove local retirement before its health key is released.
+Missing rows alone, corrupt fences and pending replacements remain unresolved.
+This proof grants no provider absence or administrative cleanup authority and
+does not change the original tombstone or its account obligations.
+
+The former health snapshot is retained under an opaque archive key in the same
+store. Its digest makes exact retries idempotent. Publication syncs the archive,
+then redirects old-owner aliases to it, then syncs the survivor's current root.
+Crashes and failed barriers retain at least one durable copy of the evidence.
+The survivor keeps its own ranges, receipts and missing-evidence uncertainty;
+unresolved third-owner data blocks handoff rather than being hidden. Archived
+records are read-only history, excluded from active work and health counts.
+Old aliases cannot mutate them, and reusing a name cannot reactivate their
+retired proof. Historical receipts retain their existing feedback protection.
 
 ## Operator file retirement
 
@@ -151,6 +172,12 @@ change does not backfill live warnings or clear historical records.
 - Public Clear Broken resolves a shared-folder replacement while preserving
   the other file and both parents; superseded receipts retain delayed-feedback
   protection without authorizing stale replay.
+- Preloaded Arr candidates preserve exact tails and legacy warnings; a real
+  local Arr collector runs on platforms with symlink support while the same
+  preloaded-candidate boundary runs on all platforms.
+- Retired shared-folder parent recovery preserves survivor failure intake and
+  public Clear Broken resolution. Archive, alias and current-root crash/failure
+  boundaries retain proof and deletion fences; uncertain retirement is refused.
 
 An existing orphan-reconciliation limitation remains a separate follow-up:
 an interrupted manual recheck of a previously clean, fresh row retains its
