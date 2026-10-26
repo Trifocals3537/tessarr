@@ -68,22 +68,27 @@ func TestSABBrowserOriginChecksCoverGETAndPOST(t *testing.T) {
 	_, router := newSABRouteTestServer(t)
 	for _, useAuth := range []bool{false, true} {
 		config.Get().UseAuth = useAuth
-		for _, method := range []string{http.MethodGet, http.MethodPost} {
-			for _, origin := range []string{"", "http://example.com", "https://untrusted.test", "null"} {
-				values := url.Values{"mode": {ModeVersion}, "cat": {"tv"}, "ma_username": {"https://sonarr.example.test"}, "ma_password": {"arr-token"}}
-				r := newSABFormRequest(values)
-				if method == http.MethodGet {
-					r = httptest.NewRequest(method, "http://example.com/api/?"+values.Encode(), nil)
-				}
-				r.Header.Set("Origin", origin)
-				w := httptest.NewRecorder()
-				router.ServeHTTP(w, r)
-				want := http.StatusOK
-				if origin == "https://untrusted.test" || origin == "null" {
-					want = http.StatusForbidden
-				}
-				if w.Code != want {
-					t.Fatalf("auth=%v %s origin=%q: status=%d, want %d", useAuth, method, origin, w.Code, want)
+		for _, scheme := range []string{"http", "https"} {
+			for _, method := range []string{http.MethodGet, http.MethodPost} {
+				for _, origin := range []string{"", "http://example.com", "https://example.com", "https://untrusted.test", "null"} {
+					values := url.Values{"mode": {ModeVersion}, "cat": {"tv"}, "ma_username": {"https://sonarr.example.test"}, "ma_password": {"arr-token"}}
+					target, body := scheme+"://example.com/api/", values.Encode()
+					if method == http.MethodGet {
+						target += "?" + values.Encode()
+						body = ""
+					}
+					r := httptest.NewRequest(method, target, strings.NewReader(body))
+					r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					r.Header.Set("Origin", origin)
+					w := httptest.NewRecorder()
+					router.ServeHTTP(w, r)
+					want := http.StatusOK
+					if origin != "" && origin != scheme+"://example.com" {
+						want = http.StatusForbidden
+					}
+					if w.Code != want {
+						t.Fatalf("auth=%v scheme=%s %s origin=%q: status=%d, want %d", useAuth, scheme, method, origin, w.Code, want)
+					}
 				}
 			}
 		}

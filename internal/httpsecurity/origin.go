@@ -49,7 +49,13 @@ func RequestOriginAllowed(r *http.Request, appURL string) bool {
 		(!strings.EqualFold(origin.Scheme, "http") && !strings.EqualFold(origin.Scheme, "https")) {
 		return false
 	}
-	if sameOriginHost(origin.Host, r.Host, origin.Scheme) {
+	listenerScheme := "http"
+	if r.TLS != nil {
+		listenerScheme = "https"
+	}
+	// The connection determines the listener transport. Proxy headers cannot
+	// authorize another scheme; reverse proxies use the explicit appURL below.
+	if strings.EqualFold(origin.Scheme, listenerScheme) && sameOriginHost(origin.Host, r.Host, listenerScheme) {
 		return true
 	}
 	configured, err := url.Parse(strings.TrimSpace(appURL))

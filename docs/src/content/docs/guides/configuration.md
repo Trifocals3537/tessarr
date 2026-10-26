@@ -73,9 +73,11 @@ separate qBittorrent-compatible login cookie used by local Arr clients.
 
 The qBittorrent and SABnzbd compatibility interfaces reject browser requests
 from unrelated origins, including GET actions. Native Arr clients can continue
-to omit browser-origin headers. For a public proxy URL, set `app_url` to the
-URL used by the browser. SABnzbd configuration responses include server settings
-with empty password fields; stored Usenet passwords remain private.
+to omit browser-origin headers. A listener origin must match the connection's
+HTTP or HTTPS transport, hostname and port; forwarded headers do not override
+the transport. For a public proxy URL, set `app_url` to the URL used by the
+browser, including its scheme. SABnzbd configuration responses include server
+settings with empty password fields; stored Usenet passwords remain private.
 
 Native installations use the loopback-only bind default so the first-run setup
 wizard is not exposed to the network. The official container image explicitly

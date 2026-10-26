@@ -47,3 +47,44 @@ func TestProtocolRequestOriginPolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestRequestOriginMatchesListenerTransport(t *testing.T) {
+	for _, tt := range []struct {
+		name, target, origin, referer, appURL string
+		want                                  bool
+	}{
+		{name: "HTTP listener", target: "http://tessarr.test/api", origin: "http://tessarr.test", want: true},
+		{name: "HTTPS listener", target: "https://tessarr.test/api", origin: "https://tessarr.test", want: true},
+		{name: "HTTPS default port", target: "https://tessarr.test:443/api", origin: "https://tessarr.test", want: true},
+		{name: "HTTP origin to HTTPS listener", target: "https://tessarr.test/api", origin: "http://tessarr.test"},
+		{name: "HTTPS origin to HTTP listener", target: "http://tessarr.test/api", origin: "https://tessarr.test"},
+		{name: "same explicit port different scheme", target: "https://tessarr.test:8443/api", origin: "http://tessarr.test:8443"},
+		{name: "HTTP referrer to HTTPS listener", target: "https://tessarr.test/api", referer: "http://tessarr.test/page"},
+		{name: "HTTPS referrer to HTTP listener", target: "http://tessarr.test/api", referer: "https://tessarr.test/page"},
+		{name: "same-host TLS proxy", target: "http://tessarr.test/api", origin: "https://tessarr.test", appURL: "https://tessarr.test/tessarr/", want: true},
+		{name: "different-host TLS proxy", target: "http://backend.test:8282/api", origin: "https://public.test", appURL: "https://public.test/tessarr/", want: true},
+		{name: "proxy referrer", target: "http://backend.test:8282/api", referer: "https://public.test/tessarr/", appURL: "https://public.test/tessarr/", want: true},
+		{name: "wrong proxy scheme", target: "http://backend.test:8282/api", origin: "http://public.test", appURL: "https://public.test/tessarr/"},
+		{name: "HTTP origin cannot use HTTPS app URL", target: "https://tessarr.test/api", origin: "http://tessarr.test", appURL: "https://tessarr.test"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+				r := httptest.NewRequest(method, tt.target, nil)
+				// Incoming server requests usually have no URL scheme. Transport
+				// comes from TLS, not absolute URLs or untrusted proxy headers.
+				r.URL.Scheme = ""
+				r.Header.Set("Origin", tt.origin)
+				r.Header.Set("Referer", tt.referer)
+				r.Header.Set("Sec-Fetch-Site", "cross-site")
+				r.Header.Set("X-Forwarded-Proto", "https")
+				r.Header.Set("Forwarded", "proto=https")
+				if got := RequestOriginAllowed(r, tt.appURL); got != tt.want {
+					t.Errorf("%s request allowed=%v, want %v", method, got, tt.want)
+				}
+				if got := ProtocolRequestAllowed(r, tt.appURL); got != tt.want {
+					t.Errorf("%s protocol allowed=%v, want %v", method, got, tt.want)
+				}
+			}
+		})
+	}
+}

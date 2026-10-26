@@ -26,23 +26,25 @@ func TestQBitBrowserOriginChecksPreventTagMutation(t *testing.T) {
 	router := q.Routes()
 	for _, useAuth := range []bool{false, true} {
 		cfg.UseAuth = useAuth
-		for _, origin := range []string{"", "http://127.0.0.1", "https://untrusted.test", "null"} {
-			q.Tags = nil
-			r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/torrents/createTags", strings.NewReader("tags=origin-fixture"))
-			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			r.Header.Set("Origin", origin)
-			if useAuth {
-				r.SetBasicAuth("https://sonarr.test", "arr-token")
-			}
-			w := httptest.NewRecorder()
-			router.ServeHTTP(w, r)
-			allowed := origin == "" || origin == "http://127.0.0.1"
-			want := http.StatusForbidden
-			if allowed {
-				want = http.StatusOK
-			}
-			if w.Code != want || (len(q.Tags) > 0) != allowed {
-				t.Fatalf("auth=%v origin=%q: status=%d tags=%v", useAuth, origin, w.Code, q.Tags)
+		for _, scheme := range []string{"http", "https"} {
+			for _, origin := range []string{"", "http://127.0.0.1", "https://127.0.0.1", "https://untrusted.test", "null"} {
+				q.Tags = nil
+				r := httptest.NewRequest(http.MethodPost, scheme+"://127.0.0.1/torrents/createTags", strings.NewReader("tags=origin-fixture"))
+				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				r.Header.Set("Origin", origin)
+				if useAuth {
+					r.SetBasicAuth("https://sonarr.test", "arr-token")
+				}
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, r)
+				allowed := origin == "" || origin == scheme+"://127.0.0.1"
+				want := http.StatusForbidden
+				if allowed {
+					want = http.StatusOK
+				}
+				if w.Code != want || (len(q.Tags) > 0) != allowed {
+					t.Fatalf("auth=%v scheme=%s origin=%q: status=%d tags=%v", useAuth, scheme, origin, w.Code, q.Tags)
+				}
 			}
 		}
 	}
