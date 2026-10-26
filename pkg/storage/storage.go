@@ -44,11 +44,18 @@ type Storage struct {
 	entryItems            *hybrid.Store
 	storageState          *hybrid.Store
 	// Durability hooks inject sync failures; production leaves them nil.
-	handoffSyncForTest     func() error
-	mainCleanupSyncForTest func() error
-	queueRowSyncForTest    func() error
-	queueIntentSyncForTest func() error
-	submissionSyncForTest  func() error
+	handoffSyncForTest            func() error
+	mainCleanupSyncForTest        func() error
+	mainRetirementSyncForTest     func(string) error
+	queueRowSyncForTest           func() error
+	queueIntentSyncForTest        func() error
+	submissionSyncForTest         func() error
+	healthAliasSyncedForTest      func()
+	healthRetirementForTest       func(string)
+	healthAliasPhaseForTest       func(string)
+	healthRenameForTest           func(string)
+	healthOwnerArchiveForTest     func(string)
+	healthOwnerArchiveSyncForTest func(string) error
 	// Per-key durability latches survive lifecycle-state eviction. Operations
 	// on each key are serialized by its lifecycle lock.
 	handoffPending   sync.Map
@@ -63,13 +70,14 @@ type Storage struct {
 	logger           zerolog.Logger
 
 	// Lock order: per-key lifecycle -> placementPublicationMu -> entryItemsMu
-	// -> hybrid store locks. Never take a lifecycle lock while holding this
+	// -> entryHealthMu -> hybrid store locks. Never take a lifecycle lock while holding this
 	// mutex, and never retain it across provider/network work.
 	placementPublicationMu sync.Mutex
 	entryItemsMu           sync.Mutex
 	entryItemsDirty        bool
 	startupComplete        bool
 	entryHealthMu          sync.Mutex
+	healthIdentityIndexed  bool // Guarded by entryHealthMu; rebuilt on each open.
 	healthCountsMu         sync.Mutex
 	healthCounts           map[HealthStatus]int
 	healthCountsBuiltAt    time.Time
@@ -215,6 +223,10 @@ func NewStorage(dbPath string) (*Storage, error) {
 			_ = s.Close()
 			return nil, err
 		}
+	}
+	if err := s.reconcileHealthRetirements(); err != nil {
+		_ = s.Close()
+		return nil, err
 	}
 	if err := s.PruneTorrentSources(); err != nil {
 		log.Warn().Err(err).Msg("Failed to prune unreferenced torrent sources")

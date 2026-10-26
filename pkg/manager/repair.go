@@ -43,9 +43,8 @@ type RepairRunOptions struct {
 	IgnoreLastChecked bool
 	AutoRepair        *bool
 	UnrestrictLink    bool
-	// VerifyContent performs an extension-aware head check after an NZB's
-	// normal availability probe. It is a one-run option and never enables
-	// scheduled or import-time rejection.
+	// VerifyContent is retained for API compatibility. Health rechecks always
+	// verify supported NZB heads; this does not change import acceptance.
 	VerifyContent bool
 	ProtocolScope string
 }

@@ -242,9 +242,13 @@ func (r *Repair) reconcileDirtyEntry(ctx context.Context, entryName string) repa
 		RepairRunOptions{},
 		false,
 	)
-	if ctx.Err() != nil || health == nil || health.Status == storage.HealthUnknown ||
+	if ctx.Err() != nil || health == nil || health.Dirty || health.Status == storage.HealthUnknown ||
 		health.Status == storage.HealthRepairing {
-		_ = r.manager.storage.MarkEntryDirtyChecked(entryName, protocol, dirtyReason)
+		// The probe already retained the original revision and progress. A
+		// retry is not a new failure and must not reset completed file checks.
+		if health == nil && (previous == nil || !previous.Dirty) {
+			_ = r.manager.storage.MarkEntryDirtyChecked(entryName, protocol, dirtyReason)
+		}
 		return repairEventIncomplete
 	}
 	if health.Status == storage.HealthBroken {
@@ -303,7 +307,9 @@ func (r *Repair) preserveConcurrentDirtySignal(entryName string) {
 	if health != nil {
 		protocol = health.Protocol
 	}
-	_ = r.manager.storage.MarkEntryDirtyChecked(entryName, protocol, "read_failure_during_recheck")
+	// This is queue-generation uncertainty, not a new range-less read
+	// failure. The newer ranges may already have been included in the probe.
+	_ = r.manager.storage.MarkEntryDirtyChecked(entryName, protocol, "health_recheck_generation_changed")
 }
 
 func (r *Repair) eventQueueStatus() RepairEventQueueStatus {

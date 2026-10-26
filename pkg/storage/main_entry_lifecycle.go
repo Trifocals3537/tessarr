@@ -92,6 +92,29 @@ func (l *mainEntryLifecycle) beginProviderSnapshot() uint64 {
 	return l.nextSequence()
 }
 
+// quiescentForHealth requires the caller to hold entryItemsMu. No existing
+// operation may still restore a temporarily removed main row. New operations
+// cannot publish a row until that mutex is released. TryLock is essential:
+// reference release can hold the directory lock while waiting for a per-key
+// lifecycle lock, whose owner may itself be waiting for entryItemsMu.
+func (l *mainEntryLifecycle) quiescentForHealth(key string) bool {
+	if l == nil || !l.mu.TryLock() {
+		return false
+	}
+	defer l.mu.Unlock()
+	state := l.states[normalizeMainEntryKey(key)]
+	return state == nil || state.refs == 0
+}
+
+func (s *Storage) syncMainRetirement(store *hybrid.Store, phase string) error {
+	if s.mainRetirementSyncForTest != nil {
+		if err := s.mainRetirementSyncForTest(phase); err != nil {
+			return err
+		}
+	}
+	return store.Sync()
+}
+
 func (l *mainEntryLifecycle) acquire(
 	key string,
 	initial func() (

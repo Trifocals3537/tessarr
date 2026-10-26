@@ -208,6 +208,8 @@ func (r *contextSectionReader) Read(p []byte) (int, error) {
 }
 
 type Usenet struct {
+	repairFingerprintMu      sync.Mutex
+	repairFingerprints       map[string]metadataFingerprint
 	bufferPools              *reader.Pools
 	nntp                     *nntp.Client
 	logger                   zerolog.Logger
@@ -753,7 +755,7 @@ func (u *Usenet) CheckFile(ctx context.Context, nzoID, filename string) error {
 	if len(messageIDs) == 0 {
 		return fmt.Errorf("file has no Segments: %s", filename)
 	}
-	return u.checkAvailability(ctx, filename, messageIDs)
+	return u.checkAvailabilityMode(ctx, filename, messageIDs, true)
 }
 
 func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFile, samplePercent int) error {
@@ -764,12 +766,22 @@ func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFil
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.
 func (u *Usenet) checkAvailability(ctx context.Context, fileName string, messageIDs []string) error {
+	return u.checkAvailabilityMode(ctx, fileName, messageIDs, false)
+}
+
+func (u *Usenet) checkAvailabilityMode(ctx context.Context, fileName string, messageIDs []string, strict bool) error {
 	if len(messageIDs) == 0 {
 		return nil
 	}
 
 	result, err := u.nntp.BatchStat(ctx, messageIDs)
+	if strict && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
+		if strict {
+			return fmt.Errorf("availability check incomplete: %w", err)
+		}
 		// Connection/system error - log and continue (don't fail availability check)
 		u.logger.Warn().
 			Err(err).
@@ -787,6 +799,9 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 	if !result.AllAvailable() {
 		notFoundCount := result.TotalCount - result.FoundCount - result.ErrorCount
 		if result.ErrorCount > 0 && notFoundCount == 0 {
+			if strict {
+				return errors.New("availability check incomplete")
+			}
 			// All failures were connection errors, not missing articles.
 			return nil
 		}

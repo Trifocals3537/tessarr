@@ -258,7 +258,7 @@ func TestRepairEventConcurrentFailurePreservesDurableDirtyState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !health.Dirty || health.DirtyReason != "read_failure_during_recheck" {
+	if !health.Dirty || health.DirtyReason != "health_recheck_generation_changed" {
 		t.Fatalf("health = %+v, want concurrent failure preserved as dirty", health)
 	}
 	if health.DirtyRevision < 2 {
