@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Trifocals3537/tessarr/internal/config"
+	"github.com/Trifocals3537/tessarr/internal/httpsecurity"
 	"github.com/Trifocals3537/tessarr/internal/utils"
 	"github.com/Trifocals3537/tessarr/pkg/arr"
 	"github.com/go-chi/chi/v5"
@@ -78,6 +79,10 @@ func decodeAuthHeader(header string) (string, string, error) {
 
 func (q *QBit) categoryContext(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !httpsecurity.ProtocolRequestAllowed(r, config.Get().AppURL) {
+			http.Error(w, "Cross-site request rejected", http.StatusForbidden)
+			return
+		}
 		contentType := strings.ToLower(r.Header.Get("Content-Type"))
 		var err error
 		if strings.Contains(contentType, "multipart/form-data") {
@@ -121,15 +126,35 @@ func (q *QBit) categoryContext(next http.Handler) http.Handler {
 // This is used to identify the Arr instance for the utils.
 // Only a valid host and token will be added to the context/config. The rest are manual
 func (q *QBit) authContext(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return q.requestAuthContext(next, false)
+}
 
-		username, password, err := q.getUsernameAndPassword(r)
+func (q *QBit) getMutationAuthContext(next http.Handler) http.Handler {
+	return q.requestAuthContext(next, true)
+}
+
+func (q *QBit) requestAuthContext(next http.Handler, getMutation bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireCredentials := getMutation && httpsecurity.GETMutationNeedsCredentials(r)
+		var username, password string
+		var err error
+		if requireCredentials {
+			// A browser can attach SID automatically to a no-referrer GET.
+			// Do not fall back to it when explicit credentials are required.
+			username, password, err = decodeAuthHeader(r.Header.Get("Authorization"))
+			if err != nil || username == "" || password == "" {
+				http.Error(w, "Headerless GET actions require explicit credentials; native sessions can use POST", http.StatusForbidden)
+				return
+			}
+		} else {
+			username, password, err = q.getUsernameAndPassword(r)
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
 		category := getCategory(r.Context())
-		a, err := q.authenticate(category, username, password)
+		a, err := q.authenticate(category, username, password, requireCredentials)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
 			return
@@ -164,13 +189,13 @@ func (q *QBit) getUsernameAndPassword(r *http.Request) (string, string, error) {
 	return "", "", nil
 }
 
-func (q *QBit) authenticate(category, username, password string) (*arr.Arr, error) {
+func (q *QBit) authenticate(category, username, password string, requireCredentials bool) (*arr.Arr, error) {
 	cfg := config.Get()
 	arrStorage := q.manager.Arr()
 	if matched := arrStorage.MatchCredentials(category, username, password); matched != nil {
 		return matched, nil
 	}
-	if cfg.UseAuth && !config.VerifyAuth(username, password) {
+	if (cfg.UseAuth || requireCredentials) && !config.VerifyAuth(username, password) {
 		return nil, fmt.Errorf("unauthorized: invalid credentials")
 	}
 	return arrStorage.GetOrCreate(category), nil

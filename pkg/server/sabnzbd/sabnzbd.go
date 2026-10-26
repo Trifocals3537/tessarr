@@ -64,12 +64,12 @@ func (s *SABnzbd) SetConfig(cfg *config.Config) {
 			if provider.Host == "" || provider.Port == 0 {
 				continue
 			}
+			// Only non-secret server settings enter this compatibility response.
 			sabnzbdConfig.Servers = append(sabnzbdConfig.Servers, Server{
 				Name:        provider.Host,
 				Host:        provider.Host,
 				Port:        provider.Port,
 				Username:    provider.Username,
-				Password:    provider.Password,
 				Connections: provider.MaxConnections,
 				SSL:         provider.SSL,
 			})

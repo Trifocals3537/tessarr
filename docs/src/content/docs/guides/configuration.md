@@ -71,6 +71,20 @@ session cookie over plain HTTP. Leave it `false` only when the UI itself must
 be used over a trusted plain-HTTP connection. This setting does not change the
 separate qBittorrent-compatible login cookie used by local Arr clients.
 
+The qBittorrent and SABnzbd compatibility interfaces reject browser requests
+from unrelated origins, including GET actions. Native Arr clients can continue
+to omit browser-origin headers. A listener origin must match the connection's
+HTTP or HTTPS transport, hostname and port; forwarded headers do not override
+the transport. For a public proxy URL, set `app_url` to the URL used by the
+browser, including its scheme. SABnzbd configuration responses include server
+settings with empty password fields; stored Usenet passwords remain private.
+
+GET actions without Origin, Referer or Fetch Metadata require valid configured
+Arr or Tessarr credentials, even when authentication is disabled. A qBittorrent
+SID cookie alone cannot authorize these requests. Native clients can continue
+using session cookies for read requests and POST actions; SABnzbd clients can
+provide their existing `ma_username` and `ma_password` credentials for GET actions.
+
 Native installations use the loopback-only bind default so the first-run setup
 wizard is not exposed to the network. The official container image explicitly
 overrides this to `0.0.0.0`; control container access with published ports,
