@@ -34,7 +34,12 @@ func retiredHealthArchiveKey(source *EntryHealth, owner string) (string, error) 
 // cleanup authority. Missing data alone, pending replacements and live main
 // rows cannot release a protected health owner. A deleting fence with no main
 // row is the existing startup-recovery state after finishing local retirement.
+// A running deletion may still roll back either phase, so its lifecycle must
+// also be quiescent before any former-owner evidence becomes archived history.
 func (s *Storage) proveRetiredHealthOwnerLocked(owner string) error {
+	if !s.mainEntries.quiescentForHealth(owner) {
+		return ErrHealthIdentity
+	}
 	if _, err := s.getMainRaw(owner); !IsEntryNotFound(err) {
 		if err != nil {
 			return err

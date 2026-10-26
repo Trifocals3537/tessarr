@@ -46,6 +46,7 @@ type Storage struct {
 	// Durability hooks inject sync failures; production leaves them nil.
 	handoffSyncForTest            func() error
 	mainCleanupSyncForTest        func() error
+	mainRetirementSyncForTest     func(string) error
 	queueRowSyncForTest           func() error
 	queueIntentSyncForTest        func() error
 	submissionSyncForTest         func() error

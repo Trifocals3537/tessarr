@@ -706,7 +706,7 @@ func (s *Storage) DeleteWithCleanup(infohash string, cleanup func(*Entry) error)
 		state.mu.Unlock()
 		return errors.Join(err, rollbackErr)
 	}
-	if err := s.entries.Sync(); err != nil {
+	if err := s.syncMainRetirement(s.entries, "main"); err != nil {
 		restoreErr := s.restoreMainEntryAfterSyncFailure(entry)
 		rollbackErr := s.rollbackMainEntryTombstone(ref.key)
 		if restoreErr == nil && rollbackErr == nil {
@@ -740,7 +740,7 @@ func (s *Storage) DeleteWithCleanup(infohash string, cleanup func(*Entry) error)
 			rollbackErr,
 		)
 	}
-	if err := s.entryTombstones.Sync(); err != nil {
+	if err := s.syncMainRetirement(s.entryTombstones, "fence"); err != nil {
 		restoreErr := s.restoreMainEntryAfterSyncFailure(entry)
 		rollbackErr := s.rollbackMainEntryTombstone(ref.key)
 		if restoreErr == nil && rollbackErr == nil {
@@ -817,7 +817,7 @@ func (s *Storage) DeleteSnapshot(entry *Entry) error {
 		}
 		return errors.Join(err, rollbackErr)
 	}
-	if err := s.entries.Sync(); err != nil {
+	if err := s.syncMainRetirement(s.entries, "main"); err != nil {
 		restoreErr := s.restoreMainEntryAfterSyncFailure(entry)
 		rollbackErr := s.rollbackMainEntryTombstone(ref.key)
 		if restoreErr == nil && rollbackErr == nil {
@@ -849,7 +849,7 @@ func (s *Storage) DeleteSnapshot(entry *Entry) error {
 			rollbackErr,
 		)
 	}
-	if err := s.entryTombstones.Sync(); err != nil {
+	if err := s.syncMainRetirement(s.entryTombstones, "fence"); err != nil {
 		restoreErr := s.restoreMainEntryAfterSyncFailure(entry)
 		rollbackErr := s.rollbackMainEntryTombstone(ref.key)
 		if restoreErr == nil && rollbackErr == nil {

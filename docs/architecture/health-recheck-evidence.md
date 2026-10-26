@@ -108,6 +108,10 @@ health row. No extra database, service or background worker is introduced.
 When a shared folder's former owner has no main row, its validated retired or
 deleting fence must prove local retirement before its health key is released.
 Missing rows alone, corrupt fences and pending replacements remain unresolved.
+The previous owner's lifecycle must also have no active operations: a deletion
+can temporarily remove its row and then restore it after a failed sync. Health
+handoff defers until that rollback window closes, without waiting for lifecycle
+locks while holding the entry index lock.
 This proof grants no provider absence or administrative cleanup authority and
 does not change the original tombstone or its account obligations.
 
@@ -178,6 +182,9 @@ change does not backfill live warnings or clear historical records.
 - Retired shared-folder parent recovery preserves survivor failure intake and
   public Clear Broken resolution. Archive, alias and current-root crash/failure
   boundaries retain proof and deletion fences; uncertain retirement is refused.
+- In-flight main and fence sync failures roll deletion back without archiving
+  active proof, through both deletion APIs. Contended lifecycle directories
+  defer health handoff without reversing the lock order.
 
 An existing orphan-reconciliation limitation remains a separate follow-up:
 an interrupted manual recheck of a previously clean, fresh row retains its
